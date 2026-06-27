@@ -2,15 +2,19 @@
 """用 W49 提供的 VMOS SSH 凭证更新右机隧道并重连。"""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
-import time
+import tempfile
 from pathlib import Path
 
 import paramiko
 
 HOST, PW, R = "46.183.27.174", "Aa112211@@785*", "/home/bot/55chat-bot"
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from bot_tunnel import write_tunnel_env  # noqa: E402
 
 SSH_HOST, SSH_PORT, SSH_USER = "129.227.134.130", "1824", "s"
 SSH_PASS = (
@@ -51,30 +55,38 @@ def upload_daemon() -> None:
     s.close()
 
 
-def write_tunnel_env() -> None:
-    body = (
-        f"# updated from VMOS panel\n"
-        f"LOCAL_PORT={LOCAL_PORT}\n"
-        f"SSH_HOST={SSH_HOST}\n"
-        f"SSH_PORT={SSH_PORT}\n"
-        f"SSH_USER={SSH_USER}\n"
-        f"SSH_PASS={SSH_PASS}\n"
-        f"ADB_SERIAL=127.0.0.1:{LOCAL_PORT}\n"
-        f"BOT_ID=bot-4\n"
-        f"ROLE=LISTENER\n"
-    )
-    s = ssh()
-    sftp = s.open_sftp()
-    with sftp.open(f"{R}/config/tunnel-right.env", "w") as f:
-        f.write(body)
-    s.exec_command(f"chmod 600 {R}/config/tunnel-right.env")
-    sftp.close()
-    s.close()
+def write_tunnel_env_remote() -> None:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".env") as tmp:
+        tmp_path = Path(tmp.name)
+        write_tunnel_env(
+            tmp_path,
+            LOCAL_PORT,
+            SSH_HOST,
+            SSH_PORT,
+            SSH_USER,
+            SSH_PASS,
+            header="# updated from VMOS panel (apply_right_tunnel.py)",
+        )
+        extra = (
+            f"ADB_SERIAL=127.0.0.1:{LOCAL_PORT}\n"
+            f"BOT_ID=bot-4\n"
+            f"ROLE=LISTENER\n"
+        )
+        tmp_path.write_text(tmp_path.read_text(encoding="utf-8") + extra, encoding="utf-8")
+    try:
+        s = ssh()
+        sftp = s.open_sftp()
+        sftp.put(str(tmp_path), f"{R}/config/tunnel-right.env")
+        s.exec_command(f"chmod 600 {R}/config/tunnel-right.env")
+        sftp.close()
+        s.close()
+    finally:
+        os.unlink(tmp_path)
 
 
 def main() -> int:
     upload_daemon()
-    write_tunnel_env()
+    write_tunnel_env_remote()
     print("=== stop old recover ===")
     print(run("pkill -f vmos_tunnel_recover.py; true").strip())
 

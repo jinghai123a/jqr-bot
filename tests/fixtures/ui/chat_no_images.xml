@@ -1,0 +1,6 @@
+<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" bounds="[0,0][720,1280]">
+    <node class="android.widget.EditText" bounds="[50,1100][670,1180]" />
+  </node>
+</hierarchy>

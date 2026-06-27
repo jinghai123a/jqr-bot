@@ -2,17 +2,23 @@
 """已知 padCode，跳过 list_pads，直接 get_adb + 写 VPS tunnel。"""
 from __future__ import annotations
 
-import re
+import os
 import sys
-import time
 from pathlib import Path
 
 import paramiko
 
 HOST, PW, R = "46.183.27.174", "Aa112211@@785*", "/home/bot/55chat-bot"
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
-from vmos_api_client import VmosApiClient  # noqa: E402
+sys.path.insert(0, str(ROOT))
+
+from bot_tunnel import (  # noqa: E402
+    fetch_adb_with_backoff,
+    parse_local_port,
+    parse_ssh_command,
+    write_tunnel_env,
+)
+from scripts.vmos_api_client import VmosApiClient  # noqa: E402
 
 RIGHT, LEFT = "ATP6416I3I1E6KPM", "APP5AU4BB269OR35"
 
@@ -42,43 +48,33 @@ def creds() -> tuple[str, str]:
     return env["VMOS_ACCESS_KEY"], env["VMOS_SECRET_KEY"]
 
 
-def parse_cmd(command: str) -> tuple[str, str, str]:
-    port_m = re.search(r"-p\s+(\d+)", command)
-    m = re.search(r"([\w-]+)@([\d.]+)", command)
-    if not m:
-        raise ValueError(command)
-    return m.group(2), port_m.group(1) if port_m else "1824", m.group(1)
+def write_env_remote(side: str, local_port: str, host: str, ssh_port: str, user: str, password: str, *, ssh_command: str = "", adb_command: str = "", expire_time: str = "") -> None:
+    import tempfile
 
-
-def write_env(side: str, port: str, host: str, ssh_port: str, user: str, password: str) -> None:
-    body = (
-        f"LOCAL_PORT={port}\nSSH_HOST={host}\nSSH_PORT={ssh_port}\n"
-        f"SSH_USER={user}\nSSH_PASS={password}\n"
-    )
-    s = ssh()
-    sftp = s.open_sftp()
-    path = f"{R}/config/tunnel-{side}.env"
-    with sftp.open(path, "w") as f:
-        f.write(body)
-    s.exec_command(f"chmod 600 {path}")
-    s.close()
-
-
-def fetch_adb(client: VmosApiClient, code: str) -> dict:
-    for i in range(15):
-        try:
-            if i:
-                w = min(90, 8 * (i + 1))
-                print(f"  wait {w}s ...", flush=True)
-                time.sleep(w)
-            try:
-                client.open_adb([code])
-            except Exception as exc:
-                print(f"  open_adb: {exc}", flush=True)
-            return client.get_adb(code, enable=True, expire_minutes=10080)
-        except Exception as exc:
-            print(f"  get_adb {i+1}: {exc}", flush=True)
-    raise RuntimeError(f"get_adb exhausted for {code}")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".env") as tmp:
+        tmp_path = Path(tmp.name)
+        write_tunnel_env(
+            tmp_path,
+            local_port,
+            host,
+            ssh_port,
+            user,
+            password,
+            ssh_command=ssh_command,
+            adb_command=adb_command,
+            expire_time=expire_time,
+            header=f"# auto-updated by vmos_direct_adb_refresh.py",
+        )
+    try:
+        s = ssh()
+        sftp = s.open_sftp()
+        remote = f"{R}/config/tunnel-{side}.env"
+        sftp.put(str(tmp_path), remote)
+        s.exec_command(f"chmod 600 {remote}")
+        sftp.close()
+        s.close()
+    finally:
+        os.unlink(tmp_path)
 
 
 def main() -> int:
@@ -87,12 +83,24 @@ def main() -> int:
 
     for side, code, port in (("right", RIGHT, "60478"), ("left", LEFT, "52718")):
         print(f"=== {side} {code} ===", flush=True)
-        adb = fetch_adb(client, code)
+        adb = fetch_adb_with_backoff(client, code, open_adb_first=True, attempts=15)
         cmd = str(adb.get("command") or "")
         key = str(adb.get("key") or "")
-        host, ssh_port, user = parse_cmd(cmd)
+        adb_cmd = str(adb.get("adb") or "")
+        host, ssh_port, user = parse_ssh_command(cmd)
+        api_port = parse_local_port(cmd, adb_cmd, port)
         print(f"  -> {host}:{ssh_port} user={user}", flush=True)
-        write_env(side, port, host, ssh_port, user, key)
+        write_env_remote(
+            side,
+            api_port,
+            host,
+            ssh_port,
+            user,
+            key,
+            ssh_command=cmd,
+            adb_command=adb_cmd,
+            expire_time=str(adb.get("expireTime") or ""),
+        )
 
     print("\n=== reconnect ===", flush=True)
     print(run(f"bash {R}/scripts/reconnect-dual-adb.sh 2>&1", 150))

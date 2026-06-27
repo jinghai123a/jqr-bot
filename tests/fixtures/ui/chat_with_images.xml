@@ -1,0 +1,10 @@
+<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" class="android.widget.FrameLayout" bounds="[0,0][720,1280]">
+    <node class="android.widget.EditText" bounds="[50,1100][670,1180]" resource-id="editTextMessage" />
+    <node class="android.widget.ImageView" bounds="[80,400][280,600]" />
+    <node class="android.widget.ImageView" bounds="[80,650][280,850]" />
+    <node class="android.widget.ImageView" bounds="[80,50][120,90]" />
+    <node class="android.widget.ImageView" bounds="[550,400][680,600]" />
+  </node>
+</hierarchy>

@@ -2,8 +2,7 @@
 """从本机调 VMOS API（绕过 VPS IP 封禁/限流），成功后写回 VPS tunnel env 并重连。"""
 from __future__ import annotations
 
-import re
-import subprocess
+import os
 import sys
 import time
 from pathlib import Path
@@ -12,9 +11,15 @@ import paramiko
 
 HOST, PW, R = "46.183.27.174", "Aa112211@@785*", "/home/bot/55chat-bot"
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT))
 
-from vmos_api_client import VmosApiClient  # noqa: E402
+from bot_tunnel import (  # noqa: E402
+    fetch_adb_with_backoff,
+    parse_local_port,
+    parse_ssh_command,
+    write_tunnel_env,
+)
+from scripts.vmos_api_client import VmosApiClient  # noqa: E402
 
 
 def ssh_run(cmd: str, t: int = 120) -> str:
@@ -41,50 +46,45 @@ def load_vmos_creds() -> tuple[str, str]:
     return ak, sk
 
 
-def parse_ssh_command(command: str) -> tuple[str, str, str]:
-    port_m = re.search(r"-p\s+(\d+)", command)
-    user_host_m = re.search(r"([\w-]+)@([\d.]+)", command)
-    if not user_host_m:
-        raise ValueError(f"无法解析 SSH command: {command!r}")
-    user = user_host_m.group(1)
-    host = user_host_m.group(2)
-    port = port_m.group(1) if port_m else "1824"
-    return host, port, user
+def write_tunnel_on_vps(
+    side: str,
+    local_port: str,
+    host: str,
+    port: str,
+    user: str,
+    password: str,
+    *,
+    ssh_command: str = "",
+    adb_command: str = "",
+    expire_time: str = "",
+) -> None:
+    import tempfile
 
-
-def write_tunnel_on_vps(side: str, local_port: str, host: str, port: str, user: str, password: str) -> None:
-    content = (
-        f"# auto-updated by vmos_api_local_refresh.py\n"
-        f"LOCAL_PORT={local_port}\n"
-        f"SSH_HOST={host}\n"
-        f"SSH_PORT={port}\n"
-        f"SSH_USER={user}\n"
-        f"SSH_PASS={password}\n"
-    )
-    path = f"{R}/config/tunnel-{side}.env"
-    s = paramiko.SSHClient()
-    s.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    s.connect(HOST, username="root", password=PW, timeout=30)
-    sftp = s.open_sftp()
-    with sftp.open(path, "w") as f:
-        f.write(content)
-    s.exec_command(f"chmod 600 {path}")
-    s.close()
-
-
-def get_adb_with_backoff(client: VmosApiClient, pad_code: str, attempts: int = 12) -> dict:
-    last: Exception | None = None
-    for i in range(attempts):
-        try:
-            if i:
-                wait = min(120, 10 * (2 ** min(i, 4)))
-                print(f"  retry {i+1}/{attempts} after {wait}s ...", flush=True)
-                time.sleep(wait)
-            return client.get_adb(pad_code, enable=True, expire_minutes=10080)
-        except Exception as exc:
-            last = exc
-            print(f"  attempt {i+1} failed: {exc}", flush=True)
-    raise last or RuntimeError("get_adb failed")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".env") as tmp:
+        tmp_path = Path(tmp.name)
+        write_tunnel_env(
+            tmp_path,
+            local_port,
+            host,
+            port,
+            user,
+            password,
+            ssh_command=ssh_command,
+            adb_command=adb_command,
+            expire_time=expire_time,
+            header="# auto-updated by vmos_api_local_refresh.py",
+        )
+    try:
+        remote = f"{R}/config/tunnel-{side}.env"
+        s = paramiko.SSHClient()
+        s.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        s.connect(HOST, username="root", password=PW, timeout=30)
+        sftp = s.open_sftp()
+        sftp.put(str(tmp_path), remote)
+        s.exec_command(f"chmod 600 {remote}")
+        s.close()
+    finally:
+        os.unlink(tmp_path)
 
 
 def main() -> int:
@@ -118,15 +118,32 @@ def main() -> int:
             client.open_adb([code])
         except Exception as exc:
             print(f"  open_adb warn: {exc}", flush=True)
-        adb = get_adb_with_backoff(client, code)
+        adb = fetch_adb_with_backoff(
+            client,
+            code,
+            open_adb_first=False,
+            wait_for_attempt=lambda i: min(120, 10 * (2 ** min(i - 1, 4))),
+        )
         command = str(adb.get("command") or "")
         key = str(adb.get("key") or "")
+        adb_cmd = str(adb.get("adb") or "")
         if not command or not key:
             print(f"FAIL: bad adb response keys={list(adb.keys())}", flush=True)
             return 1
         host, ssh_port, user = parse_ssh_command(command)
+        api_port = parse_local_port(command, adb_cmd, port)
         print(f"  host={host}:{ssh_port} user={user} expire={adb.get('expireTime')}", flush=True)
-        write_tunnel_on_vps(side, port, host, ssh_port, user, key)
+        write_tunnel_on_vps(
+            side,
+            api_port,
+            host,
+            ssh_port,
+            user,
+            key,
+            ssh_command=command,
+            adb_command=adb_cmd,
+            expire_time=str(adb.get("expireTime") or ""),
+        )
         ok_ports.append(port)
 
     if not ok_ports:
