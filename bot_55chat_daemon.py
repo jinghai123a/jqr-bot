@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import queue
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import Counter, deque, defaultdict
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
@@ -92,7 +93,14 @@ LISTENER_FORCE_SCAN_SEC = max(
 )
 LISTENER_CMDS_PER_TICK = max(1, int(os.environ.get("BOT_LISTENER_CMDS_PER_TICK", "5") or 5))
 CLICKER_IDLE_SEC = max(0.05, float(os.environ.get("BOT_CLICKER_IDLE_SEC", "0.08") or 0.08))
+# 单机部署身份：LISTENER | CLICKER | HYBRID（双机编排时仍按 bot-id 分角色）
+BOT_ROLE = os.environ.get("BOT_ROLE", "").strip().upper()
+GATEWAY_ENABLED = os.environ.get("BOT_GATEWAY_ENABLED", "1").lower() in ("1", "true", "yes")
+GATEWAY_BASE_URL = os.environ.get("BOT_GATEWAY_URL", "http://127.0.0.1:8765").rstrip("/")
+GATEWAY_TIMEOUT_SEC = max(1.0, float(os.environ.get("BOT_GATEWAY_TIMEOUT_SEC", "3") or 3))
 LOG_WORKER_THREADS = max(1, int(os.environ.get("BOT_LOG_WORKERS", "4") or 4))
+# 公告/回复并发：有界线程池上限（后续 Hook / 剪贴板快发任务统一入口）
+OUTBOUND_POOL_MAX = max(1, min(10, int(os.environ.get("BOT_OUTBOUND_POOL_MAX", "10") or 10)))
 CONTEXT_REFRESH_SEC = max(1.0, float(os.environ.get("BOT_CONTEXT_REFRESH_SEC", "2") or 2))
 SEND_DEBOUNCE_SEC = max(0.02, float(os.environ.get("BOT_SEND_DEBOUNCE_SEC", "0.03") or 0.03))
 POST_PANEL_LOG = os.environ.get("BOT_POST_PANEL_LOG", "0" if FAST else "1").lower() in ("1", "true", "yes")
@@ -305,6 +313,71 @@ _LISTENER_FIRE_THREADS: dict[str, threading.Thread] = {}
 _LISTENER_FIRE_LOCK = threading.Lock()
 
 
+class OutboundTaskPool:
+    """公告 + 回复侧任务的有界并发池（ThreadPoolExecutor max_workers=10）。"""
+
+    __slots__ = ("_executor", "max_workers")
+
+    def __init__(self, max_workers: int = OUTBOUND_POOL_MAX) -> None:
+        self.max_workers = max_workers
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="outbound-pool",
+        )
+
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[Any]:
+        return self._executor.submit(fn, *args, **kwargs)
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        self._executor.shutdown(wait=wait, cancel_futures=not wait)
+
+
+_OUTBOUND_TASK_POOL: OutboundTaskPool | None = None
+_OUTBOUND_TASK_POOL_LOCK = threading.Lock()
+
+
+def get_outbound_task_pool() -> OutboundTaskPool:
+    global _OUTBOUND_TASK_POOL
+    with _OUTBOUND_TASK_POOL_LOCK:
+        if _OUTBOUND_TASK_POOL is None:
+            _OUTBOUND_TASK_POOL = OutboundTaskPool()
+        return _OUTBOUND_TASK_POOL
+
+
+def shutdown_outbound_task_pool() -> None:
+    global _OUTBOUND_TASK_POOL
+    with _OUTBOUND_TASK_POOL_LOCK:
+        if _OUTBOUND_TASK_POOL is not None:
+            _OUTBOUND_TASK_POOL.shutdown(wait=False)
+            _OUTBOUND_TASK_POOL = None
+
+
+def submit_outbound_hook(
+    fn: Callable[..., Any],
+    /,
+    *args: Any,
+    label: str = "",
+    **kwargs: Any,
+) -> Future[Any]:
+    """Panel Hook 非阻塞投递：局部失败仅记日志，不拖垮 Orchestrator 主循环。"""
+    tag = label or getattr(fn, "__name__", "outbound-hook")
+
+    def _run() -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            log.exception("出站池任务异常 hook=%s", tag)
+            return None
+
+    return get_outbound_task_pool().submit(_run)
+
+
 @dataclass
 class _ListenerFireTap:
     serial: str
@@ -413,6 +486,9 @@ def clicker_ensure_fire_worker(serial: str) -> None:
 
 def clicker_fire_tap(serial: str, x: int, y: int) -> None:
     """左机发图热 tap：专用线程，零 dump。"""
+    if serial_role(serial) == "LISTENER" or BOT_ROLE == "LISTENER":
+        log.info("LISTENER 角色隔离：禁止 clicker_fire_tap @(%d,%d)", x, y)
+        return
     if not is_clicker_serial(serial):
         adb_tap_raw(serial, x, y, purpose="clicker-fire")
         return
@@ -4557,6 +4633,10 @@ def effective_input_bounds(
 def adb_tap(serial: str, x: int, y: int) -> None:
     if block_listener_navigation(serial, f"导航点击@({x},{y})"):
         return
+    if serial_role(serial) == "LISTENER" or BOT_ROLE == "LISTENER":
+        if listener_forbidden_tap(serial, x, y):
+            log.info("LISTENER 角色隔离：禁止 tap @(%d,%d)", x, y)
+            return
     if clicker_forbidden_tap(serial, x, y):
         log.info("左机发图禁止点击 @(%d,%d)", x, y)
         return
@@ -6056,6 +6136,9 @@ def read_messenger_id_for_nick(
 
     store_mid_cache(serial, nick, mid, bot_id)
     save_mid_cache()
+    if GATEWAY_ENABLED:
+        if gateway_update_id(nick, mid):
+            log.info("[缓存更新] 成功绑定新用户 username=%s user_id=%s", nick, mid)
     log.info("读取 55M ID %s ← 昵称 %s（认人缓存已写入）", mid, nick)
     if bot:
         if is_clicker_bot(bot):
@@ -6266,6 +6349,68 @@ def _sender_for_index(texts: list[str], idx: int, pool: dict[str, list[dict]]) -
 
 def api(method: str, path: str, body: Any = None) -> Any:
     return _BACKEND.request(method, path, body)
+
+
+def gateway_post_json(path: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """记忆网关 HTTP POST（纯 stdlib，对接 mock_gateway）。"""
+    url = f"{GATEWAY_BASE_URL}{path}"
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=GATEWAY_TIMEOUT_SEC) as resp:
+            raw = resp.read().decode("utf-8")
+            body = json.loads(raw) if raw else {}
+            return resp.status, body if isinstance(body, dict) else {}
+    except urllib.error.HTTPError as ex:
+        raw = ex.read().decode("utf-8", errors="replace")
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            body = {"status": "error", "message": raw[:200]}
+        return ex.code, body if isinstance(body, dict) else {}
+    except Exception as ex:
+        log.warning("网关请求失败 %s: %s", path, ex)
+        return 0, {}
+
+
+def gateway_chat_message(username: str, msg: str) -> tuple[int, dict[str, Any]]:
+    return gateway_post_json("/api/chat/message", {"username": username, "msg": msg})
+
+
+def gateway_update_id(username: str, user_id: str) -> bool:
+    status, body = gateway_post_json(
+        "/api/chat/update_id",
+        {"username": username, "user_id": user_id},
+    )
+    return status == 200 and body.get("status") == "success"
+
+
+def listener_gateway_resolve(
+    serial: str,
+    bot_id: str,
+    username: str,
+    msg: str,
+) -> str:
+    """网关认人：hit=已缓存 user_id | pending=202 待 Clicker | skip=未启用/失败。"""
+    if not GATEWAY_ENABLED:
+        return "skip"
+    status, body = gateway_chat_message(username, msg)
+    if status == 200 and body.get("status") == "success":
+        uid = str(body.get("user_id") or "").strip()
+        if uid:
+            store_mid_cache(serial, username, uid, bot_id)
+            save_mid_cache()
+            log.info("[极速放行] 命中缓存 username=%s user_id=%s", username, uid)
+        return "hit"
+    if status == 202 and body.get("action") == "require_id_fetch":
+        log.info("[风控拦截] 未知用户，挂起并下发认人任务 username=%s", username)
+        return "pending"
+    return "skip"
 
 
 def record_bill(
@@ -6866,6 +7011,11 @@ def clicker_forbidden_tap(serial: str, x: int, y: int, purpose: str = "") -> boo
 
 def listener_forbidden_tap(serial: str, x: int, y: int, purpose: str = "") -> bool:
     """右机 LISTENER：仅钉死发送键或钉死输入框（composer-focus）允许 tap。"""
+    role = serial_role(serial)
+    if role == "LISTENER" or BOT_ROLE == "LISTENER":
+        if purpose in ("pinned-send", "composer-focus", "listener-fire"):
+            return False
+        return True
     if not is_listener_send_only_serial(serial) or not LISTENER_ZERO_NAV:
         return False
     if purpose == "composer-focus":
@@ -11482,6 +11632,23 @@ def bot_device_role(bot: dict, clicker_ids: set[str] | None = None) -> str:
     bid = str(bot.get("id") or "")
     clickers = clicker_ids if clicker_ids is not None else _clicker_bot_ids()
 
+    per = (
+        os.environ.get(f"BOT_ROLE_{bid}")
+        or bot.get("deviceRole")
+        or bot.get("role")
+        or ""
+    ).strip().upper()
+    if per in ("LISTENER", "CLICKER", "HYBRID"):
+        return per
+
+    if BOT_ROLE in ("LISTENER", "CLICKER", "HYBRID"):
+        if BOT_ROLE == "LISTENER" and bid == BOT_LISTENER_ID:
+            return "LISTENER"
+        if BOT_ROLE == "CLICKER" and bid in clickers:
+            return "CLICKER"
+        if BOT_ROLE == "HYBRID":
+            return "HYBRID"
+
     if ORCHESTRATOR and (BOT_LISTENER_ID or clickers):
         if bid == BOT_LISTENER_ID:
             return "LISTENER"
@@ -11490,14 +11657,6 @@ def bot_device_role(bot: dict, clicker_ids: set[str] | None = None) -> str:
         log.warning("bot %s 不在编排名单，按 CLICKER 处理", bid)
         return "CLICKER"
 
-    raw = (
-        bot.get("deviceRole")
-        or bot.get("role")
-        or os.environ.get(f"BOT_ROLE_{bid}")
-        or ""
-    ).strip().upper()
-    if raw in ("LISTENER", "CLICKER", "HYBRID"):
-        return raw
     if bid == BOT_LISTENER_ID:
         return "LISTENER"
     if bid in clickers:
@@ -11505,6 +11664,13 @@ def bot_device_role(bot: dict, clicker_ids: set[str] | None = None) -> str:
     if bid != BOT_LISTENER_ID:
         return "CLICKER"
     return "HYBRID"
+
+
+def bot_matches_deployment_role(bot: dict) -> bool:
+    """BOT_ROLE 单机部署：过滤与本进程身份不符的云机。"""
+    if BOT_ROLE not in ("LISTENER", "CLICKER"):
+        return True
+    return bot_device_role(bot) == BOT_ROLE
 
 
 def is_clicker_bot(bot: dict | None) -> bool:
@@ -11952,11 +12118,36 @@ class Orchestrator:
     def __init__(self) -> None:
         self.brain = Brain()
         self.ctx = SharedContext()
+        self.outbound_pool = get_outbound_task_pool()
         self._running = threading.Event()
         self._running.set()
         self._threads: list[threading.Thread] = []
         self._workers: dict[str, Worker] = {}
         self._serials: dict[str, str] = {}
+
+    def _dispatch_finance_outbox_hook(self, serial: str, bot: dict) -> None:
+        """Panel API 200 触发的上下分出站：有界池异步执行，brain-refresh 毫秒级返回。"""
+        bot_id = str(bot.get("id") or "")
+        try:
+            approved = api(
+                "GET",
+                f"/api/topup-requests?status=approved&botId={bot_id}",
+            )
+            if not isinstance(approved, list) or not approved:
+                return
+            _, _, _, settings = self.ctx.snapshot()
+            snap = ui_snapshot(serial, chat=False, channel="refresh")
+            send_xy = snap.inbar_send or snap.keyboard_send
+            if not in_target_group_chat(snap.root, bot, serial):
+                return
+            process_topup_outbox(
+                serial, bot, settings, snap.input_xy, send_xy,
+            )
+            process_withdraw_outbox(
+                serial, bot, settings, snap.input_xy, send_xy,
+            )
+        except Exception:
+            log.exception("上分出站异常 bot=%s", bot_id)
 
     def _refresh_loop(self) -> None:
         topup_counter = 0
@@ -11969,25 +12160,12 @@ class Orchestrator:
                     serial = self._serials.get(bot["id"])
                     if not serial:
                         continue
-                    try:
-                        approved = api(
-                            "GET",
-                            f"/api/topup-requests?status=approved&botId={bot['id']}",
-                        )
-                        if not isinstance(approved, list) or not approved:
-                            continue
-                        users, _, _, settings = self.ctx.snapshot()
-                        snap = ui_snapshot(serial, chat=False, channel="refresh")
-                        send_xy = snap.inbar_send or snap.keyboard_send
-                        if in_target_group_chat(snap.root, bot, serial):
-                            process_topup_outbox(
-                                serial, bot, settings, snap.input_xy, send_xy,
-                            )
-                            process_withdraw_outbox(
-                                serial, bot, settings, snap.input_xy, send_xy,
-                            )
-                    except Exception:
-                        log.exception("上分出站异常 bot=%s", bot.get("id"))
+                    submit_outbound_hook(
+                        self._dispatch_finance_outbox_hook,
+                        serial,
+                        bot,
+                        label=f"finance-outbox-{bot.get('id')}",
+                    )
             time.sleep(CONTEXT_REFRESH_SEC)
 
     def _listener_bots(self) -> list[dict]:
@@ -12423,6 +12601,8 @@ class Orchestrator:
                         mid = read_messenger_id_for_nick(
                             serial, task.nick, users, lbot["id"], bot=bot,
                         )
+                        if mid and GATEWAY_ENABLED:
+                            gateway_update_id(task.nick, mid)
                         if mid:
                             log.info("[%s] RESOLVE_CMD 已读 ID %s ← %s", name, mid, task.nick)
                         reply = handle_command(
@@ -12457,6 +12637,9 @@ class Orchestrator:
 
     def start(self, active: list[dict]) -> None:
         active = [b for b in active if str(b.get("id") or "") not in SKIP_BOT_IDS]
+        active = [b for b in active if bot_matches_deployment_role(b)]
+        if BOT_ROLE:
+            log.info("BOT_ROLE=%s GATEWAY=%s 本进程 active=%s", BOT_ROLE, GATEWAY_ENABLED, [b.get("id") for b in active])
         if SKIP_BOT_IDS:
             log.info("跳过 bot: %s", ",".join(sorted(SKIP_BOT_IDS)))
         validate_deploy_roles(active)
@@ -12488,6 +12671,11 @@ class Orchestrator:
         for serial, items in by_serial.items():
             if len(items) > 1:
                 log.warning("同一 serial %s 绑了 %d 个 bot，仅建议一机一号", serial, len(items))
+
+        log.info(
+            "出站并发池 outbound-pool max_workers=%d (公告/回复队列预留)",
+            self.outbound_pool.max_workers,
+        )
 
         if UI_COLLECTOR_ENABLED:
             for serial in by_serial:
@@ -12657,6 +12845,7 @@ class Orchestrator:
                 time.sleep(1)
         except KeyboardInterrupt:
             self._running.clear()
+            shutdown_outbound_task_pool()
 
 
 class Worker:
@@ -13096,8 +13285,27 @@ class Worker:
                     bot=self.bot,
                 )
             ):
+                gw = listener_gateway_resolve(serial, self.bot["id"], snd, cmd)
+                if gw == "hit":
+                    reply = handle_command(
+                        cmd, self.bot, users, products, combo_rules, settings, snd,
+                        cmd_serial, cache_serial=serial,
+                    )
+                    if reply:
+                        mark_cmds_seen(self.seen_ids, msgs, cmd, snd, hint)
+                        if cmd_y > 0 and snd:
+                            record_handled_cmd_y(self._handled_cmd_y, cmd, snd, cmd_y)
+                        reply = with_user_header(reply, snd)
+                        enqueue_send(
+                            serial, self.bot, reply, settings,
+                            input_xy=input_xy, send_xy=send_xy, group_ok=self.in_group,
+                        )
+                        post_log(f"[ADB] 已回复(网关缓存): {reply[:100]}", "SUCCESS")
+                    else:
+                        mark_cmds_seen(self.seen_ids, msgs, cmd, snd, hint)
+                    break
                 if self.brain.submit_resolve_cmd(self.bot["id"], snd, cmd_y or 0, mid, cmd):
-                    log.info("认人+指令已委派 Clicker ← [%s] %s y=%s", snd, cmd, cmd_y)
+                    log.info("认人+指令已委派 Clicker ← [%s] %s y=%s gw=%s", snd, cmd, cmd_y, gw)
                     mark_cmds_seen(self.seen_ids, msgs, cmd, snd, hint)
                 else:
                     log.warning("Clicker 不可用，无法认人: [%s] %s", snd, cmd)
@@ -13266,9 +13474,10 @@ def main() -> None:
         main_legacy()
         return
     log.info(
-        "启动(大脑编排) API=%s FAST=%s LISTENER=%s CLICKER=%s tick=%.0fms "
+        "启动(大脑编排) API=%s FAST=%s LISTENER=%s CLICKER=%s BOT_ROLE=%s GATEWAY=%s tick=%.0fms "
         "ROI=%s CV2=%s SEND=%s PRIO=1",
         API_BASE, FAST, BOT_LISTENER_ID, ",".join(sorted(CLICKER_BOT_IDS)),
+        BOT_ROLE or "-", GATEWAY_ENABLED,
         LISTENER_TICK_SEC * 1000,
         FAST_DETECT_ENABLED, _HAS_CV2,
         LISTENER_SEND_MODE if LISTENER_FAST_SEND else "off",
