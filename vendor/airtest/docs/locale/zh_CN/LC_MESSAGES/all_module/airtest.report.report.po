@@ -1,0 +1,153 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2017, Game-Netease
+# This file is distributed under the same license as the airtest package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2017.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: airtest \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2021-06-21 14:38+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.9.0\n"
+
+#: ../../all_module/airtest.report.report.rst:2
+msgid "airtest.report.report module"
+msgstr ""
+
+#: airtest.report.report.timefmt:1 of
+#, python-format
+msgid ""
+"Formatting of timestamp in Jinja2 templates :param timestamp: timestamp "
+"of steps :return: \"%Y-%m-%d %H:%M:%S\""
+msgstr ""
+
+#: airtest.report.report.LogToHtml:1 of
+msgid "基类：:class:`object`"
+msgstr ""
+
+#: airtest.report.report.LogToHtml:1 of
+msgid "Convert log to html display"
+msgstr ""
+
+#: airtest.report.report.LogToHtml.get_thumbnail:1 of
+msgid "compress screenshot"
+msgstr ""
+
+#: airtest.report.report.LogToHtml.div_rect:1 of
+msgid "count rect for js use"
+msgstr ""
+
+#: airtest.report.report.LogToHtml.get_relative_log:1 of
+msgid ""
+"Try to get the relative path of log.txt :param output_file: output file: "
+"log.html :return: ./log.txt or \"\""
+msgstr ""
+
+#: airtest.report.report.LogToHtml.report_data:1 of
+msgid "Generate data for the report page"
+msgstr ""
+
+#: airtest.report.report.LogToHtml.report
+#: airtest.report.report.LogToHtml.report_data of
+msgid "参数"
+msgstr ""
+
+#: airtest.report.report.LogToHtml.report:4
+#: airtest.report.report.LogToHtml.report_data:3 of
+msgid "The file name or full path of the output file, default HTML_FILE"
+msgstr ""
+
+#: airtest.report.report.LogToHtml.report:5
+#: airtest.report.report.LogToHtml.report_data:4 of
+msgid "List of screen recording files"
+msgstr ""
+
+#: airtest.report.report.LogToHtml.report
+#: airtest.report.report.LogToHtml.report_data of
+msgid "返回"
+msgstr ""
+
+#: airtest.report.report.LogToHtml.report:1 of
+msgid ""
+"Generate the report page, you can add custom data and overload it if "
+"needed"
+msgstr ""
+
+#: airtest.report.report.LogToHtml.report:3 of
+msgid "default is HTML_TPL"
+msgstr ""
+
+#~ msgid "server_call没有log assert 类似于exist"
+#~ msgstr ""
+
+#~ msgid ""
+#~ "处理poco的相关操作，参数与airtest的不同，由一个截图和一个操作构成，需要合成一个步骤 :param "
+#~ "step 一个完整的操作，如click: :param prev_step "
+#~ "前一个步骤，应该是截图:"
+#~ msgstr ""
+
+#~ msgid "把对应的poco操作显示成中文"
+#~ msgstr ""
+
+#~ msgid "进一步解析成模板可显示的内容"
+#~ msgstr ""
+
+#~ msgid "按照depth = 1 的name来分类 touch,swipe,wait,exist 都是搜索图片位置，然后执行操作，包括3层调用"
+#~ msgstr ""
+
+#~ msgid "3=screenshot 2= _loop_find  1=本身操作"
+#~ msgstr ""
+
+#~ msgid "keyevent,text,sleep 和图片无关，直接显示一条说明就可以"
+#~ msgstr ""
+
+#~ msgid "1= 本身"
+#~ msgstr ""
+
+#~ msgid "assert 类似于exist"
+#~ msgstr ""
+
+#~ msgid "把对应函数(depth=1)的name显示成中文"
+#~ msgstr ""
+
+#~ msgid "Bases: :class:`object`"
+#~ msgstr ""
+
+#~ msgid "基类：:class:`object`"
+#~ msgstr ""
+
+#~ msgid "airtest\\.report\\.report module"
+#~ msgstr ""
+
+#~ msgid ""
+#~ "Generate data for the report page "
+#~ ":param output_file: The file name or "
+#~ "full path of the output file, "
+#~ "default HTML_FILE :param record_list: List "
+#~ "of screen recording files :return:"
+#~ msgstr ""
+
+#~ msgid ""
+#~ "Generate the report page, you can "
+#~ "add custom data and overload it if"
+#~ " needed :param template_name: default is"
+#~ " HTML_TPL :param output_file: The file "
+#~ "name or full path of the output"
+#~ " file, default HTML_FILE :param "
+#~ "record_list: List of screen recording "
+#~ "files :return:"
+#~ msgstr ""
+
+#~ msgid "Parameters"
+#~ msgstr ""
+
+#~ msgid "Returns"
+#~ msgstr ""
+

@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.env
+*.log
+vendor/*/.git/
+vendor/*/.git
+
+# Local secrets / tunnel credentials
+config/tunnel-left.env
+config/tunnel-right.env
+
+# Session debug artifacts (root)
+/_*.py
+/*.png
+/_log_snip.txt
+/artifacts/
+/logs/
+
+# One-off diagnostic scripts
+/scripts/_*.py
+/scripts/_*.txt

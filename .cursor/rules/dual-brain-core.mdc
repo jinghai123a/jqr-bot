@@ -1,0 +1,42 @@
+---
+description: 双脑机器人仓库核心架构与编码约束（本仓库专用）
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+# 双脑机器人 · 本仓库
+
+## 代码地图
+
+| 路径 | 职责 |
+|------|------|
+| `bot_55chat_daemon.py` | 主守护进程：API、读屏、下注解析、双机编排、Probe |
+| `probe-android/` | Trime/无障碍 Probe（Kotlin） |
+| `scripts/vps_*.py` | VPS 部署、日志、审计脚本 |
+
+## 双机架构（硬约束）
+
+- **右机 LISTENER**（`bot-4`）：读屏 + 热路径回复，尽量零多余点击。
+- **左机 CLICKER**（`bot-3`）：ADD 等需点击流程；完成后把结果交回 LISTENER 发群文案。
+- 认人靠 **messengerId 绑定**；不点头像拿不到 ID。按千人群规模设计，不按当前小群偷懒。
+- 不绑官方 IM API；Platform-agnostic、rule-driven。
+
+## 业务规则
+
+- 下注金额后缀只认 **「各」**；「合+数字」报格式错误，不自动等同「各」。
+- 对外性能表述用「亚秒级/秒级」，不夸大「毫秒级」。
+
+## 编码偏好
+
+- 最小 diff；不擅自扩 scope；未要求不 git commit。
+- 改 `bot_55chat_daemon.py` 前先读周边现有模式（`Worker`、`ORCHESTRATOR`、env 开关）。
+- 本仓库与 Netlify / Zapier / 爬虫 SaaS / Asana **无关**；除非 W49 明确要求，不加载对应 plugin skill 或 MCP。
+
+## 项目记忆
+
+完整坐标、部署、成败记录见 **`project-memory-55chat.mdc`**（alwaysApply）。
+
+## ADD 流程
+
+见全局规则 `dual-brain-add-flow-pending`（`alwaysApply: false`，需要时 @ 引用）。

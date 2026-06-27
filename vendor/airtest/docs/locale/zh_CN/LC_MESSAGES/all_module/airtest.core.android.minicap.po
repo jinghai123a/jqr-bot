@@ -1,0 +1,125 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2017, Game-Netease
+# This file is distributed under the same license as the airtest package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2017.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: airtest \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2021-06-21 14:12+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.9.0\n"
+
+#: ../../all_module/airtest.core.android.minicap.rst:2
+msgid "airtest.core.android.minicap module"
+msgstr ""
+
+#~ msgid "返回"
+#~ msgstr ""
+
+#~ msgid "参数"
+#~ msgstr ""
+
+#~ msgid "Returns"
+#~ msgstr ""
+
+#~ msgid "Parameters"
+#~ msgstr ""
+
+#~ msgid "Bases: :class:`object`"
+#~ msgstr ""
+
+#~ msgid "基类：:class:`object`"
+#~ msgstr ""
+
+#~ msgid "airtest\\.core\\.android\\.minicap module"
+#~ msgstr ""
+
+#~ msgid "super fast android screenshot method from stf minicap."
+#~ msgstr ""
+
+#~ msgid "reference https://github.com/openstf/minicap"
+#~ msgstr ""
+
+#~ msgid "Install or upgrade minicap"
+#~ msgstr ""
+
+#~ msgid "None"
+#~ msgstr ""
+
+#~ msgid "Uninstall minicap"
+#~ msgstr ""
+
+#~ msgid "Install minicap"
+#~ msgstr ""
+
+#~ msgid "Reference: https://github.com/openstf/minicap/blob/master/run.sh"
+#~ msgstr ""
+
+#~ msgid "Get display info by minicap"
+#~ msgstr ""
+
+#~ msgid ""
+#~ "It might segfault, the preferred way "
+#~ "is to get the information from adb"
+#~ " commands"
+#~ msgstr ""
+
+#~ msgid "display information"
+#~ msgstr ""
+
+#~ msgid ""
+#~ "Get the single frame from minicap "
+#~ "-s, this method slower than `get_frames`"
+#~ msgstr ""
+
+#~ msgid "1. shell cmd 1. remove log info 1."
+#~ msgstr ""
+
+#~ msgid "Args:"
+#~ msgstr ""
+
+#~ msgid ""
+#~ "projection: screenshot projection, default is"
+#~ " None which means using self.projection"
+#~ msgstr ""
+
+#~ msgid "Returns:"
+#~ msgstr ""
+
+#~ msgid "jpg data"
+#~ msgstr ""
+
+#~ msgid ""
+#~ "Get stream, it uses `adb forward`and "
+#~ "socket communication. Use minicap ``lazy``mode"
+#~ " (provided by gzmaruijie) for long "
+#~ "connections - returns one latest frame"
+#~ " from the server"
+#~ msgstr ""
+
+#~ msgid "True or False"
+#~ msgstr ""
+
+#~ msgid "Get one frame from minicap stream"
+#~ msgstr ""
+
+#~ msgid "frame"
+#~ msgstr ""
+
+#~ msgid "Update rotation and reset the backend stream generator"
+#~ msgstr ""
+
+#~ msgid "rotation input"
+#~ msgstr ""
+
+#~ msgid "End the stream"
+#~ msgstr ""
+
