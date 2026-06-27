@@ -27,6 +27,9 @@ from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from bot_backend import BackendApiTransport, fetch_user_bills as _fetch_user_bills_impl, record_bill as _record_bill_impl
+import bot_probe
+
 try:
     from board_capture import (
         render_mark6_board_png,
@@ -167,11 +170,9 @@ TRIME_APK_URL = os.environ.get(
     "BOT_TRIME_APK_URL",
     "https://github.com/osfans/trime/releases/download/v3.2.11/trime-3.2.11-arm64-v8a-release.apk",
 )
-_PROBE_EVENTS: queue.Queue = queue.Queue(maxsize=800)
 _PROBE_DEDUP: dict[str, float] = {}
 _COMMAND_CLAIM: dict[str, float] = {}
 _OUTBOUND_TEXT_DEDUP: dict[str, float] = {}
-_PROBE_SERVER_STARTED = False
 PROBE_CMD_DEDUP_SEC = max(1.0, float(os.environ.get("BOT_PROBE_CMD_DEDUP_SEC", "5") or 5))
 OUTBOUND_DEDUP_SEC = max(2.0, float(os.environ.get("BOT_OUTBOUND_DEDUP_SEC", "8") or 8))
 
@@ -665,6 +666,7 @@ def wc(sec: float, fast: float | None = None) -> None:
         w(sec, fast)
 
 API_BASE = os.environ.get("BOT_API_BASE", "http://127.0.0.1:3000").rstrip("/")
+_BACKEND = BackendApiTransport(API_BASE, timeout=10)
 DEFAULT_ADB = os.environ.get("VITE_DEFAULT_ADB_HOST", "localhost:56313")
 DEFAULT_GROUP_USER = os.environ.get("BOT_GROUP_DEFAULT_USER", "qwer")
 GROUP_TITLE_RE = re.compile(r"^.+\(\d+\)$")
@@ -1821,14 +1823,7 @@ def needs_registration_reply(cmd: str) -> bool:
 
 
 def fetch_user_bills(bot_id: str, username: str, limit: int = 15) -> list[dict]:
-    try:
-        rows = api(
-            "GET",
-            f"/api/bills?botId={bot_id}&username={urllib.parse.quote(username)}&limit={limit}",
-        )
-        return rows if isinstance(rows, list) else []
-    except Exception:
-        return []
+    return _fetch_user_bills_impl(_BACKEND, bot_id, username, limit)
 
 
 def format_round_bets_reply(user: dict, bot_id: str, settings: dict[str, str], username: str) -> str:
@@ -6270,15 +6265,7 @@ def _sender_for_index(texts: list[str], idx: int, pool: dict[str, list[dict]]) -
 
 
 def api(method: str, path: str, body: Any = None) -> Any:
-    url = f"{API_BASE}{path}"
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(
-        url, data=data, method=method,
-        headers={"Content-Type": "application/json"} if data else {},
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw else None
+    return _BACKEND.request(method, path, body)
 
 
 def record_bill(
@@ -6290,18 +6277,17 @@ def record_bill(
     detail: str = "",
     customer_code: str = "",
 ) -> None:
-    try:
-        api("POST", "/api/bills", {
-            "botId": bot_id,
-            "username": username,
-            "type": bill_type,
-            "amount": round(float(amount), 3),
-            "balanceAfter": round(float(balance_after), 3),
-            "detail": detail,
-            "customerCode": customer_code,
-        })
-    except Exception as ex:
-        log.warning("账单记录失败: %s", ex)
+    _record_bill_impl(
+        _BACKEND,
+        log,
+        bot_id,
+        username,
+        bill_type,
+        amount,
+        balance_after,
+        detail,
+        customer_code,
+    )
 
 
 def adb_run(serial: str, *args: str, timeout: int = 20) -> str:
@@ -7610,63 +7596,15 @@ def try_claim_command(
 
 
 def drain_probe_events() -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    while True:
-        try:
-            out.append(_PROBE_EVENTS.get_nowait())
-        except queue.Empty:
-            break
-    return out
+    return bot_probe.drain_events()
 
 
 def probe_events_pending() -> bool:
-    return not _PROBE_EVENTS.empty()
-
-
-class _ProbeHandler(BaseHTTPRequestHandler):
-    def log_message(self, fmt: str, *args: Any) -> None:
-        return
-
-    def do_POST(self) -> None:
-        if self.path not in ("/event", "/api/probe/event"):
-            self.send_response(404)
-            self.end_headers()
-            return
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(length) if length > 0 else b"{}"
-        try:
-            ev = json.loads(raw.decode("utf-8"))
-            if isinstance(ev, dict):
-                _PROBE_EVENTS.put_nowait(ev)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"ok")
-        except Exception:
-            self.send_response(400)
-            self.end_headers()
+    return bot_probe.events_pending()
 
 
 def start_probe_server() -> None:
-    global _PROBE_SERVER_STARTED
-    if _PROBE_SERVER_STARTED or not PROBE_ENABLED:
-        return
-
-    def _serve() -> None:
-        try:
-            srv = HTTPServer(("0.0.0.0", PROBE_PORT), _ProbeHandler)
-            global _PROBE_SERVER_STARTED
-            _PROBE_SERVER_STARTED = True
-            log.info("探针 HTTP 监听 0.0.0.0:%d (adb reverse tcp:%d tcp:%d)", PROBE_PORT, PROBE_PORT, PROBE_PORT)
-            srv.serve_forever()
-        except OSError as ex:
-            if getattr(ex, "errno", None) == 98:
-                log.info("探针 HTTP 端口 %d 已被占用（已有实例在监听）", PROBE_PORT)
-                _PROBE_SERVER_STARTED = True
-            else:
-                log.warning("探针 HTTP 启动失败: %s", ex)
-
-    threading.Thread(target=_serve, name="probe-http", daemon=True).start()
+    bot_probe.start_probe_server(port=PROBE_PORT, enabled=PROBE_ENABLED)
 
 
 def setup_probe_adb_reverse(serial: str) -> None:
