@@ -5,9 +5,17 @@ __pycache__/
 vendor/*/.git/
 vendor/*/.git
 
-# Local secrets / tunnel credentials
+# Local secrets / tunnel credentials / machine-specific runtime
+config/bot-start.env
 config/tunnel-left.env
 config/tunnel-right.env
+config/vps-ssh.env
+config/vmos-api.env
+config/tunnel-creds.local.env
+config/本地-VMOS-开发者凭证.md
+
+# Local dev caches
+.pytest_cache/
 
 # Session debug artifacts (root)
 /_*.py

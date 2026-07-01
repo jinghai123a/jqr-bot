@@ -6,13 +6,21 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from .adb_probe import adb_probe_port
 from .env_io import load_env_file, parse_local_port, write_tunnel_env
+from .expire_schedule import adb_expire_minutes
 from .pad_resolve import resolve_pad_code
-from .ssh_parse import parse_ssh_command
+from .ssh_parse import parse_ssh_command, rewrite_adb_connect_port, rewrite_ssh_forward_port
 
 SleepFn = Callable[[float], None]
 RunSubprocess = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def _adb_expire_minutes() -> int:
+    return adb_expire_minutes()
 
 
 def fetch_adb_with_backoff(
@@ -43,7 +51,7 @@ def fetch_adb_with_backoff(
                         client.wait_open_adb_tasks(tasks)
                 except RuntimeError:
                     pass
-            adb = client.get_adb(pad_code, enable=True, expire_minutes=10080, retries=3)
+            adb = client.get_adb(pad_code, enable=True, expire_minutes=_adb_expire_minutes(), retries=3)
             command = str(adb.get("command") or "")
             ssh_pass = str(adb.get("key") or "")
             if not command or not ssh_pass:
@@ -85,7 +93,7 @@ def refresh_side_credentials(
                 client.wait_open_adb_tasks(tasks)
             except RuntimeError as exc:
                 print(f"[warn] openOnlineAdb {side}: {exc}")
-            adb = client.get_adb(code, enable=True, expire_minutes=10080, retries=3)
+            adb = client.get_adb(code, enable=True, expire_minutes=_adb_expire_minutes(), retries=3)
             command = str(adb.get("command") or "")
             ssh_pass = str(adb.get("key") or "")
             if not command or not ssh_pass:
@@ -109,10 +117,18 @@ def refresh_side_credentials(
     adb_cmd = str(adb.get("adb") or "")
     ssh_pass = str(adb.get("key") or "")
     host, ssh_port, user = parse_ssh_command(command)
-    api_port = parse_local_port(command, adb_cmd, port)
+    canonical = str(port)
+    api_port = parse_local_port(command, adb_cmd, canonical)
+    if api_port != canonical:
+        print(f"[{side}] normalize OpenAPI local port {api_port} -> {canonical}")
+    command = rewrite_ssh_forward_port(command, canonical)
+    adb_cmd = rewrite_adb_connect_port(adb_cmd, canonical)
+    bind_ip = str(cfg.get("tunnel_bind") or "").strip()
+    exp_mins = _adb_expire_minutes()
+    issued = datetime.now(tz=ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
     write_tunnel_env(
         tunnel_file,
-        api_port,
+        canonical,
         host,
         ssh_port,
         user,
@@ -120,10 +136,14 @@ def refresh_side_credentials(
         ssh_command=command,
         adb_command=adb_cmd,
         expire_time=str(adb.get("expireTime") or ""),
+        expire_minutes=str(exp_mins),
+        issued_at=issued,
+        tunnel_bind_ip=bind_ip,
     )
     print(
         f"[{side}] updated {tunnel_file.name} "
-        f"port={api_port} host={host}:{ssh_port} expire={adb.get('expireTime')}"
+        f"port={canonical} host={host}:{ssh_port} expire={adb.get('expireTime')}",
+        flush=True,
     )
     return True, None
 

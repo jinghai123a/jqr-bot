@@ -50,12 +50,19 @@ def write_tunnel_env(
     ssh_command: str = "",
     adb_command: str = "",
     expire_time: str = "",
+    expire_minutes: str = "",
+    issued_at: str = "",
+    tunnel_bind_ip: str = "",
     header: str = "# auto-updated by vmos-refresh-tunnels.py — VMOS OpenAPI padApi/adb 原文",
 ) -> None:
-    """Persist OpenAPI command/adb verbatim (do not rewrite)."""
+    """Persist OpenAPI command/adb (local -L / adb connect 已归一化到 LOCAL_PORT)。"""
     lines = [
         header,
         "# 文档: https://cloud.vmoscloud.com/vmoscloud/doc/zh/server/OpenAPI.html",
+    ]
+    if tunnel_bind_ip:
+        lines.append(shell_env_line("TUNNEL_SSH_BIND_IP", tunnel_bind_ip))
+    lines.extend([
         shell_env_line("LOCAL_PORT", local_port),
         shell_env_line("VMOS_SSH_COMMAND", ssh_command.strip()),
         shell_env_line("VMOS_ADB_COMMAND", adb_command.strip()),
@@ -64,7 +71,10 @@ def write_tunnel_env(
         shell_env_line("SSH_USER", ssh_user),
         shell_env_line("SSH_PASS", ssh_pass),
         shell_env_line("EXPIRE_TIME", expire_time),
-    ]
+        shell_env_line("EXPIRE_MINUTES", expire_minutes),
+        shell_env_line("ISSUED_AT", issued_at),
+    ])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    content = "\n".join(lines) + "\n"
+    path.write_bytes(content.encode("utf-8"))
     os.chmod(path, 0o600)
