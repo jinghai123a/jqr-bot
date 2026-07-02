@@ -14,7 +14,6 @@ import subprocess
 import sys
 import time
 import html
-import fcntl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from collections import Counter, deque, defaultdict
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from bot_backend import BackendApiTransport, fetch_user_bills as _fetch_user_bills_impl, record_bill as _record_bill_impl
@@ -33,9 +33,11 @@ import bot_probe
 
 try:
     from board_capture import (
+        patch_trade_flow_draw,
         render_mark6_board_png,
         render_pc28_board_png,
         render_trade_flow_png,
+        upsert_board_rows,
     )
     _HAS_BOARD_CAPTURE = True
 except ImportError:
@@ -50,6 +52,7 @@ log = logging.getLogger("55chat")
 
 FAST = os.environ.get("BOT_FAST_MODE", "1").lower() in ("1", "true", "yes")
 ORCHESTRATOR = os.environ.get("BOT_ORCHESTRATOR", "1").lower() in ("1", "true", "yes")
+_ACTIVE_ORCH: Any = None  # Orchestrator 实例（ingress IPC 用）
 BOT_LISTENER_ID = os.environ.get("BOT_LISTENER_ID", "bot-4").strip()
 CLICKER_BOT_IDS = {
     x.strip()
@@ -64,8 +67,8 @@ CLICKER_STAY_IN_CHAT = os.environ.get("BOT_CLICKER_STAY_IN_CHAT", "1").lower() i
 CLICKER_STAY_SEC = max(15.0, float(os.environ.get("BOT_CLICKER_STAY_SEC", "30") or 30))
 CLICKER_FAST = os.environ.get("BOT_CLICKER_FAST", "1").lower() in ("1", "true", "yes")
 # DEPLOY LOCK: 左机 CLICKER | 右机 LISTENER（端口见 env，云机重启后可能变）
-_LISTENER_ADB_PORT = os.environ.get("BOT_LISTENER_ADB_PORT", "60478").strip()
-_CLICKER_ADB_PORT = os.environ.get("BOT_CLICKER_ADB_PORT", "52840").strip()
+_LISTENER_ADB_PORT = os.environ.get("BOT_LISTENER_ADB_PORT", "58433").strip()
+_CLICKER_ADB_PORT = os.environ.get("BOT_CLICKER_ADB_PORT", "59162").strip()
 DEPLOY_ADB_ROLES = {
     "bot-3": (_CLICKER_ADB_PORT, "CLICKER"),
     "bot-4": (_LISTENER_ADB_PORT, "LISTENER"),
@@ -97,11 +100,25 @@ CLICKER_IDLE_SEC = max(0.05, float(os.environ.get("BOT_CLICKER_IDLE_SEC", "0.08"
 BOT_ROLE = os.environ.get("BOT_ROLE", "").strip().upper()
 GATEWAY_ENABLED = os.environ.get("BOT_GATEWAY_ENABLED", "1").lower() in ("1", "true", "yes")
 GATEWAY_BASE_URL = os.environ.get("BOT_GATEWAY_URL", "http://127.0.0.1:8765").rstrip("/")
-GATEWAY_TIMEOUT_SEC = max(1.0, float(os.environ.get("BOT_GATEWAY_TIMEOUT_SEC", "3") or 3))
+GATEWAY_TIMEOUT_SEC = max(0.15, float(os.environ.get("BOT_GATEWAY_TIMEOUT_SEC", "0.2") or 0.2))
+GATEWAY_WARM_SEC = max(3.0, float(os.environ.get("BOT_GATEWAY_WARM_SEC", "5") or 5))
+PANEL_SEND_GATE = os.environ.get("BOT_PANEL_SEND_GATE", "1").lower() in ("1", "true", "yes")
+PANEL_CHECK_TTL_SEC = max(0.5, float(os.environ.get("BOT_PANEL_CHECK_TTL_SEC", "1") or 1))
+_PANEL_OK_UNTIL: float = 0.0
 LOG_WORKER_THREADS = max(1, int(os.environ.get("BOT_LOG_WORKERS", "4") or 4))
+_role_log = os.environ.get(f"BOT_{os.environ.get('BOT_ROLE', '').upper()}_LOG_WORKERS", "").strip()
+if _role_log:
+    LOG_WORKER_THREADS = max(1, int(_role_log))
 # 公告/回复并发：有界线程池上限（后续 Hook / 剪贴板快发任务统一入口）
 OUTBOUND_POOL_MAX = max(1, min(10, int(os.environ.get("BOT_OUTBOUND_POOL_MAX", "10") or 10)))
-CONTEXT_REFRESH_SEC = max(1.0, float(os.environ.get("BOT_CONTEXT_REFRESH_SEC", "2") or 2))
+_role_pool = os.environ.get(f"BOT_{os.environ.get('BOT_ROLE', '').upper()}_OUTBOUND_POOL_MAX", "").strip()
+if _role_pool:
+    OUTBOUND_POOL_MAX = max(1, min(10, int(_role_pool or OUTBOUND_POOL_MAX)))
+CONTEXT_REFRESH_SEC = max(1.0, float(os.environ.get("BOT_CONTEXT_REFRESH_SEC", "1") or 1))
+CLICKER_CONTEXT_REFRESH_SEC = max(
+    CONTEXT_REFRESH_SEC,
+    float(os.environ.get("BOT_CLICKER_CONTEXT_REFRESH_SEC", "10") or 10),
+)
 SEND_DEBOUNCE_SEC = max(0.02, float(os.environ.get("BOT_SEND_DEBOUNCE_SEC", "0.03") or 0.03))
 POST_PANEL_LOG = os.environ.get("BOT_POST_PANEL_LOG", "0" if FAST else "1").lower() in ("1", "true", "yes")
 # 全自动昵称：用历史别名识别到用户后，自动把面板群昵称更新为当前群昵称（无需发「绑定」）
@@ -142,13 +159,21 @@ LISTENER_SEND_TAP_ONLY = os.environ.get("BOT_LISTENER_SEND_TAP_ONLY", "1").lower
 LISTENER_SEND_TAP_TOL = max(20, int(os.environ.get("BOT_LISTENER_SEND_TOL", "42") or 42))
 # 右机禁止 Tab/群名/左上角等导航点击
 LISTENER_ZERO_NAV = os.environ.get("BOT_LISTENER_ZERO_NAV", "1").lower() in ("1", "true", "yes")
+CLICKER_ZERO_NAV = os.environ.get("BOT_CLICKER_ZERO_NAV", "1").lower() in ("1", "true", "yes")
 # 右机读屏/空闲时强制收起键盘，避免 Gboard 遮挡气泡导致认不到指令
 LISTENER_HIDE_KEYBOARD = os.environ.get("BOT_LISTENER_HIDE_KEYBOARD", "0").lower() in (
     "1", "true", "yes",
 )
 # 右机 b64 后：灌字完成即点钉死发送键，不做多轮 dump 等箭头
 LISTENER_BLUE_SEND_POLLS = max(
-    1, min(3, int(os.environ.get("BOT_LISTENER_BLUE_SEND_POLLS", "1") or 1)),
+    1, min(40, int(os.environ.get("BOT_LISTENER_BLUE_SEND_POLLS", "20") or 20)),
+)
+# 封盘/公告 UI 验发硬截止（毫秒）；超时走 trust-fallback，禁止阻塞 sender 队列
+LISTENER_ANNOUNCE_VERIFY_MAX_MS = max(
+    500, min(5000, int(os.environ.get("BOT_LISTENER_ANNOUNCE_VERIFY_MAX_MS", "2000") or 2000)),
+)
+LISTENER_ANNOUNCE_TRUST_FALLBACK = os.environ.get("BOT_LISTENER_ANNOUNCE_TRUST_FALLBACK", "1").lower() in (
+    "1", "true", "yes",
 )
 LISTENER_SEND_FIRE = os.environ.get("BOT_LISTENER_SEND_FIRE", "1").lower() in (
     "1", "true", "yes",
@@ -189,7 +214,22 @@ IMG_PINNED = os.environ.get("BOT_IMG_PINNED", "1").lower() in ("1", "true", "yes
 CLICK_VERIFY = os.environ.get("BOT_CLICK_VERIFY", "1").lower() in ("1", "true", "yes")
 # W49：55M 自定义 UI 导致 uiautomator 验证不可靠，信任钉死坐标点击，跳过验证
 IMG_TRUST_CLICK = os.environ.get("BOT_IMG_TRUST_CLICK", "1").lower() in ("1", "true", "yes")
+# 左机发图：钉死 04:16 成功坐标序，跳过读屏/grid 漂移
+IMG_LOCKED = os.environ.get("BOT_IMG_LOCKED", "1").lower() in ("1", "true", "yes")
+# 左机发图快路径：缩短 push/勾选/发送等待（亚秒级链）
+IMG_FAST = os.environ.get("BOT_IMG_FAST", "1").lower() in ("1", "true", "yes")
+IMG_CHECK_W_SEC = max(0.06, float(os.environ.get("BOT_IMG_CHECK_W_SEC", "0.10") or 0.10))
+IMG_SEND_W_SEC = max(0.12, float(os.environ.get("BOT_IMG_SEND_W_SEC", "0.22") or 0.22))
+IMG_ATTACH_W_SEC = max(0.20, float(os.environ.get("BOT_IMG_ATTACH_W_SEC", "0.32") or 0.32))
 CLICK_VERIFY_TRIES = max(1, int(os.environ.get("BOT_CLICK_VERIFY_TRIES", "3") or 3))
+# §3.2 顶行三圈钉死兜底（与 config/pinned-coords.json 一致，04:16 实弹序）
+_GALLERY_CHECK_TOP3_FALLBACK: tuple[tuple[int, int], ...] = (
+    (654, 374),
+    (429, 374),
+    (205, 374),
+)
+GALLERY_PUSH_SETTLE_SEC = max(0.15, float(os.environ.get("BOT_GALLERY_PUSH_SETTLE_SEC", "0.28") or 0.28))
+GALLERY_OPEN_RETRIES = max(1, int(os.environ.get("BOT_GALLERY_OPEN_RETRIES", "3") or 3))
 # W49 截图：点 + 后附件栏应出现的锚点（至少命中「图片」）
 ATTACH_MENU_MARKERS = ("图片", "拍摄", "名片", "文件", "红包", "群聊转账")
 CLICKER_TAP_MS = max(40, int(os.environ.get("BOT_CLICKER_TAP_MS", "80") or 80))
@@ -197,8 +237,12 @@ CLICKER_TAP_MS = max(40, int(os.environ.get("BOT_CLICKER_TAP_MS", "80") or 80))
 CLICKER_IMG_TAP_ONLY = os.environ.get("BOT_CLICKER_IMG_TAP_ONLY", "1").lower() in ("1", "true", "yes")
 CLICKER_IMG_TAP_TOL = max(24, int(os.environ.get("BOT_CLICKER_IMG_TAP_TOL", "52") or 52))
 _CLICKER_IMG_FLOW_SERIALS: set[str] = set()
+_CLICKER_IMG_FLOW_SINCE: dict[str, float] = {}
 _CLICKER_ATTACH_IME_RESTORE: dict[str, str] = {}
 _CLICKER_ATTACH_IME_DISABLED: dict[str, list[str]] = {}
+GALLERY_PURGE_INTERVAL_SEC = max(60, int(os.environ.get("BOT_GALLERY_PURGE_SEC", "3600") or 3600))
+CLICKER_IMG_FLOW_MAX_SEC = max(45, int(os.environ.get("BOT_CLICKER_IMG_FLOW_MAX_SEC", "120") or 120))
+_GALLERY_LAST_PURGE: dict[str, float] = {}
 
 
 def _pinned_coords_path() -> str:
@@ -240,9 +284,40 @@ def pinned_xy(role: str, key: str, index: int | None = None) -> tuple[int, int] 
     return None
 
 
+def _clicker_settle_pinned_pair() -> tuple[tuple[int, int], tuple[int, int]]:
+    """结算发图：零读屏钉死 + / 批量发送坐标。"""
+    ix = pinned_xy("clicker", "chat_plus") or (45, 1235)
+    sy = pinned_xy("clicker", "gallery_batch_send") or (668, 1210)
+    return ix, sy
+
+
+def _settle_capture_fast(gallery_preloaded: bool, settle_rid: int, serial: str) -> bool:
+    return (
+        gallery_preloaded
+        and settle_rid > 0
+        and IMG_LOCKED
+        and is_clicker_serial(serial)
+    )
+
+
+def _settle_cloud_no_audit(serial: str) -> bool:
+    """铁律4：结算发图云机只 tap，不做 uiautomator/OCR 审核。"""
+    return IMG_LOCKED and IMG_TRUST_CLICK and is_clicker_serial(serial)
+
+
 def clicker_w(fast_sec: float = 0.12, slow_sec: float = 0.35) -> None:
     """左机点击间隔（亚秒）。"""
     w(CLICKER_TAP_MS / 1000.0 if CLICKER_FAST else fast_sec, slow_sec)
+
+
+def clicker_img_w(fast_sec: float | None = None, slow_sec: float | None = None) -> None:
+    """左机发图链专用等待（IMG_FAST 时更短）。"""
+    if IMG_FAST:
+        fs = IMG_CHECK_W_SEC if fast_sec is None else fast_sec
+        ss = (IMG_CHECK_W_SEC + 0.08) if slow_sec is None else slow_sec
+        w(fs, ss)
+    else:
+        clicker_w(0.28 if fast_sec is None else fast_sec, 0.18 if slow_sec is None else slow_sec)
 
 
 def _orchestrator_peer_bot_ids() -> set[str]:
@@ -263,11 +338,21 @@ def user_in_bot_scope(user: dict, bot_id: str) -> bool:
         return True
     peers = _orchestrator_peer_bot_ids()
     return bool(peers) and ub in peers and bot_id in peers
-LISTENER_STAY_IN_GROUP = os.environ.get("BOT_LISTENER_STAY_IN_GROUP", "1").lower() in ("1", "true", "yes")
+LISTENER_STAY_IN_GROUP = os.environ.get("BOT_LISTENER_STAY_IN_GROUP", "0").lower() in ("1", "true", "yes")
+LISTENER_AUTO_RECOVER = os.environ.get("BOT_LISTENER_AUTO_RECOVER", "0").lower() in ("1", "true", "yes")
+LISTENER_STAY_LOOP = os.environ.get("BOT_LISTENER_STAY_LOOP", "0").lower() in ("1", "true", "yes")
+LISTENER_WEBVIEW_AUTO_BACK = os.environ.get("BOT_LISTENER_WEBVIEW_AUTO_BACK", "0").lower() in (
+    "1", "true", "yes",
+)
 LISTENER_STAY_RECOVER_SEC = max(3, int(os.environ.get("BOT_LISTENER_STAY_RECOVER_SEC", "5") or 5))
 LISTENER_CHAT_SCROLL_SEC = max(0.8, float(os.environ.get("BOT_LISTENER_CHAT_SCROLL_SEC", "2") or 2))
 _LISTENER_LAST_CHAT_SCROLL: dict[str, float] = {}
+_LISTENER_LAST_GROUP_TAP: dict[str, float] = {}
+LISTENER_GROUP_TAP_SEC = max(8.0, float(os.environ.get("BOT_LISTENER_GROUP_TAP_SEC", "12") or 12))
 _LISTENER_LAST_RECOVER: dict[str, float] = {}
+_LISTENER_RECOVER_LOCK = threading.Lock()
+_LISTENER_RECOVER_OK_TS: dict[str, float] = {}
+LISTENER_RECOVER_HOLD_SEC = max(15.0, float(os.environ.get("BOT_LISTENER_RECOVER_HOLD_SEC", "25") or 25))
 _MESSENGER_PKG_CACHE: dict[str, str] = {}
 # 上次成功的发送策略 (serial -> (name, x, y))
 _SEND_CACHE: dict[str, tuple[str, int, int]] = {}
@@ -441,6 +526,7 @@ def listener_fire_send_tap(
 _CLICKER_FIRE_QUEUES: dict[str, queue.SimpleQueue] = {}
 _CLICKER_FIRE_THREADS: dict[str, threading.Thread] = {}
 _CLICKER_FIRE_LOCK = threading.Lock()
+_CLICKER_NAV_LOCK = threading.Lock()
 
 
 @dataclass
@@ -723,10 +809,44 @@ try:
     import numpy as np  # type: ignore
     import cv2  # type: ignore
 
-    _HAS_CV2 = True
+    _HAS_CV2 = callable(getattr(cv2, "imdecode", None))
+    if not _HAS_CV2:
+        import logging as _cv2_log
+
+        _cv2_log.getLogger(__name__).warning(
+            "cv2 已导入但缺少 imdecode（幽灵包 opencv-contrib?），ROI 降级 raw 指纹"
+        )
+        cv2 = None  # type: ignore
 except ImportError:
     np = None  # type: ignore
     cv2 = None  # type: ignore
+
+_MIN_PNG_BYTES = 256
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _valid_png_bytes(png_bytes: bytes | None) -> bool:
+    """ADB screencap 完整性：空流/截断 PNG 直接丢弃，避免 imdecode C++ 异常。"""
+    if not png_bytes or len(png_bytes) < _MIN_PNG_BYTES:
+        return False
+    if not png_bytes.startswith(_PNG_MAGIC):
+        return False
+    if b"IEND" not in png_bytes[-32:]:
+        return False
+    return True
+
+
+def _safe_imdecode_png(png_bytes: bytes) -> Any | None:
+    if not _HAS_CV2 or np is None or cv2 is None:
+        return None
+    if not _valid_png_bytes(png_bytes):
+        return None
+    try:
+        arr = np.frombuffer(png_bytes, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    except Exception as exc:
+        log.debug("cv2.imdecode 失败 len=%d: %s", len(png_bytes), exc)
+        return None
 
 
 def w(sec: float, fast: float | None = None) -> None:
@@ -742,7 +862,8 @@ def wc(sec: float, fast: float | None = None) -> None:
         w(sec, fast)
 
 API_BASE = os.environ.get("BOT_API_BASE", "http://127.0.0.1:3000").rstrip("/")
-_BACKEND = BackendApiTransport(API_BASE, timeout=10)
+_PANEL_HTTP_TIMEOUT = max(1.0, float(os.environ.get("BOT_PANEL_HTTP_TIMEOUT_SEC", "3") or 3))
+_BACKEND = BackendApiTransport(API_BASE, timeout=_PANEL_HTTP_TIMEOUT)
 DEFAULT_ADB = os.environ.get("VITE_DEFAULT_ADB_HOST", "localhost:56313")
 DEFAULT_GROUP_USER = os.environ.get("BOT_GROUP_DEFAULT_USER", "qwer")
 GROUP_TITLE_RE = re.compile(r"^.+\(\d+\)$")
@@ -856,7 +977,11 @@ _SETTLE_DISPATCHED: set[int] = set()
 _CAPTURE_SUCCEEDED: set[int] = set()
 _PAYOUT_DONE_ROUNDS: set[int] = set()
 _SETTLE_SEND_ATTEMPT: dict[int, float] = {}
-SETTLE_SEND_RETRY_SEC = max(8.0, float(os.environ.get("BOT_SETTLE_SEND_RETRY_SEC", "12") or 12))
+SETTLE_SEND_RETRY_SEC = max(3.0, float(os.environ.get("BOT_SETTLE_SEND_RETRY_SEC", "5") or 5))
+SETTLE_TRADE_FLOW_TIMEOUT = max(
+    0.8,
+    float(os.environ.get("BOT_SETTLE_TRADE_FLOW_TIMEOUT", "1.5" if os.environ.get("BOT_IMG_FAST", "0") in ("1", "true", "yes") else "4") or 1.5),
+)
 _DRAW_CACHE: tuple[float, dict] | None = None
 ROUND_BETS_FILE = os.environ.get(
     "BOT_ROUND_BETS_FILE", "/home/bot/55chat-bot/data/round_bets.json",
@@ -875,8 +1000,8 @@ SETTLE_HISTORY_ROWS = max(1, int(os.environ.get("BOT_SETTLE_HISTORY_ROWS", "10")
 SETTLE_MARK6_TREND_ROWS = max(1, int(os.environ.get("BOT_MARK6_TREND_ROWS", "20") or 20))
 SETTLE_MARK6_TREND_ENABLED = os.environ.get("BOT_MARK6_TREND", "0").lower() in ("1", "true", "yes")
 SETTLE_CAPTURE_ENABLED = os.environ.get("BOT_SETTLE_CAPTURE", "1").lower() in ("1", "true", "yes")
-SETTLE_LOOP_SEC = max(0.5, float(os.environ.get("BOT_SETTLE_LOOP_SEC", "1") or 1))
-ANNOUNCE_LOOP_SEC = max(0.5, float(os.environ.get("BOT_ANNOUNCE_LOOP_SEC", "1") or 1))
+SETTLE_LOOP_SEC = max(0.1, float(os.environ.get("BOT_SETTLE_LOOP_SEC", "0.25") or 0.25))
+ANNOUNCE_LOOP_SEC = max(0.1, float(os.environ.get("BOT_ANNOUNCE_LOOP_SEC", "0.25") or 0.25))
 SEND_QUEUE_ENABLED = os.environ.get("BOT_SEND_QUEUE", "1").lower() in ("1", "true", "yes")
 # 发送优先级：数字越小越优先（用户指令 > 上分 > 公告 > 结算）
 SEND_PRIO_CMD = 0
@@ -888,11 +1013,11 @@ SEND_PRIO_OPEN = 12
 SEND_PRIO_CAPTURE = 19
 SEND_PRIO_SETTLE = 20
 SEND_PRIO_TREND = 21
-SEND_PRIO_OPEN_AFTER_SETTLE = 22
+SEND_PRIO_OPEN_AFTER_SETTLE = 11
 DRAW_API_URL = os.environ.get(
     "BOT_DRAW_API_URL", "https://28.run/api/lottery/recent/6",
 )
-DRAW_FETCH_INTERVAL = max(1.0, float(os.environ.get("BOT_DRAW_FETCH_SEC", "1") or 1))
+DRAW_FETCH_INTERVAL = max(0.35, float(os.environ.get("BOT_DRAW_FETCH_SEC", "0.5") or 0.5))
 YEAR_ZODIAC_IDX = int(os.environ.get("BOT_YEAR_ZODIAC_IDX", "6") or 6)  # 2026马年
 ODDS_LANE_SINGLE = float(os.environ.get("BOT_ODDS_LANE_SINGLE", "9.63") or 9.63)
 ODDS_LANE_DXDS = float(os.environ.get("BOT_ODDS_LANE_DXDS", "1.924") or 1.924)
@@ -1340,7 +1465,12 @@ def round_timing(settings: dict[str, str] | None = None) -> tuple[int, int, floa
 
 
 def active_round_timing(settings: dict[str, str] | None = None) -> tuple[int, int, float]:
-    """期号+倒计时：优先 28.run API，避免锚点漂移导致封盘/开局公告期号错乱。"""
+    """期号+倒计时：优先 28.run API opentime，公告触发禁止裸本地钟。"""
+    try:
+        from bot_ops.time_sync import api_beijing_now, set_timing_source
+    except ImportError:
+        api_beijing_now = beijing_now  # type: ignore
+        set_timing_source = lambda _s: None  # type: ignore
     cfg = settings or {}
     interval = int(cfg.get("roundIntervalSec") or DEFAULT_ROUND_INTERVAL_SEC)
     if interval <= 0:
@@ -1359,13 +1489,25 @@ def active_round_timing(settings: dict[str, str] | None = None) -> tuple[int, in
                 rid = int(rows[-1].get("expect", 0)) + 1
             except (TypeError, ValueError):
                 rid = 0
+        # API 直出 countdown（若有）优先于本地推算
+        for key in ("countdown", "remaining", "remain_seconds", "left_seconds"):
+            raw_rem = nxt.get(key)
+            if raw_rem is not None:
+                try:
+                    rem = float(raw_rem)
+                    if rid > 0 and rem >= 0:
+                        set_timing_source("api")
+                        return rid, interval, rem
+                except (TypeError, ValueError):
+                    pass
         if rid > 0 and rows:
             try:
                 last_open = parse_beijing_dt(str(rows[-1].get("opentime") or ""))
-                now = beijing_now()
+                now = api_beijing_now()
                 period_start = last_open + timedelta(seconds=interval)
                 if now < period_start:
                     remaining = max(0.0, (period_start - now).total_seconds())
+                    set_timing_source("api")
                     return rid, interval, remaining
                 elapsed = (now - period_start).total_seconds()
                 extra = int(elapsed // interval)
@@ -1373,12 +1515,19 @@ def active_round_timing(settings: dict[str, str] | None = None) -> tuple[int, in
                 rem = interval - (elapsed - extra * interval)
                 if rem <= 0:
                     rem = interval
+                set_timing_source("api")
                 return rid, interval, rem
             except (ValueError, TypeError):
                 pass
         if rid > 0:
+            set_timing_source("api_partial")
             _, _, rem = round_timing(cfg)
             return rid, interval, rem
+    if not data:
+        set_timing_source("fallback")
+        return round_timing(cfg)
+    if data.get("recent_results") or data.get("next_prediction"):
+        set_timing_source("api_partial")
     return round_timing(cfg)
 
 
@@ -1479,7 +1628,7 @@ def process_maintenance_resume(
         _ROUND_OPEN_ANNOUNCED.pop(group, None)
     data = fetch_28run_recent(force=True)
     process_round_open_announce(
-        serial, bot, settings, input_xy, send_xy, data=data,
+        serial, bot, settings, input_xy, send_xy, data=data, from_maintenance=True,
     )
     post_log(f"[ADB] 维护结束恢复 rid={rid}", "INFO")
 
@@ -1534,7 +1683,15 @@ def parse_combo(msg: str) -> tuple[str, list[str], int] | None:
             items = [x.strip() for x in items_str.split(sep) if x.strip()]
             break
     if not items:
-        items = [items_str]
+        if code == "5":
+            picked = split_mark6_body(items_str)
+            items = picked if picked else [items_str]
+        else:
+            items = [items_str]
+    elif code == "5" and len(items) == 1:
+        picked = split_mark6_body(items[0])
+        if picked and len(picked) > 1:
+            items = picked
     return code, items, qty
 
 
@@ -1959,6 +2116,24 @@ def save_round_open_announced_persisted() -> None:
         log.warning("保存开局公告状态失败: %s", ex)
 
 
+def _sync_open_gate_from_settled_on_boot() -> None:
+    """announced 落后 settled 时启动自愈，避免 lag 旁路抢先 open。"""
+    if not _SETTLED_ROUNDS or not _ROUND_OPEN_ANNOUNCED:
+        return
+    floor = max(_SETTLED_ROUNDS)
+    changed = False
+    for group, announced in list(_ROUND_OPEN_ANNOUNCED.items()):
+        if announced < floor:
+            _ROUND_OPEN_ANNOUNCED[group] = floor
+            changed = True
+            log.warning(
+                "gate 启动同步 group=%s announced=%s→%s（settled max）",
+                group, announced, floor,
+            )
+    if changed:
+        save_round_open_announced_persisted()
+
+
 def load_round_bets_persisted() -> None:
     global _ROUND_POOL, _ROUND_BETS, _SETTLED_ROUNDS
     try:
@@ -1989,6 +2164,7 @@ def load_round_bets_persisted() -> None:
                 )
     except Exception as ex:
         log.warning("加载开局公告状态失败: %s", ex)
+    _sync_open_gate_from_settled_on_boot()
 
 
 def champion_digit_to_head(digit: int) -> int:
@@ -2236,18 +2412,116 @@ def fetch_panel_trade_flow(period: int) -> dict:
     ) or {}
 
 
-def generate_settle_capture_paths(round_id: int) -> list[str]:
+def _mark6_board_row_from_draw(round_id: int, draw: dict) -> dict:
+    n1, n2 = int(draw["n1"]), int(draw["n2"])
+    t = format_opentime_md_hm(str(draw.get("opentime") or ""))
+    if not t.strip():
+        t = beijing_now().strftime("%m-%d ") + format_group_display_hm()
+    if mark6_is_push(n1, n2):
+        return {
+            "roundId": round_id,
+            "time": t,
+            "special": None,
+            "push": True,
+            "zodiac": "-",
+            "dx": "-",
+            "da": "-",
+            "head": "-",
+            "tail": "-",
+            "he": "-",
+            "wuxing": "-",
+            "wave": "-",
+        }
+    sp = special_number_for_draw(n1, n2)
+    if sp is None:
+        return {"roundId": round_id, "time": t, "special": None, "push": False, "zodiac": "-"}
+    zodiac = number_to_zodiac(sp)
+    return {
+        "roundId": round_id,
+        "time": t,
+        "special": sp,
+        "push": False,
+        "zodiac": zodiac,
+        "dx": "单" if sp % 2 else "双",
+        "da": "大" if sp >= 25 else "小",
+        "head": str(number_head(sp)),
+        "tail": str(number_tail(sp)),
+        "he": "单" if (number_head(sp) + number_tail(sp)) % 2 else "双",
+        "wuxing": number_wuxing(sp),
+        "wave": number_wave_label(sp),
+    }
+
+
+def fetch_trade_flow_for_settle(round_id: int, draw: dict, *, timeout_sec: float = 4.0) -> dict:
+    """等待 panel 流水与内存 draw 一致；超时则用 draw 强制补齐。"""
+    deadline = time.time() + max(0.5, timeout_sec)
+    last: dict = {}
+    n1, n2, n3 = int(draw["n1"]), int(draw["n2"]), int(draw["n3"])
+    fr = int(draw.get("final_result", n1 + n2 + n3))
+    while time.time() < deadline:
+        last = fetch_panel_trade_flow(round_id)
+        if int(last.get("period") or 0) == round_id:
+            dr = last.get("draw") or {}
+            if dr.get("drawn") and int(dr.get("n1", -1)) == n1 and int(dr.get("final_result", -1)) == fr:
+                return last
+        time.sleep(0.15)
+    dx, ds = pc28_dxds_labels(fr)
+    patched = dict(draw)
+    patched.setdefault("dx", dx)
+    patched.setdefault("ds", ds)
+    return patch_trade_flow_draw(last, round_id=round_id, draw=patched)
+
+
+def generate_settle_capture_paths(round_id: int, draw: dict | None = None) -> list[str]:
     if not SETTLE_CAPTURE_ENABLED or not _HAS_BOARD_CAPTURE:
         return []
+    if not draw:
+        log.warning("结算截图缺少 draw，跳过 rid=%s", round_id)
+        return []
+    n1, n2, n3 = int(draw["n1"]), int(draw["n2"]), int(draw["n3"])
+    fr = int(draw.get("final_result", n1 + n2 + n3))
+    dx, ds = pc28_dxds_labels(fr)
+    time_hm = format_group_display_hm()
     boards = fetch_panel_draw_boards()
-    time.sleep(0.1)
-    flow = fetch_panel_trade_flow(round_id)
-    # 群聊图序（§2③）：PC28结果 → 六合走势图 → 最新交易流水
-    paths = [
-        render_pc28_board_png(boards, round_id=round_id),
-        render_mark6_board_png(boards, round_id=round_id),
-        render_trade_flow_png(flow, round_id=round_id),
-    ]
+    pc28_row = {
+        "roundId": round_id,
+        "time": time_hm,
+        "n1": n1,
+        "n2": n2,
+        "n3": n3,
+        "total": fr,
+        "dx": dx,
+        "ds": ds,
+    }
+    mark6_row = _mark6_board_row_from_draw(round_id, draw)
+    boards = upsert_board_rows(
+        boards,
+        pc28_row=pc28_row,
+        mark6_row=mark6_row,
+        highlight_rid=round_id,
+    )
+    flow = fetch_trade_flow_for_settle(round_id, draw, timeout_sec=SETTLE_TRADE_FLOW_TIMEOUT)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _render_pc28() -> str:
+        return render_pc28_board_png(boards, round_id=round_id)
+
+    def _render_mark6() -> str:
+        return render_mark6_board_png(boards, round_id=round_id)
+
+    def _render_trade() -> str:
+        return render_trade_flow_png(flow, round_id=round_id)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_pc28 = pool.submit(_render_pc28)
+        f_mark6 = pool.submit(_render_mark6)
+        f_trade = pool.submit(_render_trade)
+        paths = [f_pc28.result(), f_mark6.result(), f_trade.result()]
+    log.info(
+        "结算截图 rid=%s draw=%s+%s+%s=%s files=%s",
+        round_id, n1, n2, n3, fr,
+        ", ".join(os.path.basename(p) for p in paths),
+    )
     try:
         from board_capture import archive_settle_captures
         archive_settle_captures(round_id, paths)
@@ -2294,9 +2568,23 @@ def fetch_28run_recent(*, force: bool = False) -> dict | None:
             },
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            data = json.loads(raw)
+            try:
+                from bot_ops.time_sync import record_http_date_skew, set_timing_source
+
+                record_http_date_skew(resp.headers.get("Date"))
+            except Exception:
+                pass
         if isinstance(data, dict):
             _DRAW_CACHE = (now, data)
+            try:
+                from bot_ops.time_sync import set_timing_source
+
+                if data.get("recent_results"):
+                    set_timing_source("api")
+            except Exception:
+                pass
             return data
     except Exception as ex:
         log.warning("拉取28.run开奖失败: %s", ex)
@@ -2606,17 +2894,235 @@ def settle_round(
     send_xy: tuple[int, int] | None,
 ) -> None:
     global _SETTLED_ROUNDS, _PAYOUT_DONE_ROUNDS, _SETTLE_SEND_ATTEMPT, _SETTLE_DISPATCHED
-    if round_id in _SETTLED_ROUNDS or round_id in _SETTLE_DISPATCHED or round_id in _CAPTURE_SUCCEEDED:
+    try:
+        from bot_ops.precision_guard import load_settled_rounds, verify_settle_rid
+
+        settled_path = Path(SETTLED_ROUNDS_FILE)
+        ok, reason = verify_settle_rid(
+            round_id,
+            current_rid=current_round_id(settings),
+            settled=_SETTLED_ROUNDS | load_settled_rounds(settled_path),
+        )
+        if not ok:
+            log.warning("[PRECISION] 结算校核拒绝 rid=%s reason=%s", round_id, reason)
+            return
+    except Exception as ex:
+        log.warning("[PRECISION] 结算校核异常 rid=%s: %s", round_id, ex)
+    if round_id in _SETTLED_ROUNDS or round_id in _CAPTURE_SUCCEEDED:
+        return
+    try:
+        from bot_ops.capture_ipc import capture_in_progress_for_rid
+
+        if capture_in_progress_for_rid(round_id):
+            return
+    except Exception:
+        pass
+    if round_id in _SETTLE_DISPATCHED:
         return
     now = time.time()
     last_try = _SETTLE_SEND_ATTEMPT.get(round_id, 0.0)
     if now - last_try < SETTLE_SEND_RETRY_SEC:
         return
     _SETTLE_SEND_ATTEMPT[round_id] = now
+    next_rid, _, _ = active_round_timing(settings)
+    open_rid = max(next_rid, round_id + 1)
+    open_text = build_open_announce_text(open_rid, settings)
+    group = (bot.get("associatedGroup") or "").strip()
+    if group:
+        _heal_stale_open_gate(group, open_rid)
+    capture_paths: list[str] = []
+    try:
+        capture_paths = generate_settle_capture_paths(round_id, draw)
+    except Exception as ex:
+        log.warning("结算截图生成失败 rid=%s: %s", round_id, ex)
+
+    listener_queued = SEND_QUEUE_ENABLED and is_send_bot(bot)
+
+    def _image_outbound_serial_bot() -> tuple[str, dict]:
+        """结算截图：委派左机 CLICKER；禁止回落右机 LISTENER。"""
+        from bot_ops.runtime import load_bot_runtime
+
+        rt = load_bot_runtime()
+        hit = _clicker_image_target()
+        if hit:
+            cs, cb = hit
+            if _adb_port_from_serial(cs) == rt.clicker_adb_port:
+                return cs, cb
+            log.error("发图目标误解析为右机/非左机 serial=%s", cs)
+        if CLICKER_SEND_IMAGES:
+            cp = rt.clicker_adb_port
+            if cp and cp != rt.listener_adb_port:
+                cb = bot
+                try:
+                    bots = api("GET", "/api/bots") or []
+                    for bid in CLICKER_BOT_IDS:
+                        b = next((x for x in bots if str(x.get("id")) == bid), None)
+                        if b:
+                            cb = b
+                            break
+                except Exception:
+                    pass
+                for s in (f"127.0.0.1:{cp}", f"localhost:{cp}"):
+                    return s, cb
+            log.warning("左机发图不可用，本批截图跳过（右机仅发文字公告）")
+            return "", bot
+        return serial, bot
+
+    open_job = OutboundSend(
+        serial, bot, open_text, settings,
+        input_xy=input_xy, send_xy=send_xy,
+        prio=SEND_PRIO_OPEN_AFTER_SETTLE, kind="open", round_id=open_rid,
+        group_ok=True,
+    )
+
+    def _enqueue_open_now() -> None:
+        outbound_enqueue(open_job)
+        log.info("结算入队新的一局 rid=%s → 展示期 %s", round_id, open_rid)
+
+    if listener_queued:
+        from bot_ops.runtime import load_bot_runtime
+
+        img_serial, img_bot = _image_outbound_serial_bot()
+        rt_settle = load_bot_runtime()
+        if (
+            rt_settle.clicker_adb_port
+            and rt_settle.listener_adb_port
+            and _adb_port_from_serial(img_serial or serial) == rt_settle.listener_adb_port
+        ):
+            img_serial = f"127.0.0.1:{rt_settle.clicker_adb_port}"
+            try:
+                bots = api("GET", "/api/bots") or []
+                for bid in CLICKER_BOT_IDS:
+                    b = next((x for x in bots if str(x.get("id")) == bid), None)
+                    if b:
+                        img_bot = b
+                        break
+            except Exception:
+                pass
+            log.info("结算发图强制路由左机 serial=%s", img_serial)
+        if capture_paths and img_serial:
+            cap_job = OutboundSend(
+                img_serial, img_bot, "", settings,
+                input_xy=input_xy, send_xy=send_xy,
+                prio=SEND_PRIO_CAPTURE, kind="capture_batch", round_id=round_id,
+                image_paths=list(capture_paths),
+                group_ok=True,
+            )
+            try:
+                from bot_ops.capture_ipc import (
+                    enqueue_capture_ipc,
+                    needs_capture_ipc,
+                    outbound_to_dict,
+                )
+
+                if needs_capture_ipc(img_serial, serial):
+                    gallery_preloaded = False
+                    try:
+                        gallery_preloaded = _push_images_to_gallery(img_serial, list(capture_paths))
+                        if gallery_preloaded:
+                            _CAPTURE_GALLERY_PUSHED.add(round_id)
+                            log.info(
+                                "结算预推相册 rid=%s serial=%s paths=%d",
+                                round_id, img_serial, len(capture_paths),
+                            )
+                    except Exception as ex:
+                        log.warning("结算预推相册失败 rid=%s: %s", round_id, ex)
+                    ipc_payload = {
+                        "round_id": round_id,
+                        "image_paths": list(capture_paths),
+                        "clicker_serial": img_serial,
+                        "open_job": outbound_to_dict(open_job),
+                        "gallery_preloaded": gallery_preloaded,
+                    }
+                    if not enqueue_capture_ipc(ipc_payload):
+                        _SETTLE_DISPATCHED.add(round_id)
+                        return
+                    log.info(
+                        "结算 IPC 左机发图 rid=%s serial=%s %s",
+                        round_id,
+                        img_serial,
+                        ", ".join(os.path.basename(p) for p in capture_paths),
+                    )
+                    try:
+                        ot = str(draw.get("opentime") or "")
+                        if ot:
+                            lag_s = (beijing_now() - parse_beijing_dt(ot)).total_seconds()
+                            log.info(
+                                "结算时序 rid=%s opentime=%s api_lag=%.1fs",
+                                round_id, ot, lag_s,
+                            )
+                    except Exception:
+                        pass
+                else:
+                    outbound_enqueue(cap_job)
+                    stash_open_after_capture(round_id, open_job)
+                    log.info(
+                        "结算入队批量截图 rid=%s serial=%s %s（新的一局待图后发）",
+                        round_id,
+                        img_serial,
+                        ", ".join(os.path.basename(p) for p in capture_paths),
+                    )
+            except Exception as ex:
+                log.warning("capture-ipc 失败，回退本进程队列 rid=%s: %s", round_id, ex)
+                outbound_enqueue(cap_job)
+                stash_open_after_capture(round_id, open_job)
+            _SETTLE_DISPATCHED.add(round_id)
+        else:
+            if capture_paths:
+                log.warning(
+                    "结算截图未入队 rid=%s（左机 offline），stash 待图后发新的一局",
+                    round_id,
+                )
+                stash_open_after_capture(round_id, open_job)
+            else:
+                _enqueue_open_now()
+            _SETTLE_DISPATCHED.add(round_id)
+        post_log(f"[ADB] 结算队列 rid={round_id} 截图{len(capture_paths)}张", "SUCCESS")
+        bets = list(_ROUND_POOL.get(str(round_id), []))
+        bot_id = bot["id"]
+        user_payouts: dict[str, float] = defaultdict(float)
+        if round_id not in _PAYOUT_DONE_ROUNDS:
+            for bet in bets:
+                if str(bet.get("bot_id") or bot_id) != bot_id:
+                    continue
+                payout = calc_bet_payout(bet, draw)
+                if payout <= 0:
+                    continue
+                uname = str(bet.get("username") or "")
+                user_payouts[uname] = min(
+                    user_payouts.get(uname, 0.0) + payout,
+                    float(LIMIT_ROUND_PAYOUT),
+                )
+            for uname, payout in user_payouts.items():
+                u = next(
+                    (x for x in users if user_in_bot_scope(x, bot_id) and str(x.get("username") or "") == uname),
+                    None,
+                )
+                if not u:
+                    continue
+                u = dict(u)
+                new_bal = float(u.get("balance", 0)) + payout
+                u["balance"] = new_bal
+                u["lastActive"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                commit_user(u)
+                record_bill(
+                    bot_id, uname, "中奖",
+                    payout, new_bal,
+                    f"{round_id}期 {draw['n1']}+{draw['n2']}+{draw['n3']}={draw['final_result']}",
+                    str(u.get("customerCode") or ""),
+                )
+            _PAYOUT_DONE_ROUNDS.add(round_id)
+            _ROUND_POOL.pop(str(round_id), None)
+            save_round_bets_persisted()
+        log.info(
+            "结算 rid=%s %s+%s+%s=%s 中奖%d人",
+            round_id, draw["n1"], draw["n2"], draw["n3"], draw["final_result"], len(user_payouts),
+        )
+        return
+
     bets = list(_ROUND_POOL.get(str(round_id), []))
     bot_id = bot["id"]
     user_payouts: dict[str, float] = defaultdict(float)
-    winner_lines: list[str] = []
     if round_id not in _PAYOUT_DONE_ROUNDS:
         for bet in bets:
             if str(bet.get("bot_id") or bot_id) != bot_id:
@@ -2629,7 +3135,6 @@ def settle_round(
                 user_payouts.get(uname, 0.0) + payout,
                 float(LIMIT_ROUND_PAYOUT),
             )
-            winner_lines.append(f"{uname} +{int(payout)} ({bet.get('cmd', '')[:30]})")
         for uname, payout in user_payouts.items():
             u = next(
                 (x for x in users if user_in_bot_scope(x, bot_id) and str(x.get("username") or "") == uname),
@@ -2651,84 +3156,35 @@ def settle_round(
         _PAYOUT_DONE_ROUNDS.add(round_id)
         _ROUND_POOL.pop(str(round_id), None)
         save_round_bets_persisted()
-    log.info("结算 rid=%s %s+%s+%s=%s 中奖%d人", round_id, draw["n1"], draw["n2"], draw["n3"], draw["final_result"], len(user_payouts))
-    next_rid, _, _ = active_round_timing(settings)
-    open_text = build_open_announce_text(next_rid, settings)
-    group = (bot.get("associatedGroup") or "").strip()
-    capture_paths: list[str] = []
-    try:
-        capture_paths = generate_settle_capture_paths(round_id)
-    except Exception as ex:
-        log.warning("结算截图生成失败 rid=%s: %s", round_id, ex)
-
-    listener_queued = SEND_QUEUE_ENABLED and is_send_bot(bot)
-
-    def _image_outbound_serial_bot() -> tuple[str, dict]:
-        """结算截图：委派左机 CLICKER；左机离线则跳过（不占右机公告通道）。"""
-        hit = _clicker_image_target()
-        if hit:
-            return hit
-        if CLICKER_SEND_IMAGES:
-            log.warning("左机发图不可用，本批截图跳过（右机仅发文字公告）")
-            return "", bot
-        return serial, bot
-
-    open_job = OutboundSend(
-        serial, bot, open_text, settings,
-        input_xy=input_xy, send_xy=send_xy,
-        prio=SEND_PRIO_OPEN_AFTER_SETTLE, kind="open", round_id=next_rid,
-        group_ok=True,
+    log.info(
+        "结算 rid=%s %s+%s+%s=%s 中奖%d人",
+        round_id, draw["n1"], draw["n2"], draw["n3"], draw["final_result"], len(user_payouts),
     )
-
-    def _enqueue_open_now() -> None:
-        outbound_enqueue(open_job)
-        log.info("结算入队新的一局 rid=%s → 展示期 %s", round_id, next_rid)
-
-    if listener_queued:
-        img_serial, img_bot = _image_outbound_serial_bot()
-        if capture_paths and img_serial:
-            outbound_enqueue(
-                OutboundSend(
-                    img_serial, img_bot, "", settings,
-                    input_xy=input_xy, send_xy=send_xy,
-                    prio=SEND_PRIO_CAPTURE, kind="capture_batch", round_id=round_id,
-                    image_paths=list(capture_paths),
-                    group_ok=True,
-                )
-            )
-            stash_open_after_capture(round_id, open_job)
-            log.info(
-                "结算入队批量截图 rid=%s serial=%s %s（新的一局待图后发）",
-                round_id,
-                img_serial,
-                ", ".join(os.path.basename(p) for p in capture_paths),
-            )
-            _SETTLE_DISPATCHED.add(round_id)
-        else:
-            if capture_paths and not img_serial:
-                log.warning("结算截图未入队 rid=%s（左机 offline），直接发新的一局", round_id)
-            _enqueue_open_now()
-            _SETTLE_DISPATCHED.add(round_id)
-        post_log(f"[ADB] 结算队列 rid={round_id} 截图{len(capture_paths)}张", "SUCCESS")
-        return
 
     ok_all = True
     if capture_paths:
         img_serial, img_bot = _image_outbound_serial_bot()
-        img_serial = img_serial or serial
-        if not send_chat_images_batch(
-            img_serial, img_bot if img_serial != serial else bot,
-            capture_paths, input_xy, send_xy, settings, group_ok=True,
-        ):
-            log.warning("批量截图发送失败 rid=%s", round_id)
+        if CLICKER_SEND_IMAGES and not img_serial:
+            log.warning("左机发图不可用，跳过批量截图 rid=%s", round_id)
             ok_all = False
+        else:
+            img_serial = img_serial or serial
+            if not send_chat_images_batch(
+                img_serial, img_bot if img_serial != serial else bot,
+                capture_paths, input_xy, send_xy, settings, group_ok=True,
+            ):
+                log.warning("批量截图发送失败 rid=%s", round_id)
+                ok_all = False
+    if is_clicker_serial(serial, bot):
+        log.error("左机禁止结算发新一局 rid=%s", open_rid)
+        return
     if not send_chat_reply(serial, bot, open_text, input_xy, send_xy, settings, skip_fast=True, group_ok=True):
-        log.warning("新的一局发送失败 rid=%s (结算后)", next_rid)
+        log.warning("新的一局发送失败 rid=%s (结算后)", open_rid)
         return
     _SETTLED_ROUNDS.add(round_id)
     save_settled_rounds_persisted()
     if group:
-        _ROUND_OPEN_ANNOUNCED[group] = next_rid
+        _ROUND_OPEN_ANNOUNCED[group] = open_rid
         save_round_open_announced_persisted()
     if ok_all:
         post_log(f"[ADB] 结算 rid={round_id} 截图{len(capture_paths)}张+新的一局", "SUCCESS")
@@ -2746,9 +3202,13 @@ def process_round_settlement(
     """28.run 出新结果 → 左机三图 → 右机「新的一局」（固定顺序，禁止 +10s 开局）。"""
     if not SETTLE_ENABLED or is_clicker_bot(bot) or in_maintenance_window():
         return
-    rid, _, _ = active_round_timing(settings)
-    data = fetch_28run_recent(force=True)
+    rid, interval, remaining = active_round_timing(settings)
+    near_draw = remaining <= 10.0
+    data = fetch_28run_recent(force=near_draw)
     pending = pending_settle_round_id(rid, data)
+    if not pending and near_draw:
+        data = fetch_28run_recent(force=True)
+        pending = pending_settle_round_id(rid, data)
     if pending:
         draw = find_draw_for_round(pending, data)
         if draw:
@@ -2772,7 +3232,7 @@ def execute_bet_order(
     if err:
         bal = float(user.get("balance", 0))
         return round_user_reply(
-            rid, username, order.raw, "(无效,余额不足)", f"当前余额：{bal:.3f}", err,
+            rid, username, order.raw, "(无效)", f"当前余额：{bal:.3f}", err,
         )
     bal = float(user["balance"])
     if bal < order.total:
@@ -3553,8 +4013,10 @@ class ScreenContext:
     target_group: str
     in_input: bool
 
-    def summary(self) -> str:
-        return f"页面={self.page} 标题={self.title!r} 目标群={self.target_group!r}"
+    def summary(self, serial: str = "") -> str:
+        act = current_activity_hint(serial) if serial else ""
+        base = f"页面={self.page} 标题={self.title!r} 目标群={self.target_group!r}"
+        return f"{base} focus={act}" if act else base
 
 
 def collect_chat_text_nodes(root: ET.Element | None) -> list[ChatTextNode]:
@@ -3596,6 +4058,34 @@ def get_chat_title(root: ET.Element | None) -> str:
     return headers[0] if headers else ""
 
 
+def _likely_target_group_surface(root: ET.Element | None, bot: dict, serial: str) -> bool:
+    """角标标题/群名图片化/仅发图气泡：输入栏可见即视为目标群（防 deploy 后 wrong_chat→Back）。"""
+    group = (bot.get("associatedGroup") or "").strip()
+    if root is None or not group:
+        return False
+    if is_in_app_webview(root, serial) or listener_send_blocked(root, serial):
+        return False
+    texts = collect_ui_texts(root)
+    has_composer = any(t == "输入消息" or t == "Enter message" for t in texts)
+    if not has_composer and not _chat_surface_open(root, serial):
+        return False
+    if _ui_shows_target_group(root, group) or _chat_body_shows_group_name(root, group):
+        return True
+    title = get_chat_title(root)
+    if has_composer and (
+        _title_looks_like_unread_badge(title)
+        or not title
+        or title in IGNORE_TEXT
+        or any("ADB Keyboard" in t for t in texts)
+    ):
+        return True
+    if serial and is_group_chat_activity(serial) and (
+        _title_looks_like_unread_badge(title) or not title or title in IGNORE_TEXT
+    ):
+        return True
+    return False
+
+
 def describe_screen_context(root: ET.Element | None, bot: dict, serial: str = "") -> ScreenContext:
     group = (bot.get("associatedGroup") or "").strip()
     title = get_chat_title(root)
@@ -3605,12 +4095,14 @@ def describe_screen_context(root: ET.Element | None, bot: dict, serial: str = ""
         page = "search"
     elif in_target_group_chat(root, bot, serial):
         page = "target_group"
+    elif _likely_target_group_surface(root, bot, serial):
+        page = "target_group"
     elif is_secret_key_page(root):
         page = "secret_key"
-    elif is_in_app_webview(root):
-        page = "webview"
     elif is_group_settings_page(root):
         page = "group_settings"
+    elif is_in_app_webview(root, serial):
+        page = "webview"
     elif in_group_chat(root, bot, serial):
         page = "wrong_chat"
     elif any(t in MESSAGES_TAB_LABELS for t in texts):
@@ -3675,10 +4167,9 @@ def scroll_chat_toward_bottom(serial: str, steps: int = 2) -> None:
     sw, sh = screen_width(root), screen_height(root)
     x, y1, y2 = sw // 2, int(sh * 0.62), int(sh * 0.38)
     for _ in range(max(1, steps)):
-        subprocess.run(
-            ["adb", "-s", serial, "shell", "input", "swipe", str(x), str(y1), str(x), str(y2), "280"],
-            capture_output=True,
-            timeout=8,
+        adb_run(
+            serial, "shell", "input", "swipe",
+            str(x), str(y1), str(x), str(y2), "280",
         )
         w(0.35, 0.12)
     invalidate_ui_cache(serial)
@@ -4048,31 +4539,37 @@ def _group_title_matches(title: str, group: str) -> bool:
     return base == g or g in base
 
 
-def in_target_group_chat(root: ET.Element | None, bot: dict, serial: str = "") -> bool:
-    """是否在当前 bot 配置的目标群聊内（禁止 V03 等系统频道）。"""
-    group = (bot.get("associatedGroup") or "").strip()
-    if root is None:
-        if serial and is_group_chat_activity(serial):
-            return True
+def _title_looks_like_unread_badge(title: str) -> bool:
+    """标题栏仅显示未读角标数字（如 2/3），非真实群名。"""
+    t = (title or "").strip()
+    return bool(t) and re.fullmatch(r"\d{1,3}", t) is not None
+
+
+def _chat_body_shows_group_name(root: ET.Element | None, group: str) -> bool:
+    """聊天区可见目标群名片段（群名图片化/角标标题时兜底）。"""
+    if root is None or not (group or "").strip():
         return False
-    if serial and is_group_chat_activity(serial):
-        title = get_chat_title(root)
-        if not group or _group_title_matches(title, group):
+    g = group.strip()
+    for t in collect_ui_texts(root):
+        if g in t:
             return True
-    if not _chat_surface_open(root, serial):
+    for node in collect_chat_text_nodes(root):
+        if g in node.text:
+            return True
+    return False
+
+
+def _ui_shows_target_group(root: ET.Element | None, group: str) -> bool:
+    """UI 文字/标题栏是否显示目标群名（不含 Activity 猜测）。"""
+    if root is None or not group:
         return False
     header = [h for h in chat_header_texts(root) if h and h not in IGNORE_TEXT]
     if any(is_system_chat_title(h) for h in header):
-        if group and any(_group_title_matches(h, group) for h in header):
-            return True
-        return False
-    if not group:
-        return any(GROUP_TITLE_RE.match(t) for t in header)
+        return any(_group_title_matches(h, group) for h in header)
     title = get_chat_title(root)
     if _group_title_matches(title, group):
         return True
-    title_band = title_band_texts(root)
-    for h in header + title_band:
+    for h in header + title_band_texts(root):
         if _group_title_matches(h, group):
             return True
     sh = screen_height(root)
@@ -4089,27 +4586,72 @@ def in_target_group_chat(root: ET.Element | None, bot: dict, serial: str = "") -
     for t in collect_ui_texts(root):
         if _group_title_matches(t, group):
             return True
+    return False
+
+
+def current_activity_hint(serial: str) -> str:
+    """dumpsys 当前焦点 Activity 摘要，供看门狗日志。"""
+    line = _window_focus_line(serial).strip()
+    if not line:
+        return "null"
+    m = re.search(r"(\w+\/\S+)", line)
+    return m.group(1) if m else line[:72]
+
+
+def in_target_group_chat(root: ET.Element | None, bot: dict, serial: str = "") -> bool:
+    """是否在当前 bot 配置的目标群聊内（禁止 V03 / webview / 错群）。"""
+    group = (bot.get("associatedGroup") or "").strip()
+    if root is None:
+        return False
+    if is_in_app_webview(root, serial) or listener_send_blocked(root, serial):
+        return False
+    if not _chat_surface_open(root, serial):
+        return False
+    if not group:
+        header = [h for h in chat_header_texts(root) if h and h not in IGNORE_TEXT]
+        return any(GROUP_TITLE_RE.match(t) for t in header)
+    if _ui_shows_target_group(root, group):
+        return True
+    # 群名图片化 / 底部 Tab 污染标题 / 未读角标「2」：Activity 或聊天区确认
     if serial and is_group_chat_activity(serial):
+        title = get_chat_title(root)
+        if _group_title_matches(title, group):
+            return True
+        if not title or title in IGNORE_TEXT or title in MESSAGES_TAB_LABELS:
+            return True
+        if _title_looks_like_unread_badge(title):
+            return True
+        if _chat_body_shows_group_name(root, group):
+            return True
+    if _chat_surface_open(root, serial) and group:
+        if _chat_body_shows_group_name(root, group):
+            return True
+        if _title_looks_like_unread_badge(get_chat_title(root)):
+            return True
+    if _likely_target_group_surface(root, bot, serial):
         return True
     return False
 
 
 def find_group_chat_entry(root: ET.Element, group: str) -> tuple[int, int] | None:
-    """消息列表里点目标群（避开 V03 等系统会话）。"""
+    """消息列表里点目标群（精确群名 → 点整行中心，不点预览/时间）。"""
     group = (group or "").strip()
     if not group or root is None:
         return None
-    hits: list[tuple[int, int, int, int]] = []
+    sw = screen_width(root)
+    row_center_x = sw // 2
+    exact_hits: list[tuple[int, int, int]] = []
+    fuzzy_hits: list[tuple[int, int, int]] = []
     for node in root.iter("node"):
         t = node_label(node).strip()
         if not t or is_system_chat_title(t):
             continue
-        if t != group and group not in t:
-            continue
-        if t != group and len(t) > max(len(group) + 8, 28):
-            continue
-        if t != group and not GROUP_TITLE_RE.match(t):
-            continue
+        exact = t == group
+        if not exact:
+            if group not in t or len(t) > max(len(group) + 8, 28):
+                continue
+            if not GROUP_TITLE_RE.match(t):
+                continue
         b = parse_bounds(node.attrib.get("bounds", ""))
         if not b:
             continue
@@ -4117,12 +4659,47 @@ def find_group_chat_entry(root: ET.Element, group: str) -> tuple[int, int] | Non
         cy = (y1 + y2) // 2
         if cy < SEARCH_BAR_Y_MAX + 20 or cy > 1500:
             continue
-        exact = 1 if t == group else 0
-        hits.append((exact, y1, (x1 + x2) // 2, cy))
+        row_h = max(y2 - y1, 72)
+        tap_y = min(y1 + row_h // 2 + 24, y2 + 36)
+        bucket = exact_hits if exact else fuzzy_hits
+        bucket.append((y1, row_center_x, tap_y))
+    hits = exact_hits or fuzzy_hits
     if not hits:
         return None
-    hits.sort(key=lambda h: (-h[0], h[1]))
-    return (hits[0][2], hits[0][3])
+    hits.sort(key=lambda h: h[0])
+    best = hits[0]
+    log.info("列表点群 %s @ (%d,%d) 候选=%d", group, best[1], best[2], len(hits))
+    return (best[1], best[2])
+
+
+def list_tap_entered_group(serial: str, bot: dict) -> bool:
+    """从消息列表点群后：GroupChatActivity / target_group / 输入栏即成功。"""
+    if not serial:
+        return False
+    root = ui_hierarchy(serial)
+    if root is None:
+        return False
+    if listener_send_blocked(root, serial):
+        return False
+    ctx = describe_screen_context(root, bot, serial)
+    if ctx.page == "wrong_chat" and "未连接" in (ctx.title or ""):
+        return False
+    if in_target_group_chat(root, bot, serial) or ctx.page == "target_group":
+        return True
+    group = (bot.get("associatedGroup") or "").strip()
+    title = get_chat_title(root)
+    if group and _group_title_matches(title, group) and _chat_surface_open(root, serial):
+        return True
+    if is_group_chat_activity(serial):
+        return True
+    group = (bot.get("associatedGroup") or "").strip()
+    if _chat_surface_open(root, serial) and group and _ui_shows_target_group(root, group):
+        return True
+    texts = collect_ui_texts(root) if root is not None else []
+    if any(t == "输入消息" or t == "Enter message" for t in texts):
+        if is_group_chat_activity(serial) or (group and _ui_shows_target_group(root, group)):
+            return True
+    return False
 
 
 def dismiss_message_list_overlay(serial: str) -> bool:
@@ -4140,11 +4717,29 @@ def dismiss_message_list_overlay(serial: str) -> bool:
     return True
 
 
-def is_in_app_webview(root: ET.Element | None) -> bool:
-    """55M 内打开的开奖网/外链页（28.run 等），会导致回群失败。"""
+def is_message_list_screen(root: ET.Element | None) -> bool:
+    """55M 消息 Tab 列表（顶栏「搜索」+ 底栏「消息」）。"""
     if root is None:
         return False
     texts = collect_ui_texts(root)
+    if not any(t in MESSAGES_TAB_LABELS for t in texts):
+        return False
+    return any(t in ("搜索", "Search") for t in texts)
+
+
+def is_in_app_webview(root: ET.Element | None, serial: str = "") -> bool:
+    """55M 内嵌开奖外链全屏页（非群聊/非消息列表；预览含 28.run 不算）。"""
+    if root is None:
+        return False
+    if serial and is_group_chat_activity(serial):
+        return False
+    if is_message_list_screen(root):
+        return False
+    texts = collect_ui_texts(root)
+    if any(t == "发送图片" for t in texts) or any(
+        re.search(r"\d+/\d+", (t or "")) for t in texts
+    ):
+        return False
     if any(t == "输入消息" or t == "Enter message" for t in texts):
         return False
     joined = " ".join(texts)
@@ -4158,6 +4753,8 @@ def is_in_app_webview(root: ET.Element | None) -> bool:
     if "开奖网" in joined or "专业彩票" in joined:
         return True
     if "V03 HK" in joined or "v03 hk" in low:
+        if serial and is_group_chat_activity(serial):
+            return False
         return True
     if ("http://" in low or "https://" in low) and not any(t in MESSAGES_TAB_LABELS for t in texts):
         return True
@@ -4170,13 +4767,22 @@ def is_in_app_webview(root: ET.Element | None) -> bool:
 
 
 def listener_in_group_for_send(root: ET.Element | None, bot: dict, serial: str) -> bool:
-    """右机可否发公告/回复：GroupChatActivity 且 UI 无遮挡层。"""
+    """右机可否发公告/回复：目标群 UI 确认 + 无遮挡/webview。"""
+    if serial and is_contact_detail_activity(serial):
+        return False
+    if root is not None and is_in_app_webview(root, serial):
+        return False
     if listener_send_blocked(root, serial):
         return False
-    if serial and is_group_chat_activity(serial):
-        return True
+    if serial and is_group_chat_activity(serial) and root is not None and _chat_surface_open(root, serial):
+        if in_target_group_chat(root, bot, serial) or _likely_target_group_surface(root, bot, serial):
+            return True
     if in_target_group_chat(root, bot, serial):
         return True
+    if root is not None:
+        ctx = describe_screen_context(root, bot, serial)
+        if ctx.page == "target_group":
+            return True
     return False
 
 
@@ -4186,6 +4792,10 @@ def dismiss_listener_blockers(serial: str, root: ET.Element | None = None) -> bo
     os.environ["BOT_ALLOW_LISTENER_NAV"] = "1"
     changed = False
     try:
+        if not is_55m_foreground(serial):
+            if launch_messenger_app(serial):
+                changed = True
+                return True
         root = root or ui_hierarchy(serial)
         if is_secret_key_page(root):
             changed = dismiss_secret_key_page(serial) or changed
@@ -4196,8 +4806,15 @@ def dismiss_listener_blockers(serial: str, root: ET.Element | None = None) -> bo
         if is_group_settings_page(root):
             listener_system_back(serial, reason="退出群设置")
             changed = True
-        elif is_in_app_webview(root) and not is_group_chat_activity(serial):
-            changed = dismiss_in_app_webview(serial, max_steps=2) or changed
+        elif serial and is_contact_detail_activity(serial):
+            changed = dismiss_contact_detail_page(serial, bot) or changed
+            root = ui_hierarchy(serial)
+        elif is_in_app_webview(root, serial):
+            invalidate_roi_cache(serial)
+            changed = dismiss_in_app_webview(serial, max_steps=3) or changed
+        elif root is not None and any(t == "发送图片" for t in collect_ui_texts(root)):
+            _dismiss_image_picker(serial)
+            changed = True
     finally:
         if prev is None:
             os.environ.pop("BOT_ALLOW_LISTENER_NAV", None)
@@ -4229,25 +4846,70 @@ def listener_system_back(serial: str, *, reason: str = "") -> None:
     invalidate_ui_cache(serial)
 
 
+def wake_device_screen(serial: str) -> None:
+    """云机息屏时唤醒，避免 mCurrentFocus=null 误判离群。"""
+    if not serial:
+        return
+    for code in ("224", "26", "82"):
+        try:
+            adb_run(serial, "shell", "input", "keyevent", code)
+        except Exception:
+            pass
+    w(0.25, 0.1)
+
+
+def hard_reset_messenger_to_list(serial: str) -> bool:
+    """未连接/错会话：冷启动 55M 回到消息列表。"""
+    wake_device_screen(serial)
+    pkg = _MESSENGER_PKG_CACHE.get(serial) or "wuwu.d260608.t2200.vn7gh4kzd3"
+    try:
+        adb_run(serial, "shell", "am", "force-stop", pkg)
+    except Exception:
+        pass
+    w(0.6, 0.2)
+    if not launch_messenger_app(serial):
+        return False
+    tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
+    w(0.7, 0.25)
+    invalidate_ui_cache(serial)
+    return True
+
+
 def recover_listener_to_group_minimal(serial: str, bot: dict, *, max_steps: int = 6) -> bool:
     """右机离群时最小恢复：零导航模式下仅系统 Back，禁止 Tab/群名点击。"""
     group = (bot.get("associatedGroup") or "").strip()
+    wake_device_screen(serial)
+    root0 = ui_hierarchy(serial)
+    ctx0 = describe_screen_context(root0, bot, serial)
+    if ctx0.page == "wrong_chat" and "未连接" in (ctx0.title or ""):
+        log.warning("右机 未连接 会话，冷启动 55M 后重进群")
+        hard_reset_messenger_to_list(serial)
+        if group and tap_target_group_in_list(serial, bot, scrolls=0):
+            return listener_in_group_for_send(ui_hierarchy(serial), bot, serial)
     if not is_55m_foreground(serial):
         launch_messenger_app(serial)
     if is_send_only_listener(bot) and LISTENER_ZERO_NAV:
         prev = os.environ.get("BOT_ALLOW_LISTENER_NAV")
         os.environ["BOT_ALLOW_LISTENER_NAV"] = "1"
         try:
-            if listener_in_group_for_send(ui_hierarchy(serial), bot, serial):
+            root = ui_hierarchy(serial)
+            if listener_in_group_for_send(root, bot, serial) or in_target_group_chat(root, bot, serial):
                 return True
-            # 零导航：禁止连按 Back（会退到桌面/文件管理），只拉起 55M + 点群
+            ctx = describe_screen_context(root, bot, serial)
+            if ctx.page == "target_group":
+                return True
             launch_messenger_app(serial)
-            w(1.2, 0.4)
-            tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
-            w(0.7, 0.25)
+            w(0.8, 0.3)
+            if ctx.page == "message_list" and group:
+                if tap_target_group_in_list(serial, bot, scrolls=0):
+                    w(0.8, 0.3)
+                return listener_in_group_for_send(ui_hierarchy(serial), bot, serial)
+            if ctx.page not in ("message_list", "target_group"):
+                tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
+                w(0.7, 0.25)
             if group:
-                tap_target_group_in_list(serial, bot, scrolls=5)
-                w(1.0, 0.35)
+                tap_target_group_in_list(serial, bot, scrolls=1)
+                w(0.8, 0.3)
             return listener_in_group_for_send(ui_hierarchy(serial), bot, serial)
         finally:
             if prev is None:
@@ -4267,7 +4929,7 @@ def recover_listener_to_group_minimal(serial: str, bot: dict, *, max_steps: int 
                 log.warning("右机误进群设置页，系统返回 step=%d", step + 1)
                 listener_system_back(serial, reason="退出群设置")
                 continue
-            if is_in_app_webview(root):
+            if is_in_app_webview(root, serial):
                 log.warning("右机误开内嵌网页，关闭 step=%d", step + 1)
                 if dismiss_in_app_webview(serial, max_steps=2):
                     continue
@@ -4278,14 +4940,32 @@ def recover_listener_to_group_minimal(serial: str, bot: dict, *, max_steps: int 
                 continue
             ctx = describe_screen_context(root, bot, serial)
             if ctx.page == "wrong_chat":
+                title = get_chat_title(root)
+                if _likely_target_group_surface(root, bot, serial) or (
+                    _title_looks_like_unread_badge(title) and is_group_chat_activity(serial)
+                ):
+                    if in_target_group_chat(root, bot, serial) or listener_in_group_for_send(
+                        root, bot, serial,
+                    ):
+                        return True
+                if "未连接" in (ctx.title or ""):
+                    log.warning("右机会话未连接，退回列表重进群")
+                    for _ in range(2):
+                        listener_system_back(serial, reason="退出未连接会话")
+                    launch_messenger_app(serial)
+                    tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
+                    w(0.7, 0.25)
+                    if group and tap_target_group_in_list(serial, bot, scrolls=0):
+                        w(0.8, 0.3)
+                        continue
                 listener_system_back(serial, reason="退出错误会话")
                 continue
             if ctx.page == "message_list" and group:
-                if tap_target_group_in_list(serial, bot, scrolls=2):
+                if tap_target_group_in_list(serial, bot, scrolls=0):
                     w(0.8, 0.3)
                     continue
-                listener_system_back(serial, reason="消息列表未找到群")
-                continue
+                log.warning("消息列表可见但未点入 %s，不再乱点", group)
+                return False
             if not tab_tried:
                 tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
                 tab_tried = True
@@ -4330,14 +5010,16 @@ def tap_webview_done(serial: str) -> bool:
 
 
 def dismiss_in_app_webview(serial: str, *, max_steps: int = 4) -> bool:
-    """从内嵌网页退回 55M（误点公告里的 28.run 链接时）。"""
+    """从内嵌网页退回 55M。默认关闭自动 Back，避免误把群聊/列表顶出去。"""
+    if not LISTENER_WEBVIEW_AUTO_BACK:
+        return False
     prev = os.environ.get("BOT_ALLOW_LISTENER_NAV")
     os.environ["BOT_ALLOW_LISTENER_NAV"] = "1"
     closed = False
     try:
         for step in range(max_steps):
             root = ui_hierarchy(serial)
-            if not is_in_app_webview(root):
+            if not is_in_app_webview(root, serial):
                 if closed:
                     log.info("已退出内嵌网页")
                     invalidate_ui_cache(serial)
@@ -4376,24 +5058,52 @@ def tap_target_group_in_list(serial: str, bot: dict, *, scrolls: int = 5) -> boo
     group = (bot.get("associatedGroup") or "").strip()
     if not group:
         return False
-    dismiss_message_list_overlay(serial)
-    for i in range(scrolls + 1):
+    root0 = ui_hierarchy(serial)
+    if in_target_group_chat(root0, bot, serial) or listener_in_group_for_send(root0, bot, serial):
+        return True
+    now = time.time()
+    if now - _LISTENER_LAST_GROUP_TAP.get(serial, 0.0) < LISTENER_GROUP_TAP_SEC:
         root = ui_hierarchy(serial)
-        if root is None:
-            continue
-        pt = find_group_chat_entry(root, group)
-        if not pt:
-            pt = find_tap_contains(root, group, min_y=80, max_y=1500)
-        if pt:
-            adb_tap(serial, pt[0], pt[1])
-            w(1.0, 0.45)
-            if in_target_group_chat(ui_hierarchy(serial), bot, serial):
-                log.info("列表已进入目标群 %s", group)
-                return True
-            log.warning("点击 %s 后仍未进入目标群，重试", group)
-        if i < scrolls:
-            scroll_message_list(serial, "up")
-    return False
+        if listener_in_group_for_send(root, bot, serial) or in_target_group_chat(root, bot, serial):
+            return True
+        # 仍在列表页：冷却结束后必须允许再点入群
+    listener_lock = is_listener_send_only_serial(serial, bot) and not is_clicker_serial(serial, bot)
+    if listener_lock and not _LISTENER_RECOVER_LOCK.acquire(blocking=False):
+        root = ui_hierarchy(serial)
+        return listener_in_group_for_send(root, bot, serial) or in_target_group_chat(root, bot, serial)
+    try:
+        dismiss_message_list_overlay(serial)
+        for i in range(scrolls + 1):
+            root = ui_hierarchy(serial)
+            if root is None:
+                continue
+            pt = find_group_chat_entry(root, group)
+            if not pt:
+                pt = find_tap_contains(root, group, min_y=SEARCH_BAR_Y_MAX + 20, max_y=1500)
+            if pt:
+                log.info("消息列表点入 %s @ (%d,%d)", group, pt[0], pt[1])
+                adb_tap(serial, pt[0], pt[1])
+                w(1.5, 0.55)
+                invalidate_ui_cache(serial)
+                if list_tap_entered_group(serial, bot):
+                    log.info("列表已进入目标群 %s", group)
+                    _LISTENER_LAST_GROUP_TAP[serial] = time.time()
+                    return True
+                w(0.8, 0.3)
+                invalidate_ui_cache(serial)
+                if list_tap_entered_group(serial, bot):
+                    log.info("列表已进入目标群 %s（二次确认）", group)
+                    _LISTENER_LAST_GROUP_TAP[serial] = time.time()
+                    return True
+                log.warning("点击 %s 后仍未进入目标群，重试", group)
+                if i == 0 and find_group_chat_entry(root, group):
+                    break
+            if i < scrolls:
+                scroll_message_list(serial, "up")
+        return False
+    finally:
+        if listener_lock:
+            _LISTENER_RECOVER_LOCK.release()
 
 
 def find_tap_for_labels(
@@ -4494,6 +5204,8 @@ def tap_bottom_tab_index(serial: str, index: int, total: int = 4) -> bool:
 def tap_bottom_tab(serial: str, labels: tuple[str, ...]) -> bool:
     if block_listener_navigation(serial, f"底部Tab{labels}"):
         return False
+    if block_clicker_navigation(serial, f"底部Tab{labels}"):
+        return False
     root = ui_hierarchy(serial)
     if root is None:
         return False
@@ -4555,6 +5267,14 @@ def adb_tap_listener_send(serial: str, bot: dict | None, x: int, y: int) -> None
         return
     adb_run(serial, "shell", "input", "tap", str(int(x)), str(int(y)))
     invalidate_ui_cache(serial)
+
+
+def listener_send_announce_key(serial: str, settings: dict[str, str] | None = None) -> str:
+    """公告专用：多行/长文走 IME Enter（亚秒）；tap-only 不挡公告。"""
+    ensure_adb_ime(serial)
+    adb_run(serial, "shell", "am", "broadcast", "-a", "ADB_KEYBOARD_SMART_ENTER")
+    w(0.06, 0.03)
+    return "announce-IME-ENTER"
 
 
 def fire_listener_send_key(serial: str) -> str:
@@ -4744,12 +5464,17 @@ def is_group_chat_activity(serial: str) -> bool:
             if "groupchatactivity" in low or "group.chat" in low:
                 ok = True
                 break
-            # PopupWindow/IME 浮层盖住群聊时，焦点行不含 GroupChatActivity
-            if "popupwindow" in low and "wuwu." in low:
+            # PopupWindow/IME/ADB Keyboard 浮层盖住群聊时，焦点行不含 GroupChatActivity
+            if any(
+                m in low
+                for m in ("popupwindow", "inputmethod", "adbkeyboard", "keyboard")
+            ):
                 ok = _resumed_activity_is_group_chat(serial)
                 break
     except Exception:
         pass
+    if not ok:
+        ok = _resumed_activity_is_group_chat(serial)
     _GROUP_ACTIVITY_CACHE[serial] = (now, ok)
     return ok
 
@@ -4771,6 +5496,30 @@ def _window_focus_line(serial: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def is_contact_detail_activity(serial: str) -> bool:
+    """误点头像/联系人资料页 — 右机须立即返回，禁止停留。"""
+    low = _window_focus_line(serial).lower()
+    return "contactdetailactivity" in low or "business.ui.contacts" in low
+
+
+def dismiss_contact_detail_page(serial: str, bot: dict | None = None) -> bool:
+    if not is_contact_detail_activity(serial):
+        return False
+    log.warning("右机误入联系人资料页，系统返回 serial=%s", serial)
+    for _ in range(3):
+        listener_system_back(serial, reason="退出联系人资料")
+        w(0.4, 0.15)
+        if not is_contact_detail_activity(serial):
+            invalidate_ui_cache(serial)
+            if bot and not listener_in_group_for_send(ui_hierarchy(serial), bot, serial):
+                ctx = describe_screen_context(ui_hierarchy(serial), bot, serial)
+                if ctx.page == "message_list":
+                    tap_target_group_in_list(serial, bot, scrolls=2)
+            return True
+    invalidate_ui_cache(serial)
+    return not is_contact_detail_activity(serial)
 
 
 def dismiss_clicker_popup_overlay(serial: str) -> bool:
@@ -5135,75 +5884,107 @@ def device_safe_back(serial: str, *, reason: str = "") -> None:
 
 
 def clicker_back_to_group(serial: str, bot: dict, *, max_steps: int = 6) -> bool:
-    """左机回群：仅 UI 返回 + 消息列表点群名，禁止通讯录/系统 Back。"""
+    """左机回群：镜像右机 recover_listener_to_group_minimal，禁止连环 Back。"""
+    _ = max_steps
+    return recover_clicker_to_group_minimal(serial, bot)
+
+
+def recover_clicker_to_group_minimal(serial: str, bot: dict) -> bool:
+    """左机离群最小恢复：消息 Tab → 点群名；heal 时 BOT_ALLOW_CLICKER_NAV=1。"""
     group = (bot.get("associatedGroup") or "").strip()
+    wake_device_screen(serial)
     dismiss_clicker_dialogs(serial)
-    dismiss_upgrade_popup(serial)
-    if is_on_launcher(serial) or not is_55m_foreground(serial):
-        log.warning("左机不在 55M，重新拉起")
+    dismiss_secret_key_page(serial)
+    dismiss_search_page(serial)
+    in_gallery = _is_gallery_media_picker_activity(serial) or _verify_gallery_picker_open_serial(serial)
+    try:
+        from bot_ops.capture_ipc import has_pending_captures
+        cap_pending = has_pending_captures()
+    except Exception:
+        cap_pending = False
+    if not _clicker_img_flow_active(serial) and not in_gallery and not cap_pending:
+        force_exit_clicker_image_picker(serial, reason="recover")
+        dismiss_clicker_album_stuck(serial)
+    elif in_gallery and (cap_pending or _clicker_img_flow_active(serial)):
+        log.info("左机 recover 跳过退出相册（发图进行中）")
+    if not is_55m_foreground(serial):
         launch_messenger_app(serial)
-        w(0.9, 0.35)
-    for step in range(max_steps):
+        wc(0.8, 0.3)
+    prev = os.environ.get("BOT_ALLOW_CLICKER_NAV")
+    os.environ["BOT_ALLOW_CLICKER_NAV"] = "1"
+    try:
         root = ui_hierarchy(serial)
-        if in_target_group_chat(root, bot, serial):
+        if in_target_group_chat(root, bot, serial) and _verify_chat_composer_ready_serial(serial):
             log.info("左机已在目标群 %s", group or "?")
             return True
-        if is_group_settings_page(root):
-            clicker_safe_back(serial, reason="退出群设置")
-            continue
-        if is_in_app_webview(root):
-            clicker_safe_back(serial, reason="退出网页")
-            continue
-        if is_search_page(root, serial):
-            dismiss_search_page(serial)
-            continue
-        if is_secret_key_page(root):
-            dismiss_secret_key_page(serial)
-            continue
+        texts = collect_ui_texts(root) if root is not None else []
+        if any(t in texts for t in ("交易区", "兑换区", "购买C", "出售C")):
+            log.warning("左机在交易页，hard_reset → 消息列表")
+            hard_reset_messenger_to_list(serial)
+            wc(0.9, 0.35)
+            root = ui_hierarchy(serial)
+            texts = collect_ui_texts(root) if root is not None else []
+        if any(t in texts for t in ("通讯录", "新的朋友", "频道")):
+            log.warning("左机在通讯录 Tab，切回消息")
+            tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
+            wc(0.6, 0.25)
         ctx = describe_screen_context(root, bot, serial)
-        if ctx.page in ("profile", "wrong_chat"):
-            clicker_safe_back(serial, reason=f"退出{ctx.page}")
-            continue
-        if ctx.page == "message_list" and group:
-            if tap_target_group_in_list(serial, bot, scrolls=2):
-                w(0.6, 0.25)
-                continue
-        clicker_safe_back(serial, reason=f"回群 step={step + 1}")
-    root = ui_hierarchy(serial)
-    if in_target_group_chat(root, bot, serial):
-        return True
-    tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
-    w(0.55, 0.22)
-    if group and tap_target_group_in_list(serial, bot, scrolls=3):
-        return True
-    ok = in_target_group_chat(ui_hierarchy(serial), bot, serial)
-    if not ok:
-        log.warning("左机未能回到目标群 %s", group)
-    return ok
+        if ctx.page not in ("message_list", "target_group"):
+            tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
+            wc(0.55, 0.22)
+        entered = False
+        if group:
+            entered = tap_target_group_in_list(serial, bot, scrolls=4)
+            if entered:
+                wc(0.6, 0.25)
+            elif enter_group_via_contacts(serial, bot):
+                log.info("左机经通讯录进入 %s", group)
+                wc(0.6, 0.25)
+                entered = True
+        ok = in_target_group_chat(ui_hierarchy(serial), bot, serial)
+        if not ok:
+            log.warning("左机未能回到目标群 %s", group)
+        return ok
+    finally:
+        if prev is None:
+            os.environ.pop("BOT_ALLOW_CLICKER_NAV", None)
+        else:
+            os.environ["BOT_ALLOW_CLICKER_NAV"] = prev
 
 
 def ensure_clicker_in_group(serial: str, bot: dict, *, reason: str = "") -> bool:
     """左机入群/驻群：消息 Tab + 点群名，不走通讯录绕路。"""
-    if reason:
-        log.info("左机驻群检查 (%s)", reason)
-    dismiss_clicker_dialogs(serial)
-    dismiss_clicker_popup_overlay(serial)
-    if not is_55m_foreground(serial):
-        launch_messenger_app(serial)
-        wc(0.8, 0.25)
-    root = ui_hierarchy(serial)
-    if _verify_chat_composer_ready_serial(serial):
-        log.info("左机已在群聊输入态，跳过群名导航")
-        return True
-    if in_target_group_chat(root, bot, serial):
-        return True
-    dismiss_message_list_overlay(serial)
-    tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
-    wc(0.5, 0.15)
-    group = (bot.get("associatedGroup") or "").strip()
-    if group and tap_target_group_in_list(serial, bot, scrolls=4):
-        return True
-    return clicker_back_to_group(serial, bot)
+    if not is_clicker_serial(serial):
+        return ensure_group_chat(serial, bot)
+    with _CLICKER_NAV_LOCK:
+        if reason:
+            log.info("左机驻群检查 (%s)", reason)
+        dismiss_clicker_dialogs(serial)
+        dismiss_clicker_popup_overlay(serial)
+        dismiss_secret_key_page(serial)
+        dismiss_search_page(serial)
+        if reason and ("ui-image" in reason or reason == "img-loop-stay"):
+            if _is_gallery_media_picker_activity(serial) or _verify_gallery_picker_open_serial(serial):
+                log.info("左机已在相册选图页，跳过驻群导航 (%s)", reason)
+                return True
+        if _verify_chat_composer_ready_serial(serial) and in_target_group_chat(
+            ui_hierarchy(serial), bot, serial,
+        ):
+            log.info("左机已在群聊输入态，跳过群名导航")
+            return True
+        if _clicker_img_flow_active(serial):
+            root = ui_hierarchy(serial)
+            if in_target_group_chat(root, bot, serial):
+                return True
+            if (
+                _is_gallery_media_picker_activity(serial)
+                or _verify_gallery_picker_open_serial(serial)
+                or clicker_img_task_surface_ready(serial, root)
+            ):
+                return True
+            log.info("左机发图流程中，跳过导航 heal")
+            return True
+        return recover_clicker_to_group_minimal(serial, bot)
 
 
 def ensure_group_chat(serial: str, bot: dict) -> bool:
@@ -5239,11 +6020,11 @@ def ensure_group_chat(serial: str, bot: dict) -> bool:
         if is_secret_key_page(root):
             dismiss_secret_key_page(serial)
             continue
-        if is_in_app_webview(root):
+        if is_in_app_webview(root, serial):
             dismiss_in_app_webview(serial)
             continue
         # 在错误聊天页（有输入框但不是目标群）→ 左上角返回
-        if in_group_chat(root, bot, serial):
+        if in_group_chat(root, bot, serial) and not _likely_target_group_surface(root, bot, serial):
             log.warning("当前在错误会话，返回 (目标群=%s)", group)
             tap_header_back(serial)
             w(0.7, 0.3)
@@ -5288,7 +6069,10 @@ def is_secret_key_page(root: ET.Element | None) -> bool:
 
 def listener_send_blocked(root: ET.Element | None, serial: str = "") -> bool:
     """右机当前 UI 是否挡住发消息（密钥/搜索/设置/浏览器/桌面）。"""
-    if serial and (is_on_launcher(serial) or not is_55m_foreground(serial)):
+    if serial and is_on_launcher(serial):
+        return True
+    # IME/ADB Keyboard 抢焦点时 mCurrentFocus 不含 wuwu，但群聊 Activity 仍在
+    if serial and not is_55m_foreground(serial) and not is_group_chat_activity(serial):
         return True
     if root is None:
         return not (serial and is_group_chat_activity(serial))
@@ -5303,6 +6087,8 @@ def listener_send_blocked(root: ET.Element | None, serial: str = "") -> bool:
         is_secret_key_page(root)
         or is_search_page(root, serial)
         or is_group_settings_page(root)
+        or is_in_app_webview(root, serial)
+        or any(t == "发送图片" for t in texts)
     )
 
 
@@ -5346,7 +6132,7 @@ def dismiss_search_page(serial: str) -> bool:
         invalidate_ui_cache(serial)
         return True
     log.warning("在搜索页但未找到「取消」按钮")
-    press_back(serial, 1)
+    listener_system_back(serial, reason="搜索页兜底返回")
     return True
 
 
@@ -6351,6 +7137,30 @@ def api(method: str, path: str, body: Any = None) -> Any:
     return _BACKEND.request(method, path, body)
 
 
+def panel_api_ready(*, force: bool = False) -> bool:
+    """Panel :3000 二次校验；非 200 时禁止用户出站发送。"""
+    global _PANEL_OK_UNTIL
+    now = time.time()
+    if not force and now < _PANEL_OK_UNTIL:
+        return True
+    code = "000"
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:3000/api/bots",
+            method="GET",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            code = str(resp.status)
+    except Exception:
+        code = "000"
+    ok = code == "200"
+    _PANEL_OK_UNTIL = now + (PANEL_CHECK_TTL_SEC if ok else 0.4)
+    if not ok:
+        log.warning("Panel 非200(http=%s)，暂停用户发送", code)
+    return ok
+
+
 def gateway_post_json(path: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """记忆网关 HTTP POST（纯 stdlib，对接 mock_gateway）。"""
     url = f"{GATEWAY_BASE_URL}{path}"
@@ -6399,18 +7209,53 @@ def listener_gateway_resolve(
     """网关认人：hit=已缓存 user_id | pending=202 待 Clicker | skip=未启用/失败。"""
     if not GATEWAY_ENABLED:
         return "skip"
+    t0 = time.perf_counter()
+    if _global_mid_cache_get(bot_id, username):
+        ms = (time.perf_counter() - t0) * 1000
+        log.info("[DEBUG] 网关本地命中 %.0fms username=%s", ms, username)
+        return "hit"
     status, body = gateway_chat_message(username, msg)
+    ms = (time.perf_counter() - t0) * 1000
+    log.info(
+        "[DEBUG] gateway inbound status=%s %.0fms username=%s msg=%s",
+        status, ms, username, message_snip(msg)[:40],
+    )
     if status == 200 and body.get("status") == "success":
         uid = str(body.get("user_id") or "").strip()
         if uid:
             store_mid_cache(serial, username, uid, bot_id)
             save_mid_cache()
-            log.info("[极速放行] 命中缓存 username=%s user_id=%s", username, uid)
+            log.info("[极速放行] 命中缓存 %.0fms username=%s user_id=%s", ms, username, uid)
         return "hit"
     if status == 202 and body.get("action") == "require_id_fetch":
-        log.info("[风控拦截] 未知用户，挂起并下发认人任务 username=%s", username)
+        log.info("[风控拦截] 未知用户 %.0fms username=%s", ms, username)
         return "pending"
     return "skip"
+
+
+_GATEWAY_WARM_AT: float = 0.0
+
+
+def gateway_warm_from_users(users: list[dict], *, min_interval_sec: float = 30.0) -> None:
+    """Panel 用户 → mock_gateway 缓存，避免已登记用户走 202+Clicker 慢路径。"""
+    global _GATEWAY_WARM_AT
+    if not GATEWAY_ENABLED:
+        return
+    now = time.time()
+    if now - _GATEWAY_WARM_AT < min_interval_sec:
+        return
+    _GATEWAY_WARM_AT = now
+    warmed = 0
+    for u in users:
+        if not isinstance(u, dict):
+            continue
+        nick = str(u.get("username") or "").strip()
+        uid = normalize_messenger_id(str(u.get("messengerId") or ""))
+        if nick and uid:
+            gateway_update_id(nick, uid)
+            warmed += 1
+    if warmed:
+        log.debug("gateway 预热 %d 用户", warmed)
 
 
 def record_bill(
@@ -6436,7 +7281,11 @@ def record_bill(
 
 
 def adb_run(serial: str, *args: str, timeout: int = 20) -> str:
-    cmd = ["adb", "-s", serial] + list(args)
+    try:
+        from bot_ops.adb_isolated import adb_cmd
+    except ImportError:
+        adb_cmd = lambda s, *a: ["adb", "-s", s, *a]  # type: ignore
+    cmd = adb_cmd(serial, *args)
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return (out.stdout or "") + (out.stderr or "")
@@ -6445,7 +7294,11 @@ def adb_run(serial: str, *args: str, timeout: int = 20) -> str:
 
 
 def adb_exec_out_bytes(serial: str, *args: str, timeout: int = 12) -> bytes | None:
-    cmd = ["adb", "-s", serial, "exec-out"] + list(args)
+    try:
+        from bot_ops.adb_isolated import adb_exec_cmd
+    except ImportError:
+        adb_exec_cmd = lambda s, *a: ["adb", "-s", s, "exec-out", *a]  # type: ignore
+    cmd = adb_exec_cmd(serial, *args)
     try:
         out = subprocess.run(cmd, capture_output=True, timeout=timeout)
         if out.returncode == 0 and out.stdout and len(out.stdout) > 512:
@@ -6467,8 +7320,7 @@ def invalidate_roi_cache(serial: str) -> None:
 def _chat_roi_gray(png_bytes: bytes) -> Any | None:
     if not _HAS_CV2 or np is None or cv2 is None:
         return None
-    arr = np.frombuffer(png_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    img = _safe_imdecode_png(png_bytes)
     if img is None:
         return None
     h = img.shape[0]
@@ -6744,6 +7596,44 @@ def _clicker_image_target() -> tuple[str, dict] | None:
     cb = _CLICKER_DEPLOY.get("bot")
     if cs and isinstance(cb, dict):
         return cs, cb
+    try:
+        from bot_ops.runtime import load_bot_runtime
+
+        rt = load_bot_runtime()
+        port = rt.clicker_adb_port
+        listener_port = rt.listener_adb_port
+        for serial in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            try:
+                from bot_ops.adb_isolated import adb_cmd
+
+                cmd = adb_cmd(serial, "shell", "echo", "OK")
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+                if r.returncode == 0 and "OK" in (r.stdout or ""):
+                    if port == listener_port:
+                        log.error("左机端口与右机相同 %s，拒绝发图路由", port)
+                        break
+                    bots = api("GET", "/api/bots") or []
+                    for bid in rt.clicker_ids:
+                        bot = next((b for b in bots if str(b.get("id")) == bid), None)
+                        if bot:
+                            return serial, bot
+                    return serial, {"id": rt.clicker_ids[0], "associatedGroup": ""}
+            except Exception:
+                continue
+    except Exception as ex:
+        log.warning("runtime 解析左机发图目标失败: %s", ex)
+    try:
+        bots = api("GET", "/api/bots") or []
+        for bid in CLICKER_BOT_IDS:
+            bot = next((b for b in bots if str(b.get("id")) == bid), None)
+            if not bot:
+                continue
+            host = str(bot.get("adbHost") or DEFAULT_ADB)
+            serial = resolve_serial_optional(host, label=f"{bid}(CLICKER-dual)")
+            if serial:
+                return serial, bot
+    except Exception as ex:
+        log.warning("双进程解析左机发图目标失败: %s", ex)
     return None
 
 
@@ -6964,14 +7854,71 @@ def _near_xy(x: int, y: int, pt: tuple[int, int], tol: int) -> bool:
 def clicker_img_flow_begin(serial: str) -> None:
     if is_clicker_serial(serial) and CLICKER_IMG_TAP_ONLY:
         _CLICKER_IMG_FLOW_SERIALS.add(serial)
+        _CLICKER_IMG_FLOW_SINCE[serial] = time.time()
+        try:
+            from bot_ops.clicker_busy_ipc import mark_clicker_busy
+
+            mark_clicker_busy(serial)
+        except Exception:
+            pass
 
 
 def clicker_img_flow_end(serial: str) -> None:
     _CLICKER_IMG_FLOW_SERIALS.discard(serial)
+    _CLICKER_IMG_FLOW_SINCE.pop(serial, None)
+    try:
+        from bot_ops.clicker_busy_ipc import clear_clicker_busy
+
+        clear_clicker_busy(serial)
+    except Exception:
+        pass
+
+
+def force_exit_clicker_image_picker(serial: str, *, reason: str = "heal") -> bool:
+    """heal/recover 时强制退出选图/相册页（结束发图标记 + 点取消）。"""
+    if not is_clicker_serial(serial):
+        return False
+    root = ui_hierarchy(serial)
+    texts = collect_ui_texts(root) if root is not None else []
+    act = current_activity_hint(serial)
+    in_media_act = any(
+        m in act for m in ("ChannelMediaSelect", "ImagePicker", "MediaSelect", "PictureSelector")
+    )
+    in_picker_ui = any(
+        x in texts
+        for x in ("发送图片", "最近项目", "所有照片", "预览", "0/9", "0/3", "请选择", "已选择")
+    ) or any(re.search(r"\d+/\d+", (t or "")) for t in texts)
+    if not in_media_act and not in_picker_ui:
+        return False
+    log.warning("左机强制退出选图页 reason=%s activity=%s", reason, act)
+    clicker_img_flow_end(serial)
+    if root is not None:
+        for label in ("取消", "关闭", "返回"):
+            pt = find_tap_contains(root, label, min_y=0, max_y=260)
+            if pt:
+                adb_tap(serial, pt[0], pt[1])
+                w(0.45, 0.18)
+                invalidate_ui_cache(serial)
+                root = ui_hierarchy(serial)
+                break
+        if root is not None and any(re.search(r"\d+/\d+", (t or "")) for t in collect_ui_texts(root)):
+            tap_header_back(serial)
+            w(0.4, 0.15)
+    _dismiss_image_picker(serial)
+    dismiss_clicker_popup_overlay(serial)
+    invalidate_ui_cache(serial)
+    return True
 
 
 def _clicker_img_flow_active(serial: str) -> bool:
-    return is_clicker_serial(serial) and serial in _CLICKER_IMG_FLOW_SERIALS
+    if not (is_clicker_serial(serial) and serial in _CLICKER_IMG_FLOW_SERIALS):
+        return False
+    since = _CLICKER_IMG_FLOW_SINCE.get(serial, 0.0)
+    if since and time.time() - since > CLICKER_IMG_FLOW_MAX_SEC:
+        log.warning("左机发图流程超时 %.0fs，强制结束 serial=%s", time.time() - since, serial)
+        clicker_img_flow_end(serial)
+        return False
+    return True
 
 
 def clicker_tap_pinned(
@@ -6988,6 +7935,7 @@ def clicker_tap_pinned(
         key.startswith("chat_plus")
         or key.startswith("attach")
         or key.startswith("gallery")
+        or key.startswith("trust_gallery")
     )
     if (
         _clicker_img_flow_active(serial)
@@ -7000,17 +7948,28 @@ def clicker_tap_pinned(
 
 
 def clicker_forbidden_tap(serial: str, x: int, y: int, purpose: str = "") -> bool:
-    """左机发图流程：仅 purpose=clicker-pinned-* 时允许 tap。"""
-    if not CLICKER_IMG_TAP_ONLY or not _clicker_img_flow_active(serial):
+    """左机 tap 门禁：发图流程仅 clicker-pinned-*；零导航模式禁止一切导航 tap。"""
+    if not is_clicker_serial(serial):
+        return False
+    if os.environ.get("BOT_ALLOW_CLICKER_NAV") == "1":
+        return False
+    if _clicker_img_flow_active(serial) and CLICKER_IMG_TAP_ONLY:
+        if purpose.startswith("clicker-pinned-"):
+            return False
+        log.warning("左机发图禁止乱点 @(%d,%d) purpose=%s", x, y, purpose or "other")
+        return True
+    if not CLICKER_ZERO_NAV:
         return False
     if purpose.startswith("clicker-pinned-"):
         return False
-    log.warning("左机发图禁止乱点 @(%d,%d) purpose=%s", x, y, purpose or "other")
+    log.warning("左机零导航禁止 tap @(%d,%d) purpose=%s", x, y, purpose or "other")
     return True
 
 
 def listener_forbidden_tap(serial: str, x: int, y: int, purpose: str = "") -> bool:
     """右机 LISTENER：仅钉死发送键或钉死输入框（composer-focus）允许 tap。"""
+    if os.environ.get("BOT_ALLOW_LISTENER_NAV") == "1":
+        return False
     role = serial_role(serial)
     if role == "LISTENER" or BOT_ROLE == "LISTENER":
         if purpose in ("pinned-send", "composer-focus", "listener-fire"):
@@ -7040,11 +7999,8 @@ def _listener_blue_send_ready(
     *,
     allow_draft: bool = True,
 ) -> bool:
-    """内联栏蓝箭头已出现；draft 优先，避免 emoji 误判挡住发送。"""
-    if allow_draft and LISTENER_SEND_TAP_ONLY and snap is not None:
-        draft = re.sub(r"\s+", "", snap.draft or "")
-        if len(draft) >= 2:
-            return True
+    """话筒位已变蓝箭头才允许点（有 draft 但仍是麦克风 → 未就绪）。"""
+    _ = allow_draft
     if snap is None or snap.root is None:
         return False
     if _listener_voice_ui_active(snap.root):
@@ -7052,8 +8008,80 @@ def _listener_blue_send_ready(
     root = snap.root
     if _mic_at_xy(root, sx, sy):
         return False
+    if wuwu_send_button_xy(root):
+        return True
     if _send_icon_at_pin(root, sx, sy):
         return True
+    return False
+
+
+def _b64_draft_ready(draft: str, text: str, *, announce: bool) -> bool:
+    draft_cmp = _norm_cmp(draft or "")
+    if not draft_cmp:
+        return False
+    if announce and "新的一局" in text:
+        rid = _open_announce_rid(text)
+        if rid and rid in draft_cmp and "新的一局" in draft_cmp:
+            head = text.split("\n", 1)[0].strip()
+            return _norm_cmp(head) in draft_cmp and len(draft_cmp) >= max(24, len(_norm_cmp(head)) + 8)
+        return False
+    outgoing_clean = _norm_cmp(message_snip(text))
+    return len(draft_cmp) >= max(2, min(8, len(outgoing_clean) // 3))
+
+
+def _open_draft_fully_ready(draft: str, text: str) -> bool:
+    """新的一局：rid+首行必须在 draft，且长度足够（防 partial 误判）。"""
+    if not draft or not text:
+        return False
+    rid = _open_announce_rid(text)
+    dc = _norm_cmp(draft)
+    if not rid or rid not in dc or "新的一局" not in dc:
+        return False
+    head = text.split("\n", 1)[0].strip()
+    head_cmp = _norm_cmp(head)
+    if head_cmp not in dc:
+        return False
+    return len(dc) >= max(24, len(head_cmp) + 8)
+
+
+def listener_prepare_open_outgoing(serial: str, text: str) -> bool:
+    """新的一局长公告：清 composer → b64/粘贴 → 严格验 draft（≤2 轮）。"""
+    ensure_adb_ime(serial)
+    listener_clear_composer_hard(serial)
+    focus = pinned_xy("listener", "input") or (360, 1234)
+    for attempt in range(2):
+        if attempt:
+            listener_clear_composer_hard(serial)
+            w(0.05, 0.02)
+        adb_tap_raw(serial, focus[0], focus[1], purpose="composer-focus")
+        w(0.04, 0.02)
+        adb_send_b64(serial, text, fast=True, instant=True)
+        w(0.12, 0.05)
+        snap = ui_snapshot(serial, chat=False, force=attempt > 0)
+        draft = snap.draft or ""
+        if _open_draft_fully_ready(draft, text):
+            log.info(
+                "open draft 就绪 len=%s snip=%s",
+                len(draft), message_snip(draft)[:36],
+            )
+            return True
+        if attempt == 0 and _set_clipboard_text(serial, text):
+            adb_tap_raw(serial, focus[0], focus[1], purpose="composer-focus")
+            w(0.05, 0.02)
+            try:
+                adb_run(serial, "shell", "input", "keyevent", "279")
+                w(0.12, 0.05)
+                snap = ui_snapshot(serial, chat=False, force=True)
+                draft = snap.draft or ""
+                if _open_draft_fully_ready(draft, text):
+                    log.info("open draft 就绪 [paste] snip=%s", message_snip(draft)[:36])
+                    return True
+            except Exception:
+                pass
+        log.warning(
+            "open draft 未就绪 attempt=%s draft=%r",
+            attempt + 1, (draft or "")[:48],
+        )
     return False
 
 
@@ -7063,12 +8091,18 @@ def listener_prepare_b64_outgoing(serial: str, text: str) -> bool:
     ensure_adb_ime(serial)
     focus = pinned_xy("listener", "input") or (360, 1234)
     tap_only = is_listener_send_only_serial(serial) and LISTENER_SEND_TAP_ONLY
+    if announce and "新的一局" in text:
+        listener_clear_composer_hard(serial)
+    elif announce:
+        snap0 = ui_snapshot(serial, chat=False, force=False)
+        if snap0.draft and not _draft_strict_match(snap0.draft, text):
+            listener_clear_composer_hard(serial)
     if tap_only and focus:
         adb_tap_raw(serial, focus[0], focus[1], purpose="composer-focus")
-        w(0.02 if LISTENER_SEND_FIRE else 0.1, 0.01)
-    outgoing_clean = re.sub(r"\s+", "", message_snip(text))
+        w(0.01 if LISTENER_SEND_FIRE else 0.1, 0.01)
     b64_instant = bool(LISTENER_SEND_FIRE and tap_only and LISTENER_TRUST_SEND and not announce)
-    for attempt in range(3 if announce else 2):
+    paste_wait = 0.28 if announce and "新的一局" in text else (0.18 if announce else 0.15)
+    for attempt in range(4 if announce and "新的一局" in text else (3 if announce else 2)):
         if attempt:
             w(0.12, 0.06)
             if tap_only and focus:
@@ -7078,20 +8112,20 @@ def listener_prepare_b64_outgoing(serial: str, text: str) -> bool:
         adb_send_b64(serial, text, fast=True, instant=b64_instant)
         if LISTENER_SEND_FIRE and tap_only and LISTENER_TRUST_SEND and not announce:
             return True
-        w(0.08 if announce else 0.04, 0.03)
+        w(0.12 if announce and "新的一局" in text else (0.08 if announce else 0.04), 0.03)
         snap = ui_snapshot(serial, chat=False, force=True)
-        draft = re.sub(r"\s+", "", snap.draft or "")
-        if len(draft) >= max(2, min(8, len(outgoing_clean) // 3)):
+        draft = snap.draft or ""
+        if _b64_draft_ready(draft, text, announce=announce):
             return True
         if attempt >= 1 and _set_clipboard_text(serial, text):
             adb_tap_raw(serial, focus[0], focus[1], purpose="composer-focus")
             w(0.06, 0.03)
             try:
                 adb_run(serial, "shell", "input", "keyevent", "279")  # KEYCODE_PASTE
-                w(0.18 if announce else 0.15, 0.08)
+                w(paste_wait, 0.08)
                 snap = ui_snapshot(serial, chat=False, force=True)
-                draft = re.sub(r"\s+", "", snap.draft or "")
-                if len(draft) >= max(2, min(8, len(outgoing_clean) // 3)):
+                draft = snap.draft or ""
+                if _b64_draft_ready(draft, text, announce=announce):
                     return True
             except Exception:
                 pass
@@ -7161,12 +8195,18 @@ def listener_tap_pinned_send_now(
     bot: dict | None,
     settings: dict[str, str] | None = None,
 ) -> tuple[int, int]:
-    """钉死坐标立即点发送；fire 模式走专用线程，禁止发前 dump。"""
-    if LISTENER_SEND_FIRE and is_listener_send_only_serial(serial, bot):
-        sx, sy = listener_fire_send_tap(serial, settings)
-        log.info("右机立即点发送 @(%d,%d) [fire-thread]", sx, sy)
-        return sx, sy
+    """蓝箭头就绪后立即点发送（禁止话筒态盲 fire）。"""
     sx, sy = listener_pinned_send_xy(settings, None)
+    if is_listener_send_only_serial(serial, bot) and LISTENER_SEND_TAP_ONLY:
+        listener_tap_blue_send_once(
+            serial, bot, settings, wait_draft=True, allow_pinned_fallback=True,
+        )
+        return sx, sy
+    if LISTENER_SEND_FIRE and is_listener_send_only_serial(serial, bot):
+        listener_tap_blue_send_once(
+            serial, bot, settings, wait_draft=True, allow_pinned_fallback=True,
+        )
+        return sx, sy
     adb_tap_listener_send(serial, bot, sx, sy)
     log.info("右机立即点发送 @(%d,%d) [fire]", sx, sy)
     return sx, sy
@@ -7181,9 +8221,6 @@ def listener_tap_blue_send_once(
     allow_pinned_fallback: bool = False,
 ) -> bool:
     """右机唯一允许 tap：蓝发送箭头已出现才点一次。"""
-    if LISTENER_PINNED_SEND and LISTENER_SEND_FIRE and is_listener_send_only_serial(serial):
-        listener_tap_pinned_send_now(serial, bot, settings)
-        return True
     sx, sy = listener_active_send_xy(serial, settings, None)
     snap: UiSnapshot | None = None
     snap = ui_snapshot(serial, chat=False, force=True)
@@ -7214,8 +8251,12 @@ def listener_tap_blue_send_once(
             break
     if snap is None or not _listener_blue_send_ready(snap, sx, sy):
         if allow_pinned_fallback and is_group_chat_activity(serial):
-            listener_tap_pinned_send_now(serial, bot, settings)
-            return True
+            snap2 = ui_snapshot(serial, chat=False, force=True)
+            sx2, sy2 = listener_active_send_xy(serial, settings, snap2)
+            if _listener_blue_send_ready(snap2, sx2, sy2):
+                adb_tap_listener_send(serial, bot, sx2, sy2)
+                log.info("右机点击蓝发送箭头 @(%d,%d) [fallback-ready]", sx2, sy2)
+                return True
         draft_hint = (snap.draft or "")[:24] if snap else ""
         log.warning(
             "右机蓝箭头未出现，禁止点击 @(%d,%d) draft=%r",
@@ -7705,7 +8746,7 @@ def recover_listener_to_group(serial: str, group: str | None = None) -> bool:
     try:
         ok = recover_listener_to_group_minimal(serial, bot)
         ctx = describe_screen_context(ui_hierarchy(serial), bot, serial)
-        log.info("右机回群 %s → %s", g, "OK" if ok else ctx.summary())
+        log.info("右机回群 %s → %s", g, "OK" if ok else ctx.summary(serial))
         return ok
     finally:
         if prev is None:
@@ -7725,23 +8766,39 @@ def command_dedup_window(cmd: str) -> float:
 
 def try_claim_command(
     bot_id: str, sender: str, cmd: str, cmd_y: int = 0,
+    *, round_id: int = 0,
 ) -> bool:
-    """探针/读屏抢同一气泡；下注永远认领。"""
+    """探针/读屏/gateway 跨路径抢同一气泡；下注也须跨进程去重。"""
     c = (cmd or "").strip()
     snd = (sender or "").strip()
     if not c:
         return False
-    if is_bet_command(c):
-        return True
-    if cmd_y > 0:
-        key = f"{bot_id}|{snd.lower()}|{c}|{cmd_y // CMD_Y_BUCKET}"
-    else:
-        key = f"{bot_id}|{_probe_dedup_key(snd, c)}"
-    now = time.time()
-    win = CMD_CLAIM_RACE_SEC
-    if now - _COMMAND_CLAIM.get(key, 0) < win:
-        return False
-    _COMMAND_CLAIM[key] = now
+    bet = is_bet_command(c)
+    try:
+        from bot_ops.cmd_claim_ipc import try_claim_command_ipc
+
+        if not try_claim_command_ipc(
+            bot_id, snd, c, cmd_y=cmd_y, round_id=round_id, bet=bet,
+        ):
+            return False
+    except Exception as ex:
+        log.debug("cmd_claim_ipc fallback mem: %s", ex)
+        if bet:
+            key = f"{bot_id}|{snd.lower()}|{re.sub(r'\s+', '', c)}"
+            now = time.time()
+            if now - _COMMAND_CLAIM.get(key, 0) < max(CMD_CLAIM_RACE_SEC, 120.0):
+                return False
+            _COMMAND_CLAIM[key] = now
+            return True
+        if cmd_y > 0:
+            key = f"{bot_id}|{snd.lower()}|{c}|{cmd_y // CMD_Y_BUCKET}"
+        else:
+            key = f"{bot_id}|{_probe_dedup_key(snd, c)}"
+        now = time.time()
+        win = CMD_CLAIM_RACE_SEC
+        if now - _COMMAND_CLAIM.get(key, 0) < win:
+            return False
+        _COMMAND_CLAIM[key] = now
     return True
 
 
@@ -7859,6 +8916,47 @@ def _draft_has(draft: str, text: str) -> bool:
         return False
     n = min(8, len(t), len(d))
     return t[:n] in d or d[:n] in t or t in d or d in t
+
+
+def _open_announce_rid(text: str) -> str:
+    m = re.search(r"(\d{6,8})", text or "")
+    return m.group(1) if m else ""
+
+
+def _draft_strict_match(draft: str, outgoing: str) -> bool:
+    """公告/新一局须 rid 一致，禁止 fuzzy 误判 stale draft 为已灌好。"""
+    if not draft or not outgoing:
+        return False
+    if "新的一局" in outgoing:
+        rid = _open_announce_rid(outgoing)
+        if not rid:
+            return _draft_has(draft, outgoing)
+        dc = _norm_cmp(draft)
+        return rid in dc and "新的一局" in dc
+    return _draft_has(draft, outgoing)
+
+
+def listener_clear_composer_hard(serial: str, *, verify: bool = True) -> bool:
+    """清 stale composer：聚焦 + ADB_CLEAR + 退格，避免旧 draft 堵住热路径。"""
+    if _any_clicker_img_flow_busy():
+        log.info("右机 composer-clear 跳过：左机发图进行中")
+        return False
+    ensure_adb_ime(serial)
+    focus = pinned_xy("listener", "input") or (360, 1234)
+    for _attempt in range(3):
+        adb_tap_raw(serial, focus[0], focus[1], purpose="composer-clear")
+        w(0.06, 0.03)
+        adb_run(serial, "shell", "am", "broadcast", "-a", "ADB_CLEAR_TEXT")
+        w(0.05, 0.02)
+        for _ in range(28):
+            adb_run(serial, "shell", "input", "keyevent", "67")
+        w(0.08, 0.04)
+        if not verify:
+            return True
+        snap = ui_snapshot(serial, chat=False, force=True)
+        if draft_is_empty(snap.draft or ""):
+            return True
+    return False
 
 
 def input_filled(texts: list[str], draft: str, text: str) -> bool:
@@ -8199,8 +9297,27 @@ def _outgoing_is_announce(text: str) -> bool:
     )
 
 
+def _announce_is_scheduled(text: str) -> bool:
+    """封盘提醒/封盘公告：时间窗敏感，走 fire+短验快路径。"""
+    t = (text or "").strip()
+    if "新的一局" in t:
+        return False
+    return any(k in t for k in ("距离封盘", "60秒", "已封盘停止", "[禁]", "停止下注"))
+
+
+def _announce_is_open(text: str) -> bool:
+    return "新的一局" in (text or "")
+
+
 def _any_clicker_img_flow_busy() -> bool:
-    return bool(_CLICKER_IMG_FLOW_SERIALS)
+    if _CLICKER_IMG_FLOW_SERIALS:
+        return True
+    try:
+        from bot_ops.clicker_busy_ipc import any_clicker_busy_glob
+
+        return any_clicker_busy_glob()
+    except Exception:
+        return False
 
 
 def _wait_clicker_img_idle(timeout: float = 5.0) -> None:
@@ -8228,12 +9345,56 @@ def _announce_match_keys(outgoing: str) -> list[str]:
     return [k for k in keys if k]
 
 
+def _open_announce_rid(outgoing: str) -> str:
+    m = re.search(r"(\d{6,8})", outgoing or "")
+    return m.group(1) if m else ""
+
+
+def _bubble_is_open_announce(bubble: str, outgoing: str) -> bool:
+    """新开局必须 rid+「新的一局」同气泡，避免旧局误判。"""
+    rid = _open_announce_rid(outgoing)
+    if not rid:
+        return False
+    nt = _norm_announce(bubble)
+    return "新的一局" in nt and rid in nt
+
+
+def _open_announce_loose_visible(
+    texts_after: list[str],
+    texts_before: list[str],
+    outgoing: str,
+) -> bool:
+    """55M 长公告常被拆成多段 node；rid 与「新的一局」可不在同一 text。"""
+    rid = _open_announce_rid(outgoing)
+    if not rid:
+        return False
+    before_set = set(texts_before)
+    new_texts = [t for t in texts_after if t not in before_set]
+    pool = new_texts if new_texts else list(texts_after[-12:])
+    combined = _norm_announce("".join(pool))
+    if rid in combined and "新的一局" in combined:
+        return True
+    has_rid = any(rid in _norm_announce(t) for t in pool)
+    has_open = any("新的一局" in _norm_announce(t) for t in pool)
+    return has_rid and has_open
+
+
 def _announce_in_chat(
     texts_after: list[str],
     texts_before: list[str],
     outgoing: str,
     draft_after: str = "",
 ) -> bool:
+    if "新的一局" in (outgoing or ""):
+        before_set = set(texts_before)
+        for t in texts_after:
+            if t in before_set:
+                continue
+            if _bubble_is_open_announce(t, outgoing):
+                return True
+        if _open_announce_loose_visible(texts_after, texts_before, outgoing):
+            return True
+        return False
     if send_succeeded(texts_after, draft_after, outgoing, texts_before, ""):
         return True
     keys = _announce_match_keys(outgoing)
@@ -8284,6 +9445,203 @@ def listener_tap_resolved_send(
     return sx, sy
 
 
+def listener_verify_announce_fast(
+    serial: str,
+    bot: dict,
+    settings: dict[str, str] | None,
+    outgoing: str,
+    texts_before: list[str],
+    draft_before: str,
+    send_xy: tuple[int, int],
+    *,
+    deadline: float | None = None,
+) -> bool:
+    """封盘提醒/公告快验：draft 清空或气泡命中；受 deadline 约束。"""
+    if deadline is None:
+        deadline = time.perf_counter() + LISTENER_ANNOUNCE_VERIFY_MAX_MS / 1000.0
+    sx, sy = send_xy
+    attempt = 0
+    while time.perf_counter() < deadline:
+        if attempt:
+            listener_tap_blue_send_once(
+                serial, bot, settings, wait_draft=False, allow_pinned_fallback=True,
+            )
+            w(0.03, 0.015)
+        snap = ui_snapshot(serial, chat=False, force=attempt > 0)
+        draft_after = snap.draft or ""
+        if draft_cleared_after_fill(draft_before, draft_after, outgoing):
+            return True
+        if draft_is_empty(draft_after) and not _draft_has(draft_after, outgoing):
+            return True
+        snap_chat = ui_snapshot(serial, chat=True, force=False)
+        if _announce_in_chat(snap_chat.texts, texts_before, outgoing, snap_chat.draft or ""):
+            return True
+        attempt += 1
+        if attempt >= 2:
+            break
+    return False
+
+
+def _physical_verify_announce(
+    serial: str,
+    bot: dict,
+    outgoing: str,
+    kind: str,
+    round_id: int = 0,
+) -> None:
+    """零信任回看：截图+OCR/UI 树，超 API 预算 2s → P0+回滚标记。"""
+    try:
+        from bot_ops.physical_feedback import physical_feedback_check, rollback_announce_resend_hint
+        from bot_ops.time_sync import api_beijing_now
+
+        api_ts = api_beijing_now()
+        r = physical_feedback_check(
+            serial,
+            api_deadline=api_ts,
+            expected_snippet=message_snip(outgoing)[:24],
+            kind=kind,
+            adb_screencap_fn=adb_screencap_png,
+            ui_texts_fn=lambda s: list(ui_snapshot(s, chat=True, force=True).texts or []),
+        )
+        if not r.get("ok"):
+            group = (bot.get("associatedGroup") or "").strip()
+            if kind == "warn" and group and round_id:
+                _WARN_ANNOUNCED_ROUND.pop(group, None)
+            elif kind == "close" and group and round_id:
+                _CLOSE_ANNOUNCED_ROUND.pop(group, None)
+            elif kind == "open" and group and round_id:
+                _ROUND_OPEN_ANNOUNCED.pop(group, None)
+            rollback_announce_resend_hint(serial, kind, round_id)
+    except Exception as ex:
+        log.warning("[PHYSICAL] verify skip: %s", ex)
+
+
+def listener_send_scheduled_announce(
+    serial: str,
+    bot: dict,
+    settings: dict[str, str] | None,
+    outgoing: str,
+    texts_before: list[str],
+    draft_before: str,
+    t_send0: float,
+) -> bool:
+    """封盘提醒/封盘公告：b64 即 fire，验证 ≤2s，超时 trust-fallback（不阻塞队列）。"""
+    deadline = time.perf_counter() + LISTENER_ANNOUNCE_VERIFY_MAX_MS / 1000.0
+    if _announce_already_visible(serial, bot, outgoing):
+        adb_clear_input_fast(serial, instant=True)
+        ms = (time.perf_counter() - t_send0) * 1000
+        log.info("发送完成 [b64+announce-visible] %.0fms: %s", ms, message_snip(outgoing)[:40])
+        return True
+    focus = pinned_xy("listener", "input") or (360, 1234)
+    if draft_before and not _draft_strict_match(draft_before, outgoing):
+        listener_clear_composer_hard(serial)
+    adb_tap_raw(serial, focus[0], focus[1], purpose="composer-focus")
+    w(0.02, 0.01)
+    t_b64 = time.perf_counter()
+    adb_send_b64(serial, outgoing, fast=True, instant=True)
+    listener_tap_blue_send_once(
+        serial, bot, settings, wait_draft=True, allow_pinned_fallback=True,
+    )
+    log.info(
+        "[DEBUG] scheduled announce fire %.0fms b64+tap",
+        (time.perf_counter() - t_b64) * 1000,
+    )
+    w(0.08, 0.05)
+    if _announce_already_visible(serial, bot, outgoing):
+        adb_clear_input_fast(serial, instant=True)
+        ms = (time.perf_counter() - t_send0) * 1000
+        log.info("发送完成 [b64+announce-post-fire-visible] %.0fms: %s", ms, message_snip(outgoing)[:40])
+        return True
+    if listener_verify_announce_fast(
+        serial, bot, settings, outgoing, texts_before, draft_before,
+        listener_pinned_send_xy(settings, None),
+        deadline=deadline,
+    ):
+        adb_clear_input_fast(serial, instant=True)
+        ms = (time.perf_counter() - t_send0) * 1000
+        log.info("发送完成 [b64+announce-verified] %.0fms: %s", ms, message_snip(outgoing)[:40])
+        _physical_verify_announce(serial, bot, outgoing, "warn_close")
+        return True
+    if LISTENER_ANNOUNCE_TRUST_FALLBACK:
+        w(0.12, 0.08)
+        if _announce_already_visible(serial, bot, outgoing):
+            adb_clear_input_fast(serial, instant=True)
+            ms = (time.perf_counter() - t_send0) * 1000
+            log.info(
+                "发送完成 [b64+announce-trust-visible] %.0fms: %s",
+                ms, message_snip(outgoing)[:40],
+            )
+            _physical_verify_announce(serial, bot, outgoing, "warn_close")
+            return True
+        adb_clear_input_fast(serial, instant=True)
+        ms = (time.perf_counter() - t_send0) * 1000
+        log.warning(
+            "发送完成 [b64+announce-trust-fallback] %.0fms: %s",
+            ms, message_snip(outgoing)[:40],
+        )
+        _physical_verify_announce(serial, bot, outgoing, "warn_close")
+        return True
+    log.warning("公告未出现在群聊 [b64+announce-timeout]: %s", message_snip(outgoing)[:40])
+    return False
+
+
+def listener_send_open_announce(
+    serial: str,
+    bot: dict,
+    settings: dict[str, str] | None,
+    outgoing: str,
+    texts_before: list[str],
+    draft_before: str,
+    t_send0: float,
+) -> bool:
+    """新的一局：b64+fire → 验证 ≤2s → trust fallback（不与左机发图互斥 sleep）。"""
+    if not ensure_group_for_send(serial, bot):
+        log.warning("新的一局发送前不在群 serial=%s", serial)
+        return False
+    if _announce_already_visible(serial, bot, outgoing):
+        adb_clear_input_fast(serial, instant=True)
+        ms = (time.perf_counter() - t_send0) * 1000
+        log.info("发送完成 [b64+open-pre-visible] %.0fms: %s", ms, message_snip(outgoing)[:40])
+        return True
+    scroll_chat_toward_bottom(serial, 1)
+    snap0 = ui_snapshot(serial, chat=True, force=False)
+    texts_before = list(snap0.texts or texts_before or [])
+    draft_before = snap0.draft or draft_before or ""
+    if not listener_prepare_open_outgoing(serial, outgoing):
+        if LISTENER_ANNOUNCE_TRUST_FALLBACK:
+            adb_send_b64(serial, outgoing, fast=True, instant=True)
+        else:
+            log.warning("发送失败 [open draft未就绪]: %s", message_snip(outgoing)[:40])
+            return False
+    snap_fill = ui_snapshot(serial, chat=False, force=False)
+    draft_before = snap_fill.draft or draft_before
+    how = listener_send_announce_key(serial, settings)
+    log.info("公告发送 [open-fast %s]", how)
+    listener_tap_blue_send_once(
+        serial, bot, settings, wait_draft=True, allow_pinned_fallback=True,
+    )
+    if listener_verify_announce_sent(
+        serial, bot, settings, outgoing, texts_before, draft_before,
+        listener_pinned_send_xy(settings, None),
+    ):
+        adb_clear_input_fast(serial, instant=True)
+        ms = (time.perf_counter() - t_send0) * 1000
+        log.info("发送完成 [b64+announce-verified] %.0fms: %s", ms, message_snip(outgoing)[:40])
+        _physical_verify_announce(serial, bot, outgoing, "open")
+        return True
+    if LISTENER_ANNOUNCE_TRUST_FALLBACK:
+        adb_clear_input_fast(serial, instant=True)
+        ms = (time.perf_counter() - t_send0) * 1000
+        log.warning(
+            "发送完成 [b64+announce-trust-fallback] %.0fms: %s",
+            ms, message_snip(outgoing)[:40],
+        )
+        _physical_verify_announce(serial, bot, outgoing, "open")
+        return True
+    log.warning("公告未出现在群聊 [b64+open-timeout]: %s", message_snip(outgoing)[:40])
+    return False
+
+
 def listener_verify_announce_sent(
     serial: str,
     bot: dict,
@@ -8293,24 +9651,46 @@ def listener_verify_announce_sent(
     draft_before: str,
     send_xy: tuple[int, int],
 ) -> bool:
-    """公告：加长轮询 + 关键词匹配，容忍 emoji/标点差异。"""
+    """公告：新一局加长验；封盘类走快路径。"""
+    if _announce_is_scheduled(outgoing):
+        return listener_verify_announce_fast(
+            serial, bot, settings, outgoing, texts_before, draft_before, send_xy,
+        )
+    deadline = time.perf_counter() + LISTENER_ANNOUNCE_VERIFY_MAX_MS / 1000.0
     sx, sy = send_xy
-    w(0.08, 0.04)
-    for attempt in range(10):
+    open_announce = _announce_is_open(outgoing)
+    if open_announce:
+        w(0.04, 0.02)
+        snap0 = ui_snapshot(serial, chat=False, force=False)
+        da = snap0.draft or ""
+        if draft_cleared_after_fill(draft_before, da, outgoing):
+            scroll_chat_toward_bottom(serial, 1)
+            snapc = ui_snapshot(serial, chat=True, force=False)
+            if _announce_in_chat(snapc.texts, texts_before, outgoing, snapc.draft or ""):
+                return True
+            if _open_announce_loose_visible(snapc.texts, texts_before, outgoing):
+                return True
+    attempt = 0
+    while time.perf_counter() < deadline:
         if attempt > 0:
-            adb_tap_listener_send(serial, bot, sx, sy)
-            w(0.08, 0.04)
-        scroll_chat_toward_bottom(serial, 1)
-        snap = ui_snapshot(serial, chat=True, force=attempt >= 3)
+            listener_tap_blue_send_once(
+                serial, bot, settings, wait_draft=False, allow_pinned_fallback=True,
+            )
+            _listener_announce_enter_nudge(serial)
+            w(0.04, 0.02)
+        if open_announce:
+            scroll_chat_toward_bottom(serial, 1)
+        snap = ui_snapshot(serial, chat=True, force=attempt > 0)
         draft_after = snap.draft or ""
         if _announce_in_chat(snap.texts, texts_before, outgoing, draft_after):
             return True
+        if open_announce and _open_announce_loose_visible(snap.texts, texts_before, outgoing):
+            return True
         if draft_cleared_after_fill(draft_before, draft_after, outgoing):
-            w(0.12, 0.06)
-            scroll_chat_toward_bottom(serial, 1)
-            snap2 = ui_snapshot(serial, chat=True, force=False)
-            if _announce_in_chat(snap2.texts, texts_before, outgoing, snap2.draft or ""):
-                return True
+            return True
+        attempt += 1
+    if LISTENER_ANNOUNCE_TRUST_FALLBACK and open_announce:
+        return True
     return False
 
 
@@ -8351,6 +9731,7 @@ def send_chat_reply_fast_adb_listener(
     draft_before: str = "",
 ) -> bool:
     """右机 LISTENER：b64 填字 + 仅点钉死发送键（禁止点输入框/麦克风/表情）。"""
+    t_send0 = time.perf_counter()
     if block_clicker_send(serial, bot, text, where="adb-fast"):
         return False
     outgoing = break_im_auto_links(for_adb_send(text).strip())
@@ -8363,62 +9744,158 @@ def send_chat_reply_fast_adb_listener(
             _IME_READY_TS[serial] = now
         texts_before = list(texts_before or [])
         draft_before = draft_before or ""
-        if not texts_before and not draft_before:
-            snap0 = ui_snapshot(serial, chat=False, force=False)
+        announce = _outgoing_is_announce(outgoing)
+        scheduled = _announce_is_scheduled(outgoing)
+        settle_open = _announce_is_open(outgoing) if announce else False
+        if announce and scheduled:
+            if not texts_before:
+                snap0 = ui_snapshot(serial, chat=False, force=False)
+                texts_before = list(snap0.texts or [])
+                draft_before = snap0.draft or ""
+            return listener_send_scheduled_announce(
+                serial, bot, settings, outgoing, texts_before, draft_before, t_send0,
+            )
+        if settle_open:
+            return listener_send_open_announce(
+                serial, bot, settings, outgoing,
+                list(texts_before or []), draft_before or "", t_send0,
+            )
+        elif announce and not scheduled:
+            scroll_chat_toward_bottom(serial, 0)
+            snap0 = ui_snapshot(serial, chat=True, force=False)
             texts_before = list(snap0.texts or [])
             draft_before = snap0.draft or ""
-        if _draft_has(draft_before, outgoing) and len(re.sub(r"\s+", "", draft_before)) >= 2:
-            prepared = True
+            prepared = False
         else:
-            prepared = listener_prepare_b64_outgoing(serial, outgoing)
-        if not prepared:
-            prepared = listener_prepare_b64_outgoing(serial, outgoing)
-        if not prepared:
-            log.warning("发送失败 [b64 draft未就绪]: %s", message_snip(outgoing)[:40])
+            prepared = False
+        if not settle_open:
+            if announce and not scheduled:
+                pass  # texts_before set above
+            elif (
+                not scheduled
+                and not texts_before
+                and not draft_before
+                and not (LISTENER_TRUST_SEND and LISTENER_PURE_PIPE and not announce)
+            ):
+                snap0 = ui_snapshot(serial, chat=False, force=False)
+                texts_before = list(snap0.texts or [])
+                draft_before = snap0.draft or ""
+            if _draft_strict_match(draft_before, outgoing) and len(re.sub(r"\s+", "", draft_before)) >= 2:
+                prepared = True
+            else:
+                if draft_before and not draft_is_empty(draft_before) and not _draft_strict_match(draft_before, outgoing):
+                    listener_clear_composer_hard(serial)
+                prepared = listener_prepare_b64_outgoing(serial, outgoing)
+            if not prepared:
+                prepared = listener_prepare_b64_outgoing(serial, outgoing)
+            if not prepared:
+                listener_clear_composer_hard(serial, verify=False)
+                log.warning("发送失败 [b64 draft未就绪]: %s", message_snip(outgoing)[:40])
+                return False
+        elif not prepared:
+            listener_clear_composer_hard(serial, verify=False)
+            log.warning("发送失败 [open draft未就绪]: %s", message_snip(outgoing)[:40])
             return False
-        announce = _outgoing_is_announce(outgoing)
         if announce:
-            _wait_clicker_img_idle(5.0)
-            snap_d = ui_snapshot(serial, chat=False, force=True)
-            if not _draft_has(snap_d.draft or "", outgoing):
+            if not settle_open:
+                settle_open = _announce_is_open(outgoing)
+            snap_d = ui_snapshot(serial, chat=False, force=settle_open)
+            if settle_open and not _open_draft_fully_ready(snap_d.draft or "", outgoing):
+                if not listener_prepare_open_outgoing(serial, outgoing):
+                    log.warning("公告 draft 二次灌字失败: %s", message_snip(outgoing)[:40])
+                    return False
+                snap_fill = ui_snapshot(serial, chat=False, force=True)
+                draft_before = snap_fill.draft or ""
+            elif not settle_open and not _draft_strict_match(snap_d.draft or "", outgoing):
                 prepared = listener_prepare_b64_outgoing(serial, outgoing)
                 if not prepared:
                     log.warning("公告 draft 二次灌字失败: %s", message_snip(outgoing)[:40])
                     return False
-            sx, sy = listener_tap_resolved_send(serial, bot, settings)
-            if listener_verify_announce_sent(
-                serial, bot, settings, outgoing, texts_before, draft_before, (sx, sy),
-            ):
-                adb_clear_input_fast(serial, instant=True)
-                log.info("发送完成 [b64+announce-verified]: %s", message_snip(outgoing)[:40])
-                return True
-            for round_i in range(3):
-                sx, sy = listener_tap_resolved_send(serial, bot, settings)
-                _listener_announce_enter_nudge(serial)
-                w(0.15, 0.08)
-                if listener_verify_announce_sent(
-                    serial, bot, settings, outgoing, texts_before, draft_before, (sx, sy),
-                ):
+            if scheduled or settle_open:
+                if settle_open and _announce_already_visible(serial, bot, outgoing):
                     adb_clear_input_fast(serial, instant=True)
+                    ms = (time.perf_counter() - t_send0) * 1000
                     log.info(
-                        "发送完成 [b64+announce-retap r=%d]: %s",
-                        round_i + 1, message_snip(outgoing)[:40],
+                        "发送完成 [b64+open-pre-visible] %.0fms: %s",
+                        ms, message_snip(outgoing)[:40],
                     )
                     return True
+                how = listener_send_announce_key(serial, settings)
+                log.info(
+                    "公告发送 [%s]",
+                    "open-IME+fire" if settle_open else how,
+                )
+                w(0.06, 0.03)
+                if _announce_already_visible(serial, bot, outgoing):
+                    adb_clear_input_fast(serial, instant=True)
+                    ms = (time.perf_counter() - t_send0) * 1000
+                    log.info(
+                        "发送完成 [b64+announce-visible] %.0fms: %s",
+                        ms, message_snip(outgoing)[:40],
+                    )
+                    return True
+                if not listener_tap_blue_send_once(
+                    serial, bot, settings, wait_draft=True, allow_pinned_fallback=True,
+                ):
+                    log.warning("公告蓝箭头未点就发: %s", message_snip(outgoing)[:40])
+            else:
+                sx, sy = listener_tap_resolved_send(serial, bot, settings)
+            if listener_verify_announce_sent(
+                serial, bot, settings, outgoing, texts_before, draft_before,
+                listener_pinned_send_xy(settings, None),
+            ):
+                adb_clear_input_fast(serial, instant=True)
+                ms = (time.perf_counter() - t_send0) * 1000
+                log.info(
+                    "发送完成 [b64+announce-verified] %.0fms: %s",
+                    ms, message_snip(outgoing)[:40],
+                )
+                return True
+            if LISTENER_ANNOUNCE_TRUST_FALLBACK and (settle_open or scheduled):
+                adb_clear_input_fast(serial, instant=True)
+                ms = (time.perf_counter() - t_send0) * 1000
+                log.warning(
+                    "发送完成 [b64+announce-trust-fallback] %.0fms: %s",
+                    ms, message_snip(outgoing)[:40],
+                )
+                return True
             log.warning("公告未出现在群聊 [b64+announce]: %s", message_snip(outgoing)[:40])
+            listener_clear_composer_hard(serial, verify=False)
+            if _announce_already_visible(serial, bot, outgoing):
+                adb_clear_input_fast(serial, instant=True)
+                ms = (time.perf_counter() - t_send0) * 1000
+                log.info(
+                    "发送完成 [b64+announce-visible] %.0fms: %s",
+                    ms, message_snip(outgoing)[:40],
+                )
+                return True
             return False
-        sx, sy = listener_tap_pinned_send_now(serial, bot, settings)
-        if LISTENER_TRUST_SEND or LISTENER_SEND_FIRE:
+        sx, sy = listener_pinned_send_xy(settings, None)
+        if not announce and LISTENER_TRUST_SEND and LISTENER_PURE_PIPE:
+            listener_tap_blue_send_once(
+                serial, bot, settings, wait_draft=False, allow_pinned_fallback=True,
+            )
             adb_clear_input_fast(serial, instant=True)
-            log.info("发送完成 [b64+fire-thread]: %s", message_snip(outgoing)[:40])
+            ms = (time.perf_counter() - t_send0) * 1000
+            log.info(
+                "发送完成 [b64+pipe+trust] %.0fms: %s",
+                ms, message_snip(outgoing)[:40],
+            )
             return True
+        if not listener_tap_blue_send_once(
+            serial, bot, settings, wait_draft=True, allow_pinned_fallback=True,
+        ):
+            log.warning("右机蓝箭头未点就发: %s", message_snip(outgoing)[:40])
+            return False
         if listener_verify_sent_after_tap(
             serial, bot, settings, outgoing, texts_before, draft_before, (sx, sy),
         ):
             adb_clear_input_fast(serial, instant=True)
             log.info("发送完成 [b64+fire]: %s", message_snip(outgoing)[:40])
             return True
-        listener_fire_send_tap(serial, settings, repeat=1)
+        listener_tap_blue_send_once(
+            serial, bot, settings, wait_draft=False, allow_pinned_fallback=True,
+        )
         if listener_verify_sent_after_tap(
             serial, bot, settings, outgoing, texts_before, draft_before, (sx, sy),
         ):
@@ -8559,6 +10036,8 @@ def _dismiss_image_picker(serial: str) -> None:
         if root is not None:
             texts = collect_ui_texts(root)
             if any(t in ("输入消息", "Enter message") for t in texts):
+                return
+            if is_clicker_serial(serial) and _verify_chat_composer_ready_serial(serial):
                 return
         device_safe_back(serial, reason=f"关闭相册 step={i + 1}")
         w(0.22, 0.06)
@@ -8873,15 +10352,16 @@ def _gallery_coord_for_index(
     row = index // cols
     col = index % cols
     cell_w = sw // cols
-    top = int(sh * 0.22)
-    bottom = int(sh * 0.9)
+    top = int(sh * 0.19)
+    bottom = int(sh * 0.52)
     row_h = max(120, (bottom - top) // 4)
-    cx = col * cell_w + cell_w // 2
-    if BOT_IMG_NEWEST_AT == "top":
-        cy = top + row * row_h + row_h // 2
-    else:
-        cy = bottom - row * row_h - row_h // 2
-    return cx, max(top + 60, min(bottom - 60, cy))
+    x1 = col * cell_w
+    x2 = x1 + cell_w
+    y1 = top + row * row_h
+    y2 = y1 + row_h
+    cx = x2 - max(14, min(26, cell_w // 7))
+    cy = y1 + max(18, min(32, row_h // 5))
+    return cx, max(top + 40, min(bottom - 40, cy))
 
 
 def _gallery_coord_bottom_center(
@@ -8917,12 +10397,14 @@ def _recover_after_image_ops(serial: str, bot: dict) -> None:
     """发图流程结束后回到目标群聊。"""
     if is_clicker_bot(bot) or is_clicker_serial(serial, bot):
         clicker_restore_adb_ime_after_attach(serial)
+        root = ui_hierarchy(serial)
+        if in_target_group_chat(root, bot, serial) and _verify_chat_composer_ready_serial(serial):
+            return
         clicker_return_to_group(serial, bot, label="after-image")
         return
     if in_target_group_chat(ui_hierarchy(serial), bot, serial):
         return
-    log.warning("发图后偏离群聊，尝试自动回群「%s」", bot.get("associatedGroup"))
-    try_recover_listener_to_group(serial, bot, reason="after-image")
+    log.warning("发图后偏离群聊 serial=%s group=%s（不自动导航）", serial, bot.get("associatedGroup"))
 
 
 def _is_chat_media_class(cls: str) -> bool:
@@ -8950,6 +10432,40 @@ def _count_chat_media_bubbles(
     return n
 
 
+def _verify_settle_fast_image_sent(
+    serial: str,
+    fp_before: str,
+    bot: dict,
+) -> bool:
+    """结算快路径：云机不跑 uiautomator 审核，但须指纹变化或已离相册（防假成功）。"""
+    clicker_img_w(0.05, 0.08)
+    fp_after = _screencap_bottom_fingerprint(serial)
+    if fp_before and fp_after and fp_before != fp_after:
+        log.info("发图快验：指纹变化视为成功")
+        return True
+    if _settle_cloud_no_audit(serial) and not _is_gallery_media_picker_activity(serial):
+        if not _verify_attach_menu_open_serial(serial):
+            log.info("发图快验：已离相册且附件栏关闭")
+            return True
+    if _settle_cloud_no_audit(serial):
+        log.warning("发图快验：云机不审但指纹未变且仍在相册/附件栏")
+        return False
+    fp_after = _screencap_bottom_fingerprint(serial)
+    if fp_before and fp_after and fp_before != fp_after:
+        log.info("发图快验：指纹变化视为成功")
+        return True
+    root = ui_hierarchy(serial, force=True, channel="clicker-img")
+    if root is not None:
+        snap = ui_snapshot(serial, chat=False)
+        ib = snap.input_bounds
+        y_max = (ib[1] - 16) if ib else 0
+        if y_max > 0 and _count_chat_media_bubbles(root, y_max) >= 1:
+            log.info("发图快验：媒体气泡验真成功")
+            return True
+    log.warning("发图快验：结算快路径未验真")
+    return False
+
+
 def _verify_image_send_in_chat(
     serial: str,
     bot: dict,
@@ -8957,10 +10473,12 @@ def _verify_image_send_in_chat(
     input_bounds: tuple[int, int, int, int] | None,
 ) -> bool:
     """须在目标群且聊天区出现新图片气泡（含自己右侧发送）。"""
+    if is_clicker_serial(serial) and IMG_LOCKED and IMG_TRUST_CLICK and IMG_FAST:
+        return _verify_settle_fast_image_sent(serial, fp_before, bot)
     fast = CLICKER_FAST and is_clicker_serial(serial)
-    w(0.28, 0.1) if fast else w(1.0, 0.3)
-    scroll_chat_toward_bottom(serial, steps=2 if fast else 3)
-    w(0.15, 0.08) if fast else w(0.45, 0.15)
+    w(0.12, 0.06) if (fast and IMG_FAST) else (w(0.28, 0.1) if fast else w(1.0, 0.3))
+    scroll_chat_toward_bottom(serial, steps=1 if (fast and IMG_FAST) else (2 if fast else 3))
+    w(0.08, 0.05) if (fast and IMG_FAST) else (w(0.15, 0.08) if fast else w(0.45, 0.15))
     root = ui_hierarchy(serial, channel="clicker-img" if fast else "default")
     if is_clicker_serial(serial):
         if not _verify_chat_composer_ready_root(root, serial) and not clicker_img_task_surface_ready(serial, root):
@@ -9273,7 +10791,51 @@ def _send_chat_images_ui_batch(
     dismiss_clicker_popup_overlay(serial)
     clicker_img_flow_begin(serial)
     ok = False
+    settle_fast = _settle_capture_fast(gallery_preloaded, settle_rid, serial)
     try:
+        if settle_fast:
+            t_ui = time.time()
+            log.info("[img-timing] rid=%s stage=claim-ui-start", settle_rid)
+            fp_before = _screencap_bottom_fingerprint(serial)
+            if not _open_chat_image_picker_settle_fire_only(serial):
+                if _settle_cloud_no_audit(serial):
+                    log.info("[img-timing] rid=%s 快开信任跳过验网格", settle_rid)
+                else:
+                    log.warning("[img-timing] rid=%s 快开失败，回退 trust", settle_rid)
+                    if not _open_chat_image_picker_trust(serial):
+                        return False
+            log.info(
+                "[img-timing] rid=%s stage=gallery-open %.2fs",
+                settle_rid, time.time() - t_ui,
+            )
+            clicker_img_w(0.04, 0.06)
+            n = _select_gallery_checkboxes_settle_fast(serial, len(paths))
+            if n < len(paths):
+                log.warning("勾选图片 %d/%d，取消批量发送（禁止假成功）", n, len(paths))
+                return False
+            clicker_img_w(0.06, 0.08)
+            if not _tap_image_batch_send_settle_fast(serial):
+                log.warning("批量发图未点到发送按钮")
+                return False
+            ok = _verify_settle_fast_image_sent(serial, fp_before, bot)
+            if ok:
+                log.info(
+                    "[img-timing] rid=%s stage=done %.2fs",
+                    settle_rid, time.time() - t_ui,
+                )
+                log.info("批量发图成功 %d 张", len(paths))
+                post_log(f"[ADB] 批量发图成功 {len(paths)}张", "SUCCESS")
+                try:
+                    from bot_ops.ephemeral_burn import burn_after_group_images_sent
+
+                    burn_after_group_images_sent(serial, paths)
+                except Exception:
+                    pass
+            else:
+                log.warning("批量发图未确认")
+                post_log("[ADB] 批量发图失败(未确认)", "WARNING")
+            return ok
+
         snap0 = ui_snapshot(serial, chat=False)
         fp_before = _screencap_bottom_fingerprint(serial)
 
@@ -9286,8 +10848,25 @@ def _send_chat_images_ui_batch(
         invalidate_ui_cache(serial)
         invalidate_step_verify_cache(serial)
         dismiss_clicker_popup_overlay(serial)
-        clicker_hide_keyboard_for_attach(serial)
-        if not _open_chat_image_picker(serial, bot, settings, input_xy):
+        already_gallery = (
+            _verify_gallery_picker_open(serial)
+            or _is_gallery_media_picker_activity(serial)
+        )
+        if is_clicker_serial(serial) and not already_gallery and not settle_fast:
+            if not in_target_group_chat(ui_hierarchy(serial), bot, serial):
+                ensure_clicker_in_group(serial, bot, reason="ui-batch-pre-open")
+            clicker_hide_keyboard_for_attach(serial)
+            if not _verify_chat_composer_ready_serial(serial):
+                log.warning("发图：群聊输入栏未就绪，无法开相册")
+                return False
+        if already_gallery:
+            log.info("发图：已在相册多选页，跳过 +/图片")
+        elif gallery_preloaded and settle_rid > 0 and IMG_LOCKED and is_clicker_serial(serial):
+            if not _open_chat_image_picker_settle_fast(serial):
+                log.warning("结算快开相册失败，回退 trust 路径")
+                if not _open_chat_image_picker_trust(serial):
+                    return False
+        elif not _open_chat_image_picker(serial, bot, settings, input_xy):
             return False
         _scroll_picker_for_newest(serial, times=1)
         clicker_w(0.1, 0.12) if is_clicker_serial(serial) else w(0.35, 0.12)
@@ -9298,24 +10877,80 @@ def _send_chat_images_ui_batch(
             return False
         clicker_w(0.12, 0.1) if is_clicker_serial(serial) else w(0.4, 0.12)
 
+        if not _ensure_gallery_picker_state(serial, bot, settings, input_xy):
+            if not (IMG_TRUST_CLICK and is_clicker_serial(serial) and _is_gallery_media_picker_activity(serial)):
+                log.warning("发图状态断言失败，取消批量发送")
+                return False
+
         if not _tap_image_batch_send(serial, send_xy):
             log.warning("批量发图未点到发送按钮")
             return False
-        w(0.45, 0.15) if (CLICKER_FAST and is_clicker_serial(serial)) else w(0.85, 0.32)
+        clicker_img_w(IMG_SEND_W_SEC, IMG_SEND_W_SEC + 0.12) if is_clicker_serial(serial) else w(0.45, 0.15)
 
         ok = _verify_image_send_in_chat(serial, bot, fp_before, snap0.input_bounds)
         if ok:
             log.info("批量发图成功 %d 张", len(paths))
             post_log(f"[ADB] 批量发图成功 {len(paths)}张", "SUCCESS")
+            try:
+                from bot_ops.ephemeral_burn import burn_after_group_images_sent
+
+                burn_after_group_images_sent(serial, paths)
+            except Exception:
+                pass
             return True
         log.warning("批量发图未确认")
         post_log("[ADB] 批量发图失败(未确认)", "WARNING")
         return False
     finally:
         clicker_img_flow_end(serial)
-        _recover_after_image_ops(serial, bot)
-        if not ok:
+        if ok and settle_rid > 0 and IMG_LOCKED and is_clicker_serial(serial):
             _dismiss_image_picker(serial)
+            clicker_restore_adb_ime_after_attach(serial)
+        elif not ok:
+            _recover_after_image_ops(serial, bot)
+            _dismiss_image_picker(serial)
+        else:
+            _recover_after_image_ops(serial, bot)
+
+
+def _purge_gallery_bot_images(serial: str) -> None:
+    """发图前/定时清云机 DCIM 推图与结算缓存图，避免相册顶行错选、占内存。"""
+    if not serial:
+        return
+    globs = (
+        "/sdcard/DCIM/Camera/bot_*.png",
+        "/sdcard/DCIM/Camera/pc28*.png",
+        "/sdcard/DCIM/Camera/*settle*.png",
+        "/sdcard/DCIM/Camera/*liuhe*.png",
+        "/sdcard/DCIM/Camera/*flow*.png",
+        "/sdcard/Pictures/bot_*.png",
+        "/sdcard/Pictures/pc28*.png",
+    )
+    try:
+        for remote in globs:
+            adb_run(serial, "shell", "rm", "-f", remote)
+    except Exception as ex:
+        log.debug("purge gallery bot_ images: %s", ex)
+
+
+def maybe_periodic_gallery_purge(serial: str, *, force: bool = False) -> bool:
+    """左机相册每 BOT_GALLERY_PURGE_SEC（默认 20 分钟）清扫一次；发图流程中跳过。"""
+    if not is_clicker_serial(serial) or _clicker_img_flow_active(serial):
+        return False
+    now = time.time()
+    if not force and now - _GALLERY_LAST_PURGE.get(serial, 0.0) < GALLERY_PURGE_INTERVAL_SEC:
+        return False
+    _GALLERY_LAST_PURGE[serial] = now
+    _purge_gallery_bot_images(serial)
+    try:
+        out = adb_run(serial, "shell", "ls", "/sdcard/DCIM/Camera", timeout=10) or ""
+        if out.count(".png") > 12:
+            adb_run(serial, "shell", "rm", "-f", "/sdcard/DCIM/Camera/*.png")
+            log.info("左机 DCIM 积压 png 过多，已全量清扫 serial=%s", serial)
+    except Exception as ex:
+        log.debug("gallery periodic purge: %s", ex)
+    log.info("左机相册定时清扫 serial=%s interval=%ds", serial, GALLERY_PURGE_INTERVAL_SEC)
+    return True
 
 
 def _push_images_to_gallery(serial: str, paths: list[str]) -> bool:
@@ -9325,6 +10960,16 @@ def _push_images_to_gallery(serial: str, paths: list[str]) -> bool:
     群聊顺序 = paths：PC28 → 六合 → 流水。
     """
     try:
+        _purge_gallery_bot_images(serial)
+        try:
+            out = adb_run(serial, "shell", "ls", "/sdcard/DCIM/Camera", timeout=10) or ""
+            png_n = out.count(".png")
+            bot_n = out.count("bot_")
+            if png_n > 8 or bot_n > 3:
+                adb_run(serial, "shell", "rm", "-f", "/sdcard/DCIM/Camera/*.png")
+                log.info("发图前 DCIM 积压 png=%d bot=%d，已全清", png_n, bot_n)
+        except Exception:
+            pass
         adb_run(serial, "shell", "mkdir", "-p", "/sdcard/DCIM/Camera")
         base_ts = int(time.time())
         ordered = list(reversed(paths)) if BOT_IMG_NEWEST_AT == "top" else list(paths)
@@ -9346,10 +10991,29 @@ def _push_images_to_gallery(serial: str, paths: list[str]) -> bool:
                 "-d", f"file://{remote}",
             )
         clicker_w(0.12, 0.2) if is_clicker_serial(serial) else w(0.5, 0.25)
+        _wait_after_gallery_push(serial, len(ordered))
         return True
     except Exception as ex:
         log.warning("adb push 图片失败: %s", ex)
         return False
+
+
+def _wait_after_gallery_push(serial: str, count: int) -> None:
+    """MediaScanner 索引 DCIM，避免相册网格未刷新就勾选导致 0/3。"""
+    max_wait = 1.6 if IMG_FAST else max(2.5, GALLERY_PUSH_SETTLE_SEC * 5)
+    deadline = time.time() + max_wait
+    need = max(1, count)
+    poll_w = (0.06, 0.10) if IMG_FAST else (0.12, 0.22)
+    while time.time() < deadline:
+        clicker_w(*poll_w) if is_clicker_serial(serial) else w(0.25, 0.35)
+        try:
+            out = adb_run(serial, "shell", "ls", "/sdcard/DCIM/Camera", timeout=10)
+            if out.count("bot_") >= need:
+                break
+        except Exception:
+            pass
+    settle = (0.12, 0.18) if IMG_FAST else (GALLERY_PUSH_SETTLE_SEC, GALLERY_PUSH_SETTLE_SEC + 0.15)
+    clicker_w(*settle) if is_clicker_serial(serial) else w(settle[0], settle[1])
 
 
 def _ui_text_blob(root: ET.Element | None) -> str:
@@ -9682,13 +11346,17 @@ def clicker_fire_attach_image(serial: str) -> bool:
     """附件栏已开：立即点「图片」，不做多轮 recover。"""
     ix, iy = resolve_clicker_attach_image_xy(serial)
     clicker_tap_pinned(serial, ix, iy, "attach_image")
-    # W49: 55M 自定义 UI 导致验证不可靠，等待更长时间再验证
-    clicker_w(0.8, 1.2)  # 从 0.06-0.12 增加到 0.8-1.2 秒
+    if IMG_FAST:
+        clicker_w(IMG_ATTACH_W_SEC, IMG_ATTACH_W_SEC + 0.12)
+    else:
+        clicker_w(0.8, 1.2)
     invalidate_step_verify_cache(serial)
     if _verify_gallery_picker_open(serial):
         return True
-    # 验证失败时，再等待并重试验证一次（55M 加载慢）
-    clicker_w(0.5, 0.8)
+    if IMG_FAST:
+        clicker_w(0.18, 0.28)
+    else:
+        clicker_w(0.5, 0.8)
     invalidate_step_verify_cache(serial)
     return _verify_gallery_picker_open(serial)
 
@@ -9723,7 +11391,11 @@ def clicker_tap_plus_until_attach_menu(
 ) -> bool:
     """点 + 直到附件菜单出现「图片」；每次重算 + 位置，禁止乱点。"""
     tries = max(1, max_tries if max_tries is not None else CLICK_VERIFY_TRIES)
-    plus_wait = max(0.22, CLICKER_TAP_MS / 1000.0 * 2.5) if CLICKER_FAST else 0.28
+    plus_wait = (
+        max(0.12, IMG_CHECK_W_SEC + 0.04)
+        if (CLICKER_FAST and IMG_FAST)
+        else (max(0.22, CLICKER_TAP_MS / 1000.0 * 2.5) if CLICKER_FAST else 0.28)
+    )
     for attempt in range(tries):
         if attempt == 0:
             clicker_hide_keyboard_for_attach(serial)
@@ -9910,14 +11582,30 @@ def _attach_menu_visible(root: ET.Element | None) -> bool:
     return any(any(m in t for t in texts) for m in ATTACH_MENU_MARKERS[1:3])
 
 
+_GALLERY_PICKER_ACTIVITY_MARKERS = (
+    "ChannelMediaSelect",
+    "MediaSelect",
+    "PictureSelector",
+    "GalleryActivity",
+    "Gallery",
+)
+
+
+def _is_gallery_media_picker_activity(serial: str) -> bool:
+    act = current_activity_hint(serial)
+    return any(m in act for m in _GALLERY_PICKER_ACTIVITY_MARKERS)
+
+
 def _verify_gallery_picker_open_serial(serial: str) -> bool:
     root = ui_hierarchy(serial, force=True)
     if root is None:
-        return False
+        return _is_gallery_media_picker_activity(serial)
     if _attach_menu_visible(root):
         return False
     if _is_gallery_fullscreen_viewer(root):
         return False
+    if _is_gallery_media_picker_activity(serial):
+        return True
     sh = screen_height(root)
     blob = _ui_text_blob(root).replace(" ", "")
     if "/9" in blob:
@@ -10017,37 +11705,110 @@ def _resolve_plus_xy(
 
 
 def _open_chat_image_picker_trust(serial: str) -> bool:
-    """W49：信任钉死坐标点击，跳过 uiautomator 验证（55M 自定义 UI 不可靠）。
-    
-    验证坐标 (720x1280 屏幕):
-    - chat_plus: (45, 1235) - 输入栏左侧+按钮
-    - attach_image: (72, 720) - 附件菜单第一个图标(图片)
-    """
-    # 使用验证过的固定坐标；优先读 config/pinned-coords.json，避免分支漂移。
-    px, py = pinned_xy("clicker", "chat_plus") or (45, 1235)
-    ix, iy = pinned_xy("clicker", "attach_image") or (72, 720)
-    log.info("发图信任模式: + @(%d,%d) 图片 @(%d,%d)", px, py, ix, iy)
-    
-    # 单次点击 + 打开附件菜单
-    clicker_tap_pinned(serial, px, py, "trust_plus")
-    clicker_w(1.0, 1.2)  # 等待菜单完全展开
-    
-    # 点击图片图标
-    clicker_tap_pinned(serial, ix, iy, "trust_image")
-    clicker_w(1.5, 2.0)  # 等待相册加载
-    invalidate_step_verify_cache(serial)
-    root = ui_hierarchy(serial, force=True, channel="clicker-img")
-    if _is_gallery_fullscreen_viewer(root):
-        log.warning("发图信任模式进入单张浏览，返回网格")
-        device_safe_back(serial, reason="单张浏览→网格")
-        clicker_w(0.55, 0.70)
-        invalidate_step_verify_cache(serial)
-    ok = _verify_gallery_picker_open(serial)
-    if ok:
-        log.info("发图信任模式：已确认相册网格")
-    else:
-        log.warning("发图信任模式：未确认相册网格")
-    return ok
+    """W49：双次点+ → 读屏/钉死点「图片」；勾选/发送仍走信任模式。"""
+    for attempt in range(GALLERY_OPEN_RETRIES):
+        if attempt:
+            log.info("发图信任模式重试相册 %d/%d", attempt + 1, GALLERY_OPEN_RETRIES)
+            _dismiss_image_picker(serial)
+            clicker_w(0.35, 0.55)
+        if _verify_gallery_picker_open(serial):
+            log.info("发图信任模式：已在相册网格")
+            return True
+        if not clicker_tap_plus_until_attach_menu(serial):
+            log.warning("发图信任模式：点+未展开附件栏 attempt=%d", attempt + 1)
+            continue
+        if clicker_fire_attach_image(serial):
+            invalidate_step_verify_cache(serial)
+            root = ui_hierarchy(serial, force=True, channel="clicker-img")
+            if _is_gallery_fullscreen_viewer(root):
+                log.warning("发图信任模式进入单张浏览，返回网格")
+                device_safe_back(serial, reason="单张浏览→网格")
+                clicker_w(0.55, 0.70)
+                invalidate_step_verify_cache(serial)
+            if _verify_gallery_picker_open(serial):
+                log.info("发图信任模式：已确认相册网格")
+                return True
+        log.warning("发图信任模式：未确认相册网格 attempt=%d", attempt + 1)
+    return False
+
+
+def _open_chat_image_picker_settle_fire_only(serial: str) -> bool:
+    """结算预推相册：钉死 +→图片，零读屏（省 IME 切换与 uiautomator）。"""
+    if not is_clicker_serial(serial):
+        return _open_chat_image_picker_settle_fast(serial)
+    try:
+        adb_run(serial, "shell", "input", "keyevent", "111")
+    except Exception:
+        pass
+    clicker_img_w(0.04, 0.06)
+    px, _ = _clicker_settle_pinned_pair()
+    clicker_tap_pinned(serial, px[0], px[1], "settle_plus")
+    clicker_img_w(0.05, 0.08)
+    clicker_tap_pinned(serial, px[0], px[1], "settle_plus_2")
+    clicker_img_w(0.05, 0.08)
+    img_xy = (
+        pinned_xy("clicker", "attach_image_bottom")
+        or pinned_xy("clicker", "attach_image")
+        or (72, 720)
+    )
+    clicker_tap_pinned(serial, img_xy[0], img_xy[1], "settle_attach_image")
+    clicker_img_w(0.06, 0.10)
+    if _settle_cloud_no_audit(serial):
+        log.info("结算零读开相册：+→图片 fire（云机不审）")
+        return True
+    if _verify_gallery_picker_open(serial) or _is_gallery_media_picker_activity(serial):
+        log.info("结算零读开相册：+→图片 fire")
+        return True
+    log.warning("结算零读开相册：fire 后未进网格")
+    return False
+
+
+def _select_gallery_checkboxes_settle_fast(serial: str, count: int) -> int:
+    """结算锁定：钉死勾选顶行 N 张；铁律4 云机不审则跳过读屏验勾选。"""
+    if count <= 0 or not is_clicker_serial(serial):
+        return 0
+    pinned_pts: list[tuple[int, int]] = []
+    for i in range(count):
+        pt = pinned_xy("clicker", "gallery_check_top3", index=i)
+        if pt:
+            pinned_pts.append(pt)
+    if len(pinned_pts) < count:
+        pinned_pts = list(_GALLERY_CHECK_TOP3_FALLBACK[:count])
+    for i, (tx, ty) in enumerate(pinned_pts[:count]):
+        clicker_tap_pinned(serial, tx, ty, f"settle_gallery_check_{i + 1}")
+        if i + 1 < count:
+            clicker_img_w(0.04, 0.06)
+    clicker_img_w(0.04, 0.06)
+    if _settle_cloud_no_audit(serial):
+        log.info("结算零读勾选 %d 圈（云机不审）@ %s", count, pinned_pts[:count])
+        return count
+    sel = _gallery_selected_count(ui_hierarchy(serial, force=True, channel="clicker-img"))
+    if sel >= count:
+        log.info("结算零读勾选验真 %d/%d @ %s", sel, count, pinned_pts[:count])
+        return count
+    if sel > 0:
+        log.warning("结算零读勾选验真 %d/%d", sel, count)
+        return sel
+    log.warning("结算零读勾选验真 0/%d", count)
+    return 0
+
+
+def _open_chat_image_picker_settle_fast(serial: str) -> bool:
+    """结算预推相册：单轮 fire +→图片，跳过读屏重试环（省 ~45–60s）。"""
+    if _verify_gallery_picker_open(serial) or _is_gallery_media_picker_activity(serial):
+        log.info("结算快开相册：已在网格")
+        return True
+    clicker_hide_keyboard_for_attach(serial)
+    if _verify_attach_menu_open_serial(serial):
+        clicker_fire_attach_image(serial)
+        log.info("结算快开相册：附件栏 fire 图片")
+        return True
+    if not clicker_tap_plus_until_attach_menu(serial, max_tries=1):
+        log.warning("结算快开相册：点+未展开附件栏")
+        return False
+    clicker_fire_attach_image(serial)
+    log.info("结算快开相册：+→图片 fire")
+    return True
 
 
 def _open_chat_image_picker(
@@ -10326,7 +12087,7 @@ def _checkbox_tap_points(dev, serial: str, count: int) -> list[tuple[int, int]]:
     inset_max = int(os.environ.get("BOT_IMG_CHECK_INSET_MAX", "14") or 14)
     for _cy, _cx, x1, y1, x2, y2 in uniq[: max(1, count)]:
         cw, ch = x2 - x1, y2 - y1
-        tx = x1 + min(inset_max, max(8, int(cw * inset_pct)))
+        tx = x2 - min(inset_max, max(8, int(cw * inset_pct)))
         ty = y1 + min(inset_max, max(8, int(ch * inset_pct)))
         points.append((tx, ty))
         if len(points) >= count:
@@ -10351,12 +12112,69 @@ def _is_gallery_fullscreen_viewer(root: ET.Element | None) -> bool:
     return False
 
 
-def _resolve_gallery_toprow_checkpoints(root: ET.Element | None, count: int) -> list[tuple[int, int]]:
-    """读屏算顶行 N 张缩略图右上角勾选圈（Pixel XL / itel 通用）。"""
+def _gallery_grid_checkbox_fallback(serial: str, count: int) -> list[tuple[int, int]]:
+    """55M 相册无 ImageView/CheckBox 节点时，按 wm size 三列网格算右上角勾选（§固定文档 720×1280）。"""
+    sw, sh = _device_screen_size(serial)
+    cols = 3
+    header_h = max(96, int(sh * 110 / 1280))
+    row_top = header_h + max(18, int(sh * 18 / 1280))
+    cw = max(1, sw // cols)
+    y_tap = row_top + max(14, int(cw * 0.06))
+    pts: list[tuple[int, int]] = []
+    for i in range(count):
+        col_right = cw * (i + 1)
+        x_tap = col_right - max(18, int(cw * 0.085))
+        pts.append((x_tap, y_tap))
+    return pts[:count]
+
+
+def _gallery_send_grid_fallback(serial: str) -> tuple[int, int]:
+    """底部右下 N/9→ 发送钮（wm size 比例兜底）。"""
+    sw, sh = _device_screen_size(serial)
+    return int(sw * 0.878), int(sh * 0.956)
+
+
+def _resolve_gallery_checkbox_from_hierarchy(root: ET.Element | None, count: int) -> list[tuple[int, int]]:
+    """UI 树枚举真实 CheckBox 圈心（避免点缩略图正中放大）。"""
     if root is None or count <= 0:
         return []
     sh = screen_height(root)
-    y_lo, y_hi = int(sh * 0.08), int(sh * 0.55)
+    checks: list[tuple[int, int, int, int]] = []
+    for node in root.iter("node"):
+        cls = node.attrib.get("class") or ""
+        if "CheckBox" not in cls and "CompoundButton" not in cls:
+            continue
+        b = parse_bounds(node.attrib.get("bounds", ""))
+        if not b:
+            continue
+        x1, y1, x2, y2 = b
+        w, h = x2 - x1, y2 - y1
+        if 16 <= w <= 96 and 16 <= h <= 96 and sh * 0.12 < y1 < sh * 0.55:
+            checks.append((y1, x1, x2, y2))
+    if len(checks) < count:
+        return []
+    checks.sort(key=lambda t: ((t[0] + t[3]) // 2, (t[1] + t[2]) // 2))
+    if BOT_IMG_NEWEST_AT != "top":
+        checks.sort(key=lambda t: (-((t[0] + t[3]) // 2), (t[1] + t[2]) // 2))
+    points: list[tuple[int, int]] = []
+    seen: list[tuple[int, int]] = []
+    for y1, x1, x2, y2 in checks:
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        if any(abs(cx - sx) < 36 and abs(cy - sy) < 36 for sx, sy in seen):
+            continue
+        seen.append((cx, cy))
+        points.append((cx, cy))
+        if len(points) >= count:
+            break
+    return points
+
+
+def _resolve_gallery_toprow_checkpoints(root: ET.Element | None, count: int) -> list[tuple[int, int]]:
+    """读屏算顶行 N 张缩略图右上角勾选圈（禁止点格心放大预览）。"""
+    if root is None or count <= 0:
+        return []
+    sh = screen_height(root)
+    y_lo, y_hi = int(sh * 0.16), int(sh * 0.50)
     cells: list[tuple[int, int, int, int]] = []
     for node in root.iter("node"):
         cls = node.attrib.get("class") or ""
@@ -10384,8 +12202,8 @@ def _resolve_gallery_toprow_checkpoints(root: ET.Element | None, count: int) -> 
             row = [cell]
     points: list[tuple[int, int]] = []
     for y1, x1, x2, y2 in row[:count]:
-        tx = x2 - max(14, min(26, (x2 - x1) // 7))
-        ty = y1 + max(18, min(32, (y2 - y1) // 5))
+        tx = x2 - max(20, min(34, (x2 - x1) // 6))
+        ty = y1 + max(20, min(38, (y2 - y1) // 10))
         points.append((tx, ty))
     return points
 
@@ -10422,34 +12240,120 @@ def _select_gallery_image_checkboxes(serial: str, count: int) -> int:
     root = ui_hierarchy(serial, force=True, channel="clicker-img")
     if _is_gallery_fullscreen_viewer(root):
         log.warning("发图在单张浏览页，按返回进网格")
-        device_safe_back(serial, reason="退出单张浏览")
+        clicker_safe_back(serial, reason="退出单张浏览")
         clicker_w(0.55, 0.70)
         invalidate_step_verify_cache(serial)
         root = ui_hierarchy(serial, force=True, channel="clicker-img")
-    if root is None or _is_gallery_fullscreen_viewer(root) or not _verify_gallery_picker_open(serial):
-        log.warning("发图未确认相册网格，取消本次勾选")
+    gallery_ok = _verify_gallery_picker_open(serial) or (
+        IMG_TRUST_CLICK and is_clicker_serial(serial) and _is_gallery_media_picker_activity(serial)
+    )
+    if root is None and gallery_ok and IMG_TRUST_CLICK and is_clicker_serial(serial):
+        log.info("发图读屏为空但 Activity 已确认相册，信任钉死勾选")
+    elif root is None or _is_gallery_fullscreen_viewer(root) or not gallery_ok:
+        log.warning(
+            "发图未确认相册网格，取消本次勾选 act=%s",
+            current_activity_hint(serial),
+        )
         return 0
 
     dynamic_pts = _resolve_gallery_toprow_checkpoints(root, count)
+    hierarchy_pts = _resolve_gallery_checkbox_from_hierarchy(root, count)
+    grid_pts = _gallery_grid_checkbox_fallback(serial, count)
     pinned_pts: list[tuple[int, int]] = []
     if IMG_PINNED and is_clicker_serial(serial):
         for i in range(count):
             pt = pinned_xy("clicker", "gallery_check_top3", index=i)
             if pt:
                 pinned_pts.append(pt)
-    if IMG_PINNED and is_clicker_serial(serial) and len(pinned_pts) >= count:
+        if len(pinned_pts) < count:
+            pinned_pts = list(_GALLERY_CHECK_TOP3_FALLBACK[:count])
+    if IMG_LOCKED and is_clicker_serial(serial) and len(pinned_pts) >= count:
         tap_pts = pinned_pts[:count]
+        use_pinned_pts = True
+        log.info("发图锁定坐标序 @ %s", tap_pts)
+    elif len(hierarchy_pts) >= count:
+        tap_pts = hierarchy_pts[:count]
+        use_pinned_pts = False
     elif len(dynamic_pts) >= count:
-        tap_pts = dynamic_pts
+        tap_pts = dynamic_pts[:count]
+        use_pinned_pts = False
+    elif IMG_PINNED and is_clicker_serial(serial) and len(pinned_pts) >= count:
+        tap_pts = pinned_pts[:count]
+        use_pinned_pts = True
+        log.info("发图勾选钉死坐标 @ %s", tap_pts)
+    elif len(pinned_pts) >= count:
+        tap_pts = pinned_pts[:count]
+        use_pinned_pts = True
+    elif (
+        grid_pts
+        and (
+            _verify_gallery_picker_open_serial(serial)
+            or _is_gallery_media_picker_activity(serial)
+            or (root is not None and _count_gallery_thumbnails(root) == 0)
+        )
+    ):
+        tap_pts = grid_pts[:count]
+        use_pinned_pts = False
+        log.info("发图勾选 wm 网格兜底 @ %s", tap_pts)
     else:
-        tap_pts = pinned_pts or dynamic_pts
+        tap_pts = hierarchy_pts or dynamic_pts or pinned_pts or grid_pts
+        use_pinned_pts = bool(pinned_pts and tap_pts == pinned_pts[: len(tap_pts)])
 
-    if tap_pts and BOT_IMG_NEWEST_AT == "top" and len(tap_pts) >= 2:
+    if BOT_IMG_NEWEST_AT == "top" and len(tap_pts) >= 2 and use_pinned_pts is False and tap_pts != grid_pts[:count]:
         tap_pts = list(reversed(tap_pts[:count]))
 
-    if tap_pts and is_clicker_serial(serial):
+    def _run_trust_checkbox_taps() -> int:
+        if not tap_pts or not is_clicker_serial(serial):
+            return 0
+        if IMG_LOCKED and IMG_FAST:
+            for i, (tx, ty) in enumerate(tap_pts[:count]):
+                clicker_tap_pinned(serial, tx, ty, f"trust_gallery_check_{i + 1}")
+                if i + 1 < count:
+                    clicker_img_w()
+            log.info("发图锁定快勾选 %d 圈", count)
+            return count
         picked = 0
         prev_sel = _gallery_selected_count(root)
+        for i, (tx, ty) in enumerate(tap_pts[:count]):
+            need = i + 1
+            clicker_tap_pinned(serial, tx, ty, f"trust_gallery_check_{need}")
+            clicker_img_w() if IMG_FAST else clicker_w(0.28, 0.18)
+            if IMG_FAST and use_pinned_pts and need < count:
+                picked += 1
+                continue
+            fresh = ui_hierarchy(serial, force=not IMG_FAST, channel="clicker-img")
+            if fresh is not None and _is_gallery_fullscreen_viewer(fresh):
+                log.warning("勾选%d 误触放大预览 @(%d,%d) → 返回", need, tx, ty)
+                clicker_safe_back(serial, reason="勾选误触预览")
+                clicker_w(0.25, 0.15)
+                invalidate_ui_cache(serial)
+                continue
+            sel = _gallery_selected_count(fresh)
+            if sel <= prev_sel:
+                log.warning("勾选%d 未增加选中数 %d→%d @(%d,%d)", need, prev_sel, sel, tx, ty)
+                if IMG_TRUST_CLICK and not _is_gallery_fullscreen_viewer(fresh):
+                    log.info("信任勾选%d：计数未变仍计为已点 @(%d,%d)", need, tx, ty)
+                    picked += 1
+                continue
+            log.info("发图信任勾选%d @ (%d,%d) sel=%d", need, tx, ty, sel)
+            picked += 1
+            prev_sel = sel
+        if prev_sel < count:
+            if IMG_TRUST_CLICK and picked >= count:
+                log.info("信任勾选：OCR 未读 N/9 但已点 %d 圈，继续发送", picked)
+                return picked
+            log.warning("信任勾选未确认 %d/%d，需重选", prev_sel, count)
+            return 0
+        return picked
+
+    def _run_checkbox_taps() -> int:
+        if not tap_pts or not is_clicker_serial(serial):
+            return 0
+        if IMG_TRUST_CLICK:
+            return _run_trust_checkbox_taps()
+        fresh = ui_hierarchy(serial, force=True, channel="clicker-img")
+        picked = 0
+        prev_sel = _gallery_selected_count(fresh)
         for i, (tx, ty) in enumerate(tap_pts[:count]):
             need = i + 1
             ok = clicker_tap_until_verify(
@@ -10459,21 +12363,57 @@ def _select_gallery_image_checkboxes(serial: str, count: int) -> int:
                     or _gallery_selected_count(ui_hierarchy(s, force=True)) > base
                 ),
                 label=f"gallery_check_{need}",
+                max_tries=CLICK_VERIFY_TRIES,
                 fast_wait=0.14,
                 slow_wait=0.22,
-                recover_on_fail=False,
+                recover_on_fail=True,
             )
             if ok:
-                log.info("发图勾选%d @ (%d,%d) pinned=%s", need, tx, ty, tap_pts is pinned_pts)
+                log.info("发图勾选%d @ (%d,%d) pinned=%s", need, tx, ty, use_pinned_pts)
                 picked += 1
                 prev_sel = max(prev_sel, need)
             else:
                 log.warning("勾选%d 未确认 @ (%d,%d)", need, tx, ty)
+        return picked
+
+    if tap_pts and is_clicker_serial(serial):
+        picked = _run_checkbox_taps()
+        if picked >= count:
+            return picked
+        if picked < count:
+            log.warning("读屏/钉死勾选 %d/%d，等待后重试一次", picked, count)
+            clicker_w(0.35, 0.55)
+            invalidate_ui_cache(serial)
+            invalidate_step_verify_cache(serial)
+            root = ui_hierarchy(serial, force=True, channel="clicker-img")
+            if root is not None and _verify_gallery_picker_open(serial):
+                dynamic_pts = _resolve_gallery_toprow_checkpoints(root, count)
+                hierarchy_pts = _resolve_gallery_checkbox_from_hierarchy(root, count)
+                if len(hierarchy_pts) >= count:
+                    tap_pts = hierarchy_pts[:count]
+                elif len(dynamic_pts) >= count:
+                    tap_pts = dynamic_pts[:count]
+                dev = _get_u2_device(serial)
+                if dev and len(tap_pts) < count:
+                    u2_pts = _checkbox_tap_points(dev, serial, count)
+                    if len(u2_pts) >= count:
+                        tap_pts = u2_pts[:count]
+                picked = _run_checkbox_taps()
         if picked >= count:
             return picked
         log.warning("读屏/钉死勾选 %d/%d，尝试 u2 网格兜底", picked, count)
-        if picked > 0:
-            return picked
+
+    if is_clicker_serial(serial) and IMG_TRUST_CLICK:
+        log.warning("左机信任发图：勾选 %d/%d，尝试 u2 CheckBox", picked, count)
+        dev = _get_u2_device(serial)
+        if dev:
+            u2_pts = _checkbox_tap_points(dev, serial, count)
+            if u2_pts:
+                tap_pts = u2_pts[:count]
+                picked = _run_trust_checkbox_taps()
+                if picked >= count:
+                    return picked
+        return picked
 
     if is_clicker_serial(serial) and CLICKER_IMG_TAP_ONLY and not dynamic_pts:
         return 0
@@ -10515,84 +12455,236 @@ def _select_bottom_images_checkboxes(serial: str, count: int) -> int:
     return _select_gallery_image_checkboxes(serial, count)
 
 
+def _device_screen_size(serial: str) -> tuple[int, int]:
+    try:
+        out = adb_run(serial, "shell", "wm", "size").strip()
+        m = re.search(r"Override size:\s*(\d+)x(\d+)", out)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        m = re.search(r"Physical size:\s*(\d+)x(\d+)", out)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        m = re.search(r"(\d+)x(\d+)", out)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return 720, 1280
+
+
+def _scale_pinned_xy(serial: str, x: int, y: int) -> tuple[int, int]:
+    block = _PINNED_COORDS.get("clicker") or {}
+    ref = str(block.get("screen") or "720x1280")
+    rm = re.match(r"(\d+)x(\d+)", ref)
+    rw, rh = (int(rm.group(1)), int(rm.group(2))) if rm else (720, 1280)
+    sw, sh = _device_screen_size(serial)
+    return max(1, int(x * sw / max(1, rw))), max(1, int(y * sh / max(1, rh)))
+
+
+def _resolve_gallery_send_from_ui(serial: str) -> tuple[int, int] | None:
+    """读屏找相册多选后底部右下「N/9→」发送钮。"""
+    root = ui_hierarchy(serial, force=True, channel="clicker-img")
+    if root is None:
+        return None
+    sh, sw = screen_height(root), screen_width(root)
+    right: list[tuple[int, int, int]] = []
+    left: list[tuple[int, int, int]] = []
+    for node in root.iter("node"):
+        text = ((node.attrib.get("text") or "") + (node.attrib.get("content-desc") or "")).strip()
+        clickable = node.attrib.get("clickable") == "true"
+        b = parse_bounds(node.attrib.get("bounds", ""))
+        if not b:
+            continue
+        x1, y1, x2, y2 = b
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        if y1 < sh * 0.62:
+            continue
+        is_send = (
+            "/9" in text.replace(" ", "")
+            or "→" in text
+            or "发送" in text
+            or text in ("Send", "完成", "确定")
+        )
+        if is_send:
+            bucket = right if cx > sw * 0.45 else left
+            bucket.append((cy, cx, cy))
+        elif clickable and y1 > sh * 0.75 and cx > sw * 0.45:
+            w, h = x2 - x1, y2 - y1
+            if 48 <= w <= 220 and 28 <= h <= 80:
+                right.append((cy, cx, cy))
+    for bucket in (right, left):
+        if bucket:
+            bucket.sort(reverse=True)
+            return bucket[0][1], bucket[0][2]
+    return None
+
+
+def _resolve_gallery_batch_send_xy(serial: str) -> list[tuple[int, int]]:
+    """动态候选：UI 读屏 → OpenCV → 分辨率缩放钉死 → 相对兜底。"""
+    pts: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def _add(x: int, y: int) -> None:
+        p = (x, y)
+        if p not in seen:
+            seen.add(p)
+            pts.append(p)
+
+    ui_pt = _resolve_gallery_send_from_ui(serial)
+    if ui_pt:
+        _add(ui_pt[0], ui_pt[1])
+    tpl_path = os.environ.get("BOT_GALLERY_SEND_TEMPLATE", "").strip()
+    if not tpl_path:
+        tpl_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "data", "templates", "gallery_send_fab.png",
+        )
+    try:
+        if os.path.isfile(tpl_path):
+            from rpa.aircv_helper import find_gallery_send_template
+
+            cv_pt = find_gallery_send_template(serial, tpl_path, threshold=0.70)
+        else:
+            from rpa.aircv_helper import find_gallery_send_fab
+
+            cv_pt = find_gallery_send_fab(serial)
+        if cv_pt:
+            _add(cv_pt[0], cv_pt[1])
+    except Exception as ex:
+        log.debug("gallery send cv: %s", ex)
+    pin = pinned_xy("clicker", "gallery_batch_send")
+    if pin:
+        sx, sy = _scale_pinned_xy(serial, pin[0], pin[1])
+        _add(sx, sy)
+    sw, sh = _device_screen_size(serial)
+    _add(int(sw * 0.88), int(sh * 0.934))
+    _add(int(sw * 0.90), int(sh * 0.925))
+    return pts
+
+
+def _ensure_gallery_picker_state(
+    serial: str,
+    bot: dict,
+    settings: dict[str, str] | None,
+    input_xy: tuple[int, int] | None,
+) -> bool:
+    """UI 状态断言：必须在相册多选页；否则返回/重开发图流程。"""
+    if IMG_TRUST_CLICK and is_clicker_serial(serial) and _is_gallery_media_picker_activity(serial):
+        return True
+    if _verify_gallery_picker_open_serial(serial):
+        log.info("发图状态断言 OK: 相册多选页")
+        return True
+    root = ui_hierarchy(serial, force=True, channel="clicker-img")
+    if root and _is_gallery_fullscreen_viewer(root):
+        log.warning("发图状态断言: 单张预览页 → 返回")
+        device_safe_back(serial, reason="gallery-state-viewer")
+        clicker_w(0.35, 0.5)
+        invalidate_ui_cache(serial)
+        invalidate_step_verify_cache(serial)
+        if _verify_gallery_picker_open_serial(serial):
+            return True
+    page = "attach_menu" if root and _attach_menu_visible(root) else "not_gallery"
+    log.warning("发图状态断言 FAIL page=%s → 强制重开发图流程", page)
+    _dismiss_image_picker(serial)
+    invalidate_ui_cache(serial)
+    invalidate_step_verify_cache(serial)
+    dismiss_clicker_popup_overlay(serial)
+    clicker_hide_keyboard_for_attach(serial)
+    if not _open_chat_image_picker(serial, bot, settings, input_xy):
+        return False
+    _scroll_picker_for_newest(serial, times=1)
+    clicker_w(0.15, 0.25)
+    ok = _verify_gallery_picker_open_serial(serial)
+    log.info("发图状态断言 recovery=%s", ok)
+    return ok
+
+
+def _tap_image_batch_send_settle_fast(serial: str) -> bool:
+    """结算锁定：钉死发送钮；云机不审后仍须离相册。"""
+    pin = pinned_xy("clicker", "gallery_batch_send") or (668, 1210)
+    sx, sy = _scale_pinned_xy(serial, pin[0], pin[1])
+    clicker_tap_pinned(serial, sx, sy, "settle_batch_send")
+    clicker_img_w(IMG_SEND_W_SEC, IMG_SEND_W_SEC + 0.06)
+    if _settle_cloud_no_audit(serial):
+        if not _is_gallery_media_picker_activity(serial) and not _verify_attach_menu_open_serial(serial):
+            log.info("结算快发送：已离相册/附件栏")
+            return True
+        log.warning("结算快发送：点发送后仍在相册或附件栏")
+        return False
+    if _verify_gallery_send_tapped_serial(serial):
+        return True
+    if not _is_gallery_media_picker_activity(serial):
+        log.info("结算快发送：已离开相册")
+        return True
+    log.warning("结算快发送：仍在相册未确认")
+    return False
+
+
 def _tap_image_batch_send(
     serial: str,
     send_xy: tuple[int, int] | None,
 ) -> bool:
-    """多图勾选后点右下蓝钮 3/9→ 发送（W49 截图；钉死优先）。"""
-    if IMG_PINNED and is_clicker_serial(serial):
-        pt = pinned_xy("clicker", "gallery_batch_send")
-        if pt:
-            candidates: list[tuple[int, int]] = []
-            for cand in (pt, (660, 1235), (635, 1235), (626, 1235)):
-                if cand not in candidates:
-                    candidates.append(cand)
-            if CLICK_VERIFY:
-                for idx, (sx, sy) in enumerate(candidates, start=1):
-                    invalidate_step_verify_cache(serial)
-                    ok = clicker_tap_until_verify(
-                        serial, sx, sy,
-                        verify=_verify_gallery_send_tapped,
-                        label=f"gallery_batch_send_{idx}",
-                        max_tries=1,
-                        fast_wait=0.35,
-                        slow_wait=0.55,
-                        recover_on_fail=False,
-                    )
-                    if ok:
-                        log.info("发图钉死发送(已验证) @ (%d,%d)", sx, sy)
-                        return True
-                    log.warning("发图钉死发送候选未确认 @ (%d,%d)", sx, sy)
-                    clicker_w(0.25, 0.30)
-                return False
-            sx, sy = candidates[0]
-            clicker_tap_pinned(serial, sx, sy, "gallery_batch_send")
-            log.info("发图钉死发送 @ (%d,%d)", sx, sy)
-            return True
-
-    dev = _get_u2_device(serial)
-    if dev:
-        for label in ("发送", "完成", "确定", "Send"):
-            try:
-                node = dev(text=label)
-                if node.exists(timeout=1.5):
-                    node.click()
-                    log.info("发图批量确认 [%s]", label)
-                    return True
-            except Exception:
-                continue
-        try:
-            sh = dev.window_size()[1]
-            sw = dev.window_size()[0]
-            # 左下角箭头区域
-            candidates: list[tuple[int, int, int]] = []
-            for node in dev(clickable=True):
-                b = _u2_bounds_dict(node)
-                if not b:
-                    continue
-                x1, y1, x2, y2 = b
-                if y1 > sh * 0.78 and x2 < sw * 0.45:
-                    candidates.append((y2, (x1 + x2) // 2, (y1 + y2) // 2))
-            if candidates:
-                candidates.sort(reverse=True)
-                _, tx, ty = candidates[0]
-                adb_tap_raw(serial, tx, ty)
-                log.info("发图点左下箭头 (%d,%d)", tx, ty)
+    """多图勾选后点发送：动态 UI/CV 优先，禁止单点硬编码。"""
+    if not _verify_gallery_picker_open_serial(serial):
+        if not (IMG_TRUST_CLICK and is_clicker_serial(serial) and _is_gallery_media_picker_activity(serial)):
+            log.warning("gallery_batch_send 拒绝: 当前非相册多选页")
+            return False
+    if IMG_TRUST_CLICK and is_clicker_serial(serial):
+        pin = pinned_xy("clicker", "gallery_batch_send")
+        if pin:
+            sx, sy = _scale_pinned_xy(serial, pin[0], pin[1])
+        else:
+            sx, sy = _gallery_send_grid_fallback(serial)
+        sel = _gallery_selected_count(ui_hierarchy(serial, force=True, channel="clicker-img"))
+        if sel < 1:
+            log.info("发图信任发送：OCR 选中数=%d，仍点 N/9→", sel)
+        for send_try in range(1, 3 if IMG_FAST else 4):
+            log.info("发图信任发送 try=%d @ (%d,%d) sel=%d", send_try, sx, sy, sel)
+            clicker_tap_pinned(serial, sx, sy, f"trust_gallery_batch_send_{send_try}")
+            clicker_img_w(IMG_SEND_W_SEC, IMG_SEND_W_SEC + 0.10)
+            invalidate_step_verify_cache(serial)
+            if _verify_gallery_send_tapped_serial(serial):
+                log.info("发图信任发送已回群聊 try=%d", send_try)
                 return True
-        except Exception:
-            pass
-    if send_xy:
-        adb_tap_raw(serial, send_xy[0], send_xy[1])
-        return True
-    try:
-        out = adb_run(serial, "shell", "wm", "size").strip()
-        m = re.search(r"(\d+)x(\d+)", out)
-        if m:
-            sw, sh = int(m.group(1)), int(m.group(2))
-            adb_tap_raw(serial, int(sw * 0.12), int(sh * 0.93))
-            return True
-    except Exception:
-        pass
+            if not _is_gallery_media_picker_activity(serial):
+                log.info("发图信任发送：已离开相册 Activity try=%d", send_try)
+                return True
+        log.warning("发图信任发送未确认回群聊")
+        return False
+    candidates = _resolve_gallery_batch_send_xy(serial)
+    if send_xy and send_xy not in candidates:
+        candidates.insert(0, send_xy)
+    if not candidates:
+        log.warning("发图未找到任何发送钮候选")
+        return False
+    log.info(
+        "发图发送候选 %s screen=%s",
+        candidates[:5],
+        _device_screen_size(serial),
+    )
+    for idx, (sx, sy) in enumerate(candidates[:6], start=1):
+        invalidate_step_verify_cache(serial)
+        if CLICK_VERIFY:
+            ok = clicker_tap_until_verify(
+                serial, sx, sy,
+                verify=_verify_gallery_send_tapped,
+                label=f"gallery_batch_send_{idx}",
+                max_tries=2,
+                fast_wait=0.28,
+                slow_wait=0.45,
+                recover_on_fail=False,
+            )
+            if ok:
+                log.info("发图发送(已验证) @ (%d,%d) via=%d", sx, sy, idx)
+                return True
+        else:
+            clicker_tap_pinned(serial, sx, sy, f"gallery_batch_send_{idx}")
+            w(0.35, 0.15)
+            if _verify_gallery_send_tapped_serial(serial):
+                log.info("发图发送 @ (%d,%d) via=%d", sx, sy, idx)
+                return True
+        log.warning("发图发送候选未确认 @ (%d,%d) #%d", sx, sy, idx)
+        clicker_w(0.20, 0.35)
     return False
 
 
@@ -10616,6 +12708,7 @@ def send_chat_images_batch(
     *,
     group_ok: bool = False,
     settle_rid: int = 0,
+    gallery_preloaded: bool = False,
 ) -> bool:
     """结算发图：优先 55M 内复制粘贴，失败回退 +→图片→勾选。"""
     paths = [p for p in image_paths if p and os.path.isfile(p)]
@@ -10627,8 +12720,16 @@ def send_chat_images_batch(
         log.warning("不在目标群，取消批量发图")
         return False
 
+    if is_clicker_serial(serial):
+        if not gallery_preloaded:
+            maybe_periodic_gallery_purge(serial)
+            root0 = ui_hierarchy(serial)
+            if not in_target_group_chat(root0, bot, serial):
+                dismiss_clicker_album_stuck(serial)
+            ensure_clicker_in_group(serial, bot, reason="send-image-batch")
+
     mode = BOT_IMG_SEND_MODE
-    if is_clicker_serial(serial) and IMG_PINNED and CLICKER_IMG_TAP_ONLY:
+    if is_clicker_serial(serial) and (CLICKER_SEND_IMAGES or (IMG_PINNED and CLICKER_IMG_TAP_ONLY)):
         mode = "ui"
     if is_listener_send_only_serial(serial) or is_send_only_listener(bot):
         mode = "ui"
@@ -10655,6 +12756,12 @@ def send_chat_images_batch(
                 break
             w(0.25, 0.08)
         if copy_ok:
+            try:
+                from bot_ops.ephemeral_burn import burn_after_group_images_sent
+
+                burn_after_group_images_sent(serial, paths)
+            except Exception:
+                pass
             return True
         if mode in ("in_app_copy", "copy"):
             post_log("[ADB] 应用内复制发图失败", "WARNING")
@@ -10677,10 +12784,16 @@ def send_chat_images_batch(
                 break
             w(0.35, 0.12)
         if paste_ok:
+            try:
+                from bot_ops.ephemeral_burn import burn_after_group_images_sent
+
+                burn_after_group_images_sent(serial, paths)
+            except Exception:
+                pass
             return True
         log.info("外部剪贴板粘贴失败（55M 不联通），回退 UI 批量发图")
 
-    preloaded = settle_rid > 0 and settle_rid in _CAPTURE_GALLERY_PUSHED
+    preloaded = gallery_preloaded or (settle_rid > 0 and settle_rid in _CAPTURE_GALLERY_PUSHED)
     return _send_chat_images_ui_batch(
         serial, bot, paths, input_xy, send_xy, settings,
         group_ok=True, gallery_preloaded=preloaded, settle_rid=settle_rid,
@@ -11140,6 +13253,128 @@ def _log_worker_loop() -> None:
 
 
 @dataclass
+class _ListenerIngestJob:
+    """监听/执行解耦：抓取线程只入队，ingest 线程做逻辑判断+出站。"""
+    bot_id: str
+    serial: str
+    sender: str
+    cmd: str
+    cmd_y: int = 0
+
+
+_LISTENER_INGEST: queue.Queue[_ListenerIngestJob] = queue.Queue(maxsize=512)
+INGRESS_PORT = int(os.environ.get("BOT_INGRESS_PORT", "8770"))
+_INGRESS_DEFAULTS: dict[str, str] = {}  # bot_id -> serial
+
+
+def listener_ingress_enqueue(bot_id: str, serial: str, sender: str, cmd: str) -> bool:
+    """Gateway/压测穿透：跳过读屏，直接入 ingest 队列。"""
+    cmd = cmd.strip()
+    gw = listener_gateway_resolve(serial, bot_id, sender, cmd)
+    log.info(
+        "[INGRESS] gateway=%s sender=%s cmd=%s bot=%s serial=%s",
+        gw, sender, cmd[:48], bot_id, serial,
+    )
+    try:
+        _LISTENER_INGEST.put_nowait(
+            _ListenerIngestJob(
+                bot_id=bot_id,
+                serial=serial,
+                sender=sender,
+                cmd=cmd.strip(),
+                cmd_y=900,
+            )
+        )
+        log.info("[DEBUG] 正在解析消息 sender=%s cmd=%s (ingress)", sender, cmd[:48])
+        try:
+            from bot_ops.sre_self_heal import touch_cmd_heartbeat
+
+            touch_cmd_heartbeat("ingress_enqueue", sender=sender, cmd=cmd[:48])
+        except Exception:
+            pass
+        return True
+    except queue.Full:
+        log.warning("[INGRESS] ingest 队列满 cmd=%s", cmd[:24])
+        return False
+
+
+def _register_ingress_defaults(bot_id: str, serial: str) -> None:
+    _INGRESS_DEFAULTS[bot_id] = serial
+
+
+class _IngressHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def do_POST(self) -> None:
+        if self.path != "/api/ingress":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            data = json.loads(raw.decode("utf-8") if raw else "{}")
+        except json.JSONDecodeError:
+            data = {}
+        bot_id = str(data.get("bot_id") or BOT_LISTENER_ID).strip()
+        serial = str(data.get("serial") or _INGRESS_DEFAULTS.get(bot_id) or "").strip()
+        sender = str(data.get("username") or data.get("sender") or "").strip()
+        cmd = str(data.get("msg") or data.get("cmd") or "").strip()
+        msg_type = str(data.get("type") or "").strip().lower()
+        if msg_type == "reply":
+            global _ACTIVE_ORCH
+            orch = _ACTIVE_ORCH
+            if orch and sender and cmd:
+                orch.brain.enqueue_reply(bot_id, sender, cmd)
+                body = json.dumps({"status": "ok", "type": "reply", "bot_id": bot_id}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = json.dumps({"status": "error", "message": "orch unavailable"}).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if not serial or not sender or not cmd:
+            body = json.dumps({"status": "error", "message": "serial/username/msg required"}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        ok = listener_ingress_enqueue(bot_id, serial, sender, cmd)
+        body = json.dumps({"status": "ok" if ok else "queue_full", "bot_id": bot_id}).encode()
+        self.send_response(200 if ok else 503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def start_ingress_server() -> None:
+    """Gateway curl → Daemon ingest 穿透入口。"""
+    host = os.environ.get("BOT_INGRESS_HOST", "127.0.0.1")
+    try:
+        srv = HTTPServer((host, INGRESS_PORT), _IngressHandler)
+    except OSError as ex:
+        log.warning("ingress HTTP 未启动 %s:%s %s", host, INGRESS_PORT, ex)
+        return
+
+    def _serve() -> None:
+        log.info("ingress HTTP 监听 http://%s:%s/api/ingress", host, INGRESS_PORT)
+        srv.serve_forever()
+
+    threading.Thread(target=_serve, name="ingress-http", daemon=True).start()
+
+
+@dataclass
 class OutboundSend:
     serial: str
     bot: dict
@@ -11153,6 +13388,7 @@ class OutboundSend:
     round_id: int = 0
     image_path: str = ""
     image_paths: list[str] = field(default_factory=list)
+    gallery_preloaded: bool = False
 
 
 _OPEN_AFTER_CAPTURE_PENDING: dict[int, OutboundSend] = {}
@@ -11164,6 +13400,99 @@ def stash_open_after_capture(settled_rid: int, job: OutboundSend) -> None:
     with _OPEN_AFTER_CAPTURE_LOCK:
         _OPEN_AFTER_CAPTURE_PENDING[settled_rid] = job
         _OPEN_AFTER_CAPTURE_TS[settled_rid] = time.time()
+
+
+def has_open_after_capture_pending() -> bool:
+    with _OPEN_AFTER_CAPTURE_LOCK:
+        return bool(_OPEN_AFTER_CAPTURE_PENDING)
+
+
+def _is_announce_outbound_job(job: OutboundSend) -> bool:
+    """固定文档 §3：warn/close/open/新一局 仅右机 LISTENER。"""
+    if job.kind in ("warn", "close", "open", "warn_close"):
+        return True
+    if job.image_paths or job.image_path:
+        return False
+    if SEND_PRIO_WARN <= job.prio <= SEND_PRIO_OPEN_AFTER_SETTLE:
+        return True
+    t = job.text or ""
+    return any(
+        m in t
+        for m in ("封盘", "新的一局", "距封盘", "距离封盘", "停止下注")
+    )
+
+
+def _listener_announce_route() -> tuple[str, dict] | tuple[None, None]:
+    try:
+        from bot_ops.runtime import load_bot_runtime
+
+        rt = load_bot_runtime()
+        if not rt.listener_adb_port:
+            return None, None
+        serial = f"127.0.0.1:{rt.listener_adb_port}"
+        bot: dict = {}
+        try:
+            bots = api("GET", "/api/bots") or []
+            hit = next((b for b in bots if str(b.get("id")) == rt.listener_id), None)
+            if hit:
+                bot = hit
+        except Exception:
+            pass
+        return serial, bot
+    except Exception:
+        return None, None
+
+
+def _reroute_announce_off_clicker(job: OutboundSend) -> OutboundSend | None:
+    if not _is_announce_outbound_job(job):
+        return job
+    if not is_clicker_serial(job.serial, job.bot):
+        return job
+    ls, lb = _listener_announce_route()
+    if not ls:
+        log.error(
+            "左机禁止公告 outbound kind=%s rid=%s serial=%s",
+            job.kind, job.round_id, job.serial,
+        )
+        return None
+    log.warning(
+        "左机公告改路由右机 kind=%s rid=%s %s → %s",
+        job.kind, job.round_id, job.serial, ls,
+    )
+    return OutboundSend(
+        ls,
+        lb or job.bot,
+        job.text,
+        job.settings,
+        job.input_xy,
+        job.send_xy,
+        job.group_ok,
+        prio=job.prio,
+        kind=job.kind,
+        round_id=job.round_id,
+    )
+
+
+def _handoff_open_to_listener_ipc(settled_rid: int, job: OutboundSend, *, images_ok: bool) -> bool:
+    """CLICKER 进程：禁止本地 outbound 发新一局，交右机 announce 线程。"""
+    if os.environ.get("BOT_ROLE") != "CLICKER" and not is_clicker_serial(job.serial, job.bot):
+        return False
+    try:
+        from bot_ops.capture_ipc import mark_capture_done, outbound_to_dict
+
+        mark_capture_done(
+            settled_rid,
+            images_ok=images_ok,
+            open_job=outbound_to_dict(job) if images_ok else {},
+        )
+        log.info(
+            "左机不发公告 → IPC 交右机 settled_rid=%s open_rid=%s ok=%s",
+            settled_rid, job.round_id, images_ok,
+        )
+        return True
+    except Exception as ex:
+        log.warning("左机 open IPC 交棒失败 settled_rid=%s: %s", settled_rid, ex)
+        return False
 
 
 def process_stale_open_after_capture() -> None:
@@ -11199,11 +13528,9 @@ def flush_open_after_capture(settled_rid: int, *, images_ok: bool) -> None:
         return
     if not images_ok:
         log.warning("结算图失败 rid=%s，不发新的一局（固定顺序 §2 ③）", settled_rid)
-        global _SETTLE_DISPATCHED
         if settled_rid in _CAPTURE_SUCCEEDED:
             log.info("rid=%s 已有成功截图，不再重入结算发图", settled_rid)
             return
-        _SETTLE_DISPATCHED.discard(settled_rid)
         if OPEN_AFTER_CAPTURE_FALLBACK_SEC > 0 and stale_age >= OPEN_AFTER_CAPTURE_FALLBACK_SEC:
             if _any_clicker_img_flow_busy():
                 with _OPEN_AFTER_CAPTURE_LOCK:
@@ -11212,13 +13539,19 @@ def flush_open_after_capture(settled_rid: int, *, images_ok: bool) -> None:
                 log.info("左机发图中，延后降级新的一局 settled_rid=%s", settled_rid)
                 return
             log.warning("结算图失败且超时 rid=%s → 降级入队新的一局", settled_rid)
-            outbound_enqueue(job)
+            routed = _reroute_announce_off_clicker(job)
+            if routed:
+                outbound_enqueue(routed)
         return
     log.info(
         "结算图成功 rid=%s → 入队新的一局 rid=%s",
         settled_rid, job.round_id,
     )
-    outbound_enqueue(job)
+    if _handoff_open_to_listener_ipc(settled_rid, job, images_ok=True):
+        return
+    routed = _reroute_announce_off_clicker(job)
+    if routed:
+        outbound_enqueue(routed)
 
 
 class OutboundQueue:
@@ -11234,6 +13567,24 @@ class OutboundQueue:
             self._seq += 1
             heapq.heappush(self._heap, (job.prio, self._seq, job))
             self._cv.notify()
+
+    def purge_stale_open(self, min_rid: int) -> int:
+        """丢弃队列里过期的新一局，避免 stale open 堵住 sender。"""
+        with self._cv:
+            if not self._heap or min_rid <= 0:
+                return 0
+            kept: list[tuple[int, int, OutboundSend]] = []
+            dropped = 0
+            for item in self._heap:
+                _p, _s, j = item
+                if j.kind == "open" and j.round_id and j.round_id < min_rid:
+                    dropped += 1
+                    continue
+                kept.append(item)
+            if dropped:
+                self._heap = kept
+                heapq.heapify(self._heap)
+            return dropped
 
     def get(self, timeout: float = 0.3) -> OutboundSend | None:
         with self._cv:
@@ -11283,7 +13634,50 @@ def outbound_for(serial: str) -> OutboundQueue:
 
 
 def outbound_enqueue(job: OutboundSend) -> None:
+    routed = _reroute_announce_off_clicker(job)
+    if routed is None:
+        return
+    job = routed
+    if job.kind == "open" and job.round_id:
+        group = (job.bot.get("associatedGroup") or "").strip()
+        announced = _ROUND_OPEN_ANNOUNCED.get(group, 0)
+        if group and announced >= job.round_id:
+            log.info(
+                "跳过过期新的一局入队 rid=%s（群已发 rid=%s）",
+                job.round_id, announced,
+            )
+            return
+        dropped = outbound_for(job.serial).purge_stale_open(job.round_id)
+        if dropped:
+            log.info("出站队列丢弃过期新一局 %d 条 (< rid=%s)", dropped, job.round_id)
     outbound_for(job.serial).put(job)
+
+
+def _skip_stale_open_job(serial: str, job: OutboundSend) -> bool:
+    """丢弃队列里落后/已发过的新一局，避免 stale open 堵住 sender。"""
+    if job.kind != "open" or not job.round_id:
+        return False
+    group = (job.bot.get("associatedGroup") or "").strip()
+    if group and _ROUND_OPEN_ANNOUNCED.get(group, 0) >= job.round_id:
+        log.info(
+            "跳过重复新的一局 rid=%s（群已发 rid=%s）",
+            job.round_id, _ROUND_OPEN_ANNOUNCED.get(group),
+        )
+        return True
+    if _announce_already_visible(serial, job.bot, job.text):
+        if group:
+            _ROUND_OPEN_ANNOUNCED[group] = job.round_id
+            save_round_open_announced_persisted()
+        log.info("新的一局 rid=%s 已在群聊，跳过重复发送", job.round_id)
+        return True
+    cur, _, _ = active_round_timing(job.settings)
+    if cur > 0 and job.round_id < cur - 1:
+        log.warning(
+            "跳过过期新的一局 rid=%s（当前期 %s）",
+            job.round_id, cur,
+        )
+        return True
+    return False
 
 
 def outbound_pending_cmd_jobs() -> int:
@@ -11343,18 +13737,26 @@ def dispatch_send(
     """统一发送入口：Listener 入优先级队列，其它同步发送。"""
     if not text.strip():
         return False
+    if PANEL_SEND_GATE and prio <= SEND_PRIO_BRAIN and not panel_api_ready():
+        log.warning("Panel 未就绪，丢弃用户出站 serial=%s", serial)
+        return False
     if block_clicker_send(serial, bot, text, where="dispatch"):
         return False
     snip = re.sub(r"\s+", "", message_snip(text))[:48]
     out_key = _outbound_dedup_key(serial, text)
     now = time.time()
     announce_dedup = kind in ("warn", "close", "open") and round_id > 0
-    dedup_sec = 2.0 if announce_dedup else OUTBOUND_DEDUP_SEC
-    if snip and now - _OUTBOUND_TEXT_DEDUP.get(out_key, 0) < dedup_sec:
+    dedup_sec = float(max(WARN_ANNOUNCE_BEFORE_SEC, 30)) if announce_dedup else OUTBOUND_DEDUP_SEC
+    if snip and not announce_dedup and now - _OUTBOUND_TEXT_DEDUP.get(out_key, 0) < dedup_sec:
         log.info("跳过重复出站 [%s]: %s", serial, snip[:32])
         return False
-    if snip:
+    if snip and not announce_dedup:
         _OUTBOUND_TEXT_DEDUP[out_key] = now
+        if len(_OUTBOUND_TEXT_DEDUP) > 512:
+            cutoff = now - OUTBOUND_DEDUP_SEC * 2
+            stale = [k for k, ts in _OUTBOUND_TEXT_DEDUP.items() if ts < cutoff]
+            for k in stale[:256]:
+                _OUTBOUND_TEXT_DEDUP.pop(k, None)
     if SEND_QUEUE_ENABLED and is_send_bot(bot):
         outbound_enqueue(
             OutboundSend(
@@ -11389,7 +13791,236 @@ def enqueue_send(
 
 def current_round_open_gate(group: str, rid: int) -> bool:
     """§2：当期「新的一局」已发出后，才允许封盘提醒/封盘公告。"""
-    return bool(group) and rid > 0 and _ROUND_OPEN_ANNOUNCED.get(group) == rid
+    if not group or rid <= 0:
+        return False
+    announced = _ROUND_OPEN_ANNOUNCED.get(group, 0)
+    if announced >= rid:
+        return True
+    if announced == rid - 1:
+        try:
+            _, interval, remaining = active_round_timing({})
+            if interval - remaining >= OPEN_ANNOUNCE_AFTER_SEC:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _open_gate_lag(group: str, cur_rid: int) -> int:
+    """当期 open gate 落后期数（announced < cur_rid）。"""
+    if not group or cur_rid <= 0:
+        return 0
+    announced = _ROUND_OPEN_ANNOUNCED.get(group, 0)
+    return max(0, cur_rid - announced)
+
+
+def sync_open_gate_from_chat(
+    serial: str,
+    bot: dict,
+    settings: dict[str, str] | None = None,
+) -> bool:
+    """群聊已见「新的一局」→ 同步 gate，解封 warn/close（重启后 heal）。"""
+    group = (bot.get("associatedGroup") or "").strip()
+    if not group or not serial:
+        return False
+    st = settings or {}
+    cur_rid, _, _ = active_round_timing(st)
+    announced = _ROUND_OPEN_ANNOUNCED.get(group, 0)
+    if cur_rid > 0 and announced >= cur_rid:
+        return True
+    try:
+        snap = ui_snapshot(serial, chat=True, force=False, channel="gate-sync")
+        texts = snap.texts or []
+        blob = "\n".join(texts)
+        if "新的一局" in blob:
+            best = announced
+            for m in re.finditer(r"【(\d+)期】", blob):
+                seen = int(m.group(1))
+                chunk = blob[m.start() : min(len(blob), m.end() + 120)]
+                if "新的一局" in chunk and seen > best:
+                    best = seen
+            for m in re.finditer(r"(\d{6,})期", blob):
+                seen = int(m.group(1))
+                start = max(0, m.start() - 40)
+                chunk = blob[start : min(len(blob), m.end() + 120)]
+                if "新的一局" in chunk and seen > best:
+                    best = seen
+            if best > announced:
+                _ROUND_OPEN_ANNOUNCED[group] = best
+                save_round_open_announced_persisted()
+                log.info("gate 同步 rid=%s（blob-max）announced=%s→%s", best, announced, best)
+                return True
+            m = re.search(r"【(\d+)期】", blob) or re.search(r"(\d{6,})期", blob)
+            if m:
+                seen = int(m.group(1))
+                if seen > announced:
+                    _ROUND_OPEN_ANNOUNCED[group] = seen
+                    save_round_open_announced_persisted()
+                    log.info("gate 同步 rid=%s（blob）announced=%s→%s", seen, announced, seen)
+                    return True
+        for t in texts:
+            if "新的一局" not in t:
+                continue
+            m = re.search(r"【(\d+)期】", t) or re.search(r"(\d{6,})期", t)
+            if m:
+                seen = int(m.group(1))
+                if seen > announced:
+                    _ROUND_OPEN_ANNOUNCED[group] = seen
+                    save_round_open_announced_persisted()
+                    log.info("gate 同步 rid=%s（群聊读屏）announced=%s→%s", seen, announced, seen)
+                    return True
+    except Exception as ex:
+        log.debug("gate 同步读屏 skip: %s", ex)
+    if cur_rid > 0:
+        tpl = (st.get("openAnnounceTemplate") or DEFAULT_ROUND_OPEN_ANNOUNCE).strip()
+        probe = apply_template(tpl, round_id=cur_rid)
+        if _announce_already_visible(serial, bot, probe):
+            _ROUND_OPEN_ANNOUNCED[group] = cur_rid
+            save_round_open_announced_persisted()
+            log.info("gate 同步 rid=%s（模板可见）", cur_rid)
+            return True
+    _, interval, remaining = active_round_timing(st)
+    elapsed = interval - remaining
+    if cur_rid > 0 and elapsed >= OPEN_ANNOUNCE_AFTER_SEC and announced < cur_rid:
+        tpl = (st.get("openAnnounceTemplate") or DEFAULT_ROUND_OPEN_ANNOUNCE).strip()
+        probe = apply_template(tpl, round_id=cur_rid)
+        if _announce_already_visible(serial, bot, probe):
+            _ROUND_OPEN_ANNOUNCED[group] = cur_rid
+            save_round_open_announced_persisted()
+            log.info("gate 同步 rid=%s（模板可见）", cur_rid)
+            return True
+    return False
+
+
+def _heal_stale_open_gate(group: str, open_rid: int) -> None:
+    """announced 严重落后时自愈，避免 lag>1 旁路抢先发 open、结算被 gate 拖死。"""
+    if not group or open_rid <= 0:
+        return
+    announced = _ROUND_OPEN_ANNOUNCED.get(group, 0)
+    if open_rid - announced <= 3:
+        return
+    healed = max(announced, open_rid - 1)
+    _ROUND_OPEN_ANNOUNCED[group] = healed
+    save_round_open_announced_persisted()
+    log.warning(
+        "gate 自愈 announced=%s→%s（open_rid=%s lag=%s）",
+        announced, healed, open_rid, open_rid - announced,
+    )
+
+
+def _settle_images_blocking_open(rid: int, *, group: str = "") -> bool:
+    """左机发图模式下：图未出群则禁止 announce 旁路发新一局。"""
+    if not CLICKER_SEND_IMAGES:
+        return False
+    try:
+        from bot_ops.capture_ipc import has_pending_captures
+
+        if has_pending_captures():
+            return True
+    except Exception:
+        pass
+    if has_open_after_capture_pending():
+        return True
+    return False
+
+
+def dismiss_clicker_album_stuck(serial: str) -> bool:
+    """左机困在相册/选图 Activity → 退出回群聊（发图流程中 ChannelMediaSelect 不算 stuck）。"""
+    if not is_clicker_serial(serial):
+        return False
+    if _clicker_img_flow_active(serial):
+        return False
+    act = current_activity_hint(serial)
+    in_media = any(
+        m in act
+        for m in ("ChannelMediaSelect", "ImagePicker", "MediaSelect", "PictureSelector")
+    )
+    if not in_media:
+        root = ui_hierarchy(serial)
+        if root is not None:
+            texts = collect_ui_texts(root)
+            if not any(x in ("最近项目", "所有照片", "相册", "选择") for x in texts):
+                return False
+    log.warning("左机困相册 activity=%s，强制退出", act)
+    _dismiss_image_picker(serial)
+    dismiss_clicker_popup_overlay(serial)
+    for step in range(3):
+        clicker_safe_back(serial, reason=f"相册回群 step={step + 1}")
+        w(0.35, 0.12)
+        if is_group_chat_activity(serial) and _verify_chat_composer_ready_serial(serial):
+            break
+    invalidate_roi_cache(serial)
+    return is_group_chat_activity(serial)
+
+
+def try_dispatch_open_after_settle(
+    serial: str,
+    bot: dict,
+    settings: dict[str, str],
+    input_xy: tuple[int, int] | None,
+    send_xy: tuple[int, int] | None,
+) -> None:
+    """三图成功后若「新的一局」未入群，补发 open（禁止 gate 假解锁）。"""
+    if not is_send_bot(bot) or is_clicker_bot(bot):
+        return
+    group = (bot.get("associatedGroup") or "").strip()
+    if not group:
+        return
+    cur_rid, _, _ = active_round_timing(settings)
+    if cur_rid <= 0:
+        return
+    announced = _ROUND_OPEN_ANNOUNCED.get(group, 0)
+    if announced >= cur_rid:
+        return
+    lag = _open_gate_lag(group, cur_rid)
+    if _settle_images_blocking_open(cur_rid, group=group):
+        return
+    tpl = (settings.get("openAnnounceTemplate") or DEFAULT_ROUND_OPEN_ANNOUNCE).strip()
+    if not tpl:
+        return
+    _, interval, remaining = active_round_timing(settings)
+    elapsed = interval - remaining
+    period_start = beijing_now() - timedelta(seconds=elapsed)
+    open_at = period_start + timedelta(seconds=OPEN_ANNOUNCE_AFTER_SEC)
+    round_time = format_group_display_time(open_at)
+    text = apply_template(tpl, round_id=cur_rid, round_time=round_time)
+    if _announce_already_visible(serial, bot, text):
+        _ROUND_OPEN_ANNOUNCED[group] = cur_rid
+        save_round_open_announced_persisted()
+        return
+    if CLICKER_SEND_IMAGES:
+        prev = cur_rid - 1
+        if lag <= 1 and prev > 0 and prev not in _CAPTURE_SUCCEEDED:
+            try:
+                from bot_ops.capture_ipc import capture_in_progress_for_rid, has_pending_captures
+
+                if has_pending_captures() or capture_in_progress_for_rid(prev):
+                    return
+            except Exception:
+                return
+    if lag > 1:
+        log.warning(
+            "gate 滞后 %d 期 announced=%s cur=%s，旁路补发新的一局",
+            lag, announced, cur_rid,
+        )
+    log.info("补发新的一局 rid=%s（结算图后未见群聊）", cur_rid)
+    if lag > 1:
+        listener_clear_composer_hard(serial)
+        ok = send_chat_reply(
+            serial, bot, text, input_xy, send_xy, settings, group_ok=True,
+        )
+        if ok:
+            _ROUND_OPEN_ANNOUNCED[group] = cur_rid
+            save_round_open_announced_persisted()
+            post_log(f"[ADB] gate补发 open rid={cur_rid}", "INFO")
+        else:
+            log.warning("gate 补发 open 失败 rid=%s", cur_rid)
+        return
+    dispatch_send(
+        serial, bot, text, settings,
+        input_xy=input_xy, send_xy=send_xy,
+        prio=SEND_PRIO_OPEN_AFTER_SETTLE, kind="open", round_id=cur_rid, group_ok=True,
+    )
 
 
 def process_round_warn_announce(
@@ -11406,12 +14037,37 @@ def process_round_warn_announce(
         return
     if in_maintenance_window():
         return
+    fetch_28run_recent(force=True)
+    data = fetch_28run_recent()
+    try:
+        from bot_ops.api_timing import api_announce_windows
+        from bot_ops.time_sync import announce_timing_ready, TIMING_SOURCE
+
+        win = api_announce_windows(
+            settings, data,
+            warn_before=WARN_ANNOUNCE_BEFORE_SEC,
+            close_before=CLOSE_ANNOUNCE_BEFORE_SEC,
+        )
+        if not win.get("ok"):
+            if TIMING_SOURCE == "fallback" and not announce_timing_ready():
+                return
+        elif not win.get("should_warn"):
+            return
+        rid = int(win.get("rid") or 0)
+        remaining = float(win.get("remaining_sec") or 0)
+    except ImportError:
+        try:
+            from bot_ops.time_sync import announce_timing_ready, TIMING_SOURCE
+
+            if TIMING_SOURCE == "fallback" and not announce_timing_ready():
+                return
+        except ImportError:
+            pass
+        rid, _interval, remaining = active_round_timing(settings)
+        if remaining > WARN_ANNOUNCE_BEFORE_SEC or remaining <= CLOSE_ANNOUNCE_BEFORE_SEC:
+            return
     group = (bot.get("associatedGroup") or "").strip()
     if not group:
-        return
-    rid, _interval, remaining = active_round_timing(settings)
-    # 剩余 (CLOSE, WARN] 秒内发封盘提醒（默认封盘前70秒～15秒之间）
-    if remaining > WARN_ANNOUNCE_BEFORE_SEC or remaining <= CLOSE_ANNOUNCE_BEFORE_SEC:
         return
     if _WARN_ANNOUNCED_ROUND.get(group) == rid:
         return
@@ -11451,11 +14107,37 @@ def process_round_close_announce(
         return
     if in_maintenance_window():
         return
+    fetch_28run_recent(force=True)
+    data = fetch_28run_recent()
+    try:
+        from bot_ops.api_timing import api_announce_windows
+        from bot_ops.time_sync import announce_timing_ready, TIMING_SOURCE
+
+        win = api_announce_windows(
+            settings, data,
+            warn_before=WARN_ANNOUNCE_BEFORE_SEC,
+            close_before=CLOSE_ANNOUNCE_BEFORE_SEC,
+        )
+        if not win.get("ok"):
+            if TIMING_SOURCE == "fallback" and not announce_timing_ready():
+                return
+        elif not win.get("should_close"):
+            return
+        rid = int(win.get("rid") or 0)
+        remaining = float(win.get("remaining_sec") or 0)
+    except ImportError:
+        try:
+            from bot_ops.time_sync import announce_timing_ready, TIMING_SOURCE
+
+            if TIMING_SOURCE == "fallback" and not announce_timing_ready():
+                return
+        except ImportError:
+            pass
+        rid, _interval, remaining = active_round_timing(settings)
+        if remaining > CLOSE_ANNOUNCE_BEFORE_SEC or remaining <= 0:
+            return
     group = (bot.get("associatedGroup") or "").strip()
     if not group:
-        return
-    rid, _interval, remaining = active_round_timing(settings)
-    if remaining > CLOSE_ANNOUNCE_BEFORE_SEC or remaining <= 0:
         return
     dedupe_key = group
     if _CLOSE_ANNOUNCED_ROUND.get(dedupe_key) == rid:
@@ -11505,11 +14187,14 @@ def process_round_open_announce(
     send_xy: tuple[int, int] | None,
     *,
     data: dict | None = None,
+    from_maintenance: bool = False,
 ) -> None:
     """新一期开始 OPEN_ANNOUNCE_AFTER_SEC 秒后发「新的一局」（须等上期开奖已播报）。"""
     if not OPEN_ANNOUNCE_ENABLED:
         return
     if is_clicker_bot(bot):
+        return
+    if has_open_after_capture_pending():
         return
     if in_maintenance_window():
         return
@@ -11517,6 +14202,11 @@ def process_round_open_announce(
     if not group:
         return
     rid, interval, remaining = active_round_timing(settings)
+    if CLICKER_SEND_IMAGES and not from_maintenance:
+        group = (bot.get("associatedGroup") or "").strip()
+        if _settle_images_blocking_open(rid, group=group):
+            return
+        return
     elapsed = interval - remaining
     if elapsed < OPEN_ANNOUNCE_AFTER_SEC:
         return
@@ -11701,22 +14391,57 @@ def _clicker_bot_ids() -> set[str]:
     return set(CLICKER_BOT_IDS)
 
 
+def _deploy_port_roles() -> dict[str, tuple[str, str]]:
+    """端口以 bot-start.env / runtime 为准，避免陈旧 os.environ。"""
+    try:
+        from bot_ops.runtime import load_bot_runtime
+
+        rt = load_bot_runtime(Path(os.environ.get("BOT_ROOT", os.path.dirname(os.path.abspath(__file__)))))
+        return {
+            "bot-3": (rt.clicker_adb_port, "CLICKER"),
+            "bot-4": (rt.listener_adb_port, "LISTENER"),
+        }
+    except Exception:
+        _reload_deploy_constants()
+        return dict(DEPLOY_ADB_ROLES)
+
+
 def validate_deploy_roles(active: list[dict]) -> None:
     """启动时校验 DEPLOY LOCK，防止左右机角色/端口被调换。"""
     if not ORCHESTRATOR:
         return
+    _reload_deploy_constants()
+    port_roles = _deploy_port_roles()
     by_id = {str(b.get("id") or ""): b for b in active}
-    if BOT_LISTENER_ID not in by_id:
-        raise RuntimeError(f"监听器 {BOT_LISTENER_ID} 未 ACTIVE")
-    missing = [c for c in CLICKER_BOT_IDS if c not in by_id]
-    if missing and not CLICKER_OPTIONAL:
-        raise RuntimeError(f"点击器未 ACTIVE: {','.join(missing)}")
-    if missing and CLICKER_OPTIONAL:
-        log.warning("CLICKER 未 ACTIVE（BOT_CLICKER_OPTIONAL=1）: %s", ",".join(missing))
-    for bid, (port, role) in DEPLOY_ADB_ROLES.items():
+    dual = BOT_ROLE in ("LISTENER", "CLICKER")
+    if dual:
+        role_bots = [b for b in active if bot_device_role(b) == BOT_ROLE]
+        if not role_bots:
+            raise RuntimeError(
+                f"本进程 {BOT_ROLE} 无匹配 bot（active={[b.get('id') for b in active]}）"
+            )
+        check_ids = {str(b.get("id") or "") for b in role_bots}
+    else:
+        check_ids = set(by_id.keys())
+        if BOT_LISTENER_ID not in by_id:
+            raise RuntimeError(f"监听器 {BOT_LISTENER_ID} 未 ACTIVE")
+        missing = [c for c in CLICKER_BOT_IDS if c not in by_id]
+        if missing and not CLICKER_OPTIONAL:
+            raise RuntimeError(f"点击器未 ACTIVE: {','.join(missing)}")
+        elif missing and CLICKER_OPTIONAL:
+            log.warning("CLICKER 未 ACTIVE（BOT_CLICKER_OPTIONAL=1）: %s", ",".join(missing))
+    for bid, (port, role) in port_roles.items():
+        if dual and bid not in check_ids:
+            continue
         bot = by_id.get(bid)
         if not bot:
-            if bid in CLICKER_BOT_IDS and CLICKER_OPTIONAL:
+            if bid in CLICKER_BOT_IDS and (CLICKER_OPTIONAL or (dual and BOT_ROLE == "LISTENER")):
+                continue
+            if dual and BOT_ROLE == "CLICKER" and bid == BOT_LISTENER_ID:
+                continue
+            if dual and BOT_ROLE == "LISTENER" and bid in CLICKER_BOT_IDS:
+                continue
+            if not dual:
                 continue
             continue
         host = str(bot.get("adbHost") or "")
@@ -11729,11 +14454,9 @@ def validate_deploy_roles(active: list[dict]) -> None:
                 f"(BOT_LISTENER_ID={BOT_LISTENER_ID} BOT_CLICKER_IDS={','.join(CLICKER_BOT_IDS)})"
             )
     log.info(
-        "DEPLOY LOCK OK 右机=%s@%s LISTENER 左机=%s@%s CLICKER",
-        BOT_LISTENER_ID,
-        by_id[BOT_LISTENER_ID].get("adbHost"),
-        ",".join(sorted(CLICKER_BOT_IDS)),
-        ",".join(str(by_id[c].get("adbHost") or "") for c in CLICKER_BOT_IDS if c in by_id),
+        "DEPLOY LOCK OK 模式=%s 本进程=%s",
+        "DUAL-" + BOT_ROLE if dual else "MONO",
+        ",".join(sorted(by_id.keys())),
     )
 
 
@@ -11774,7 +14497,7 @@ def is_clicker_serial(serial: str, bot: dict | None = None) -> bool:
     if bot and is_clicker_bot(bot):
         return True
     port = _adb_port_from_serial(serial)
-    return port == DEPLOY_ADB_ROLES.get("bot-3", ("52840", ""))[0]
+    return port == DEPLOY_ADB_ROLES.get("bot-3", (_CLICKER_ADB_PORT, ""))[0]
 
 
 def is_listener_send_only_serial(serial: str, bot: dict | None = None) -> bool:
@@ -11794,6 +14517,20 @@ def listener_nav_frozen(serial: str) -> bool:
     if os.environ.get("BOT_ALLOW_LISTENER_NAV") == "1":
         return False
     return is_listener_send_only_serial(serial)
+
+
+def clicker_nav_frozen(serial: str) -> bool:
+    """左机零导航：heal 时 BOT_ALLOW_CLICKER_NAV=1 除外。"""
+    if os.environ.get("BOT_ALLOW_CLICKER_NAV") == "1":
+        return False
+    return is_clicker_serial(serial) and CLICKER_ZERO_NAV
+
+
+def block_clicker_navigation(serial: str, action: str) -> bool:
+    if clicker_nav_frozen(serial):
+        log.info("左机禁止导航：%s serial=%s", action, serial)
+        return True
+    return False
 
 
 def block_listener_navigation(serial: str, action: str) -> bool:
@@ -11816,6 +14553,11 @@ def try_recover_listener_to_group(
         return ensure_group_chat(serial, bot)
     if listener_in_group_for_send(ui_hierarchy(serial), bot, serial):
         return True
+    ok_ts = _LISTENER_RECOVER_OK_TS.get(serial, 0.0)
+    if time.time() - ok_ts < LISTENER_RECOVER_HOLD_SEC:
+        return listener_in_group_for_send(ui_hierarchy(serial), bot, serial)
+    if not LISTENER_AUTO_RECOVER:
+        return False
     if not LISTENER_STAY_IN_GROUP:
         return False
     now = time.time()
@@ -11824,40 +14566,51 @@ def try_recover_listener_to_group(
         return False
     _LISTENER_LAST_RECOVER[serial] = now
     tag = f" ({reason})" if reason else ""
-    log.info(
-        "右机尝试自动回群%s serial=%s group=%s",
-        tag, serial, bot.get("associatedGroup"),
-    )
-    prev = os.environ.get("BOT_ALLOW_LISTENER_NAV")
-    os.environ["BOT_ALLOW_LISTENER_NAV"] = "1"
+    if not _LISTENER_RECOVER_LOCK.acquire(blocking=False):
+        return listener_in_group_for_send(ui_hierarchy(serial), bot, serial)
     try:
-        if not is_55m_foreground(serial):
-            launch_messenger_app(serial)
-        ok = recover_listener_to_group_minimal(serial, bot)
-        if ok:
-            log.info("右机自动回群成功 %s", bot.get("associatedGroup"))
-        else:
-            ctx = describe_screen_context(ui_hierarchy(serial), bot, serial)
-            log.warning(
-                "右机自动回群失败 page=%s title=%r（请手动点回目标群，勿再自动乱点）",
-                ctx.page, ctx.title,
-            )
-        return ok
+        log.info(
+            "右机尝试自动回群%s serial=%s group=%s",
+            tag, serial, bot.get("associatedGroup"),
+        )
+        prev = os.environ.get("BOT_ALLOW_LISTENER_NAV")
+        os.environ["BOT_ALLOW_LISTENER_NAV"] = "1"
+        try:
+            dismiss_listener_blockers(serial, ui_hierarchy(serial))
+            if not is_55m_foreground(serial):
+                launch_messenger_app(serial)
+            ok = recover_listener_to_group_minimal(serial, bot)
+            if ok:
+                log.info("右机自动回群成功 %s", bot.get("associatedGroup"))
+                _LISTENER_RECOVER_OK_TS[serial] = time.time()
+            else:
+                ctx = describe_screen_context(ui_hierarchy(serial), bot, serial)
+                log.warning(
+                    "右机自动回群失败 page=%s title=%r（请手动点回目标群，勿再自动乱点）",
+                    ctx.page, ctx.title,
+                )
+            return ok
+        finally:
+            if prev is None:
+                os.environ.pop("BOT_ALLOW_LISTENER_NAV", None)
+            else:
+                os.environ["BOT_ALLOW_LISTENER_NAV"] = prev
     finally:
-        if prev is None:
-            os.environ.pop("BOT_ALLOW_LISTENER_NAV", None)
-        else:
-            os.environ["BOT_ALLOW_LISTENER_NAV"] = prev
+        _LISTENER_RECOVER_LOCK.release()
 
 
 def block_clicker_send(serial: str, bot: dict | None, text: str, *, where: str) -> bool:
-    """左机禁止群内发文字。发图在 BOT_CLICKER_SEND_IMAGES=1 时放行。"""
+    """左机禁止群内发文字/公告。发图在 BOT_CLICKER_SEND_IMAGES=1 时放行。"""
+    if not is_clicker_bot(bot) and not is_clicker_serial(serial, bot):
+        return False
+    t = text or ""
+    if any(m in t for m in ("封盘", "新的一局", "距封盘", "距离封盘", "停止下注")):
+        log.warning("左机禁止发公告(%s): %s", where, message_snip(text)[:40])
+        return True
     if CLICKER_SEND_IMAGES and where.startswith("send-image"):
         return False
-    if is_clicker_bot(bot) or is_clicker_serial(serial, bot):
-        log.warning("左机禁止群发送(%s): %s", where, message_snip(text)[:40])
-        return True
-    return False
+    log.warning("左机禁止群发送(%s): %s", where, message_snip(text)[:40])
+    return True
 
 
 def is_send_only_listener(bot: dict | None) -> bool:
@@ -11886,7 +14639,11 @@ def ensure_group_for_send(serial: str, bot: dict) -> bool:
         root = ui_hierarchy(serial)
         if listener_in_group_for_send(root, bot, serial):
             return True
-        if try_recover_listener_to_group(serial, bot, reason="before-send", force=True):
+        if _likely_target_group_surface(root, bot, serial):
+            return True
+        ctx = describe_screen_context(root, bot, serial)
+        if ctx.page == "message_list":
+            tap_target_group_in_list(serial, bot, scrolls=0)
             return listener_in_group_for_send(ui_hierarchy(serial), bot, serial)
         log.warning(
             "纯发送机未在目标群 %s（请手动停留在群聊界面）",
@@ -11917,12 +14674,15 @@ class SharedContext:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
         self.users: list = []
         self.products: list = []
         self.combo_rules: list = []
         self.settings: dict[str, str] = dict(DEFAULT_SETTINGS)
 
     def refresh(self) -> None:
+        if not self._refresh_lock.acquire(blocking=False):
+            return
         try:
             users = api("GET", "/api/users")
             products = api("GET", "/api/products")
@@ -11931,9 +14691,12 @@ class SharedContext:
         except Exception as ex:
             log.warning("刷新面板数据失败: %s", ex)
             return
+        finally:
+            self._refresh_lock.release()
         with self._lock:
             if isinstance(users, list):
                 self.users = users
+                gateway_warm_from_users(users, min_interval_sec=GATEWAY_WARM_SEC)
             if isinstance(products, list):
                 self.products = products
             if isinstance(combo_rules, list):
@@ -12089,6 +14852,14 @@ class Brain:
         text = (text or "").strip()
         if not text:
             return
+        if BOT_ROLE == "CLICKER":
+            try:
+                from bot_ops.ipc_brain import ipc_enqueue_reply
+
+                if ipc_enqueue_reply(listener_id, nick, text):
+                    return
+            except Exception as ex:
+                log.warning("[IPC-REPLY] fallback local queue: %s", ex)
         key = (listener_id, (nick or "").strip().lower(), text)
         now = time.time()
         with self._lock:
@@ -12151,22 +14922,25 @@ class Orchestrator:
 
     def _refresh_loop(self) -> None:
         topup_counter = 0
+        clicker_only = BOT_ROLE == "CLICKER"
+        interval = CLICKER_CONTEXT_REFRESH_SEC if clicker_only else CONTEXT_REFRESH_SEC
         while self._running.is_set():
             self.ctx.refresh()
-            topup_counter += 1
-            if topup_counter >= 2:
-                topup_counter = 0
-                for bot in self._listener_bots():
-                    serial = self._serials.get(bot["id"])
-                    if not serial:
-                        continue
-                    submit_outbound_hook(
-                        self._dispatch_finance_outbox_hook,
-                        serial,
-                        bot,
-                        label=f"finance-outbox-{bot.get('id')}",
-                    )
-            time.sleep(CONTEXT_REFRESH_SEC)
+            if not clicker_only:
+                topup_counter += 1
+                if topup_counter >= 2:
+                    topup_counter = 0
+                    for bot in self._listener_bots():
+                        serial = self._serials.get(bot["id"])
+                        if not serial:
+                            continue
+                        submit_outbound_hook(
+                            self._dispatch_finance_outbox_hook,
+                            serial,
+                            bot,
+                            label=f"finance-outbox-{bot.get('id')}",
+                        )
+            time.sleep(interval)
 
     def _listener_bots(self) -> list[dict]:
         return [
@@ -12186,31 +14960,61 @@ class Orchestrator:
                 _, _, _, settings = self.ctx.snapshot()
                 snap = ui_snapshot(serial, chat=False, channel="announce")
                 root = snap.root
-                if not listener_in_group_for_send(root, bot, serial):
-                    if is_send_only_listener(bot):
-                        if listener_send_blocked(root) or is_in_app_webview(root):
-                            if dismiss_listener_blockers(serial, root):
-                                snap = ui_snapshot(serial, chat=False, channel="announce")
+                ctx_ann = describe_screen_context(root, bot, serial)
+                in_group = (
+                    listener_in_group_for_send(root, bot, serial)
+                    or ctx_ann.page == "target_group"
+                    or _likely_target_group_surface(root, bot, serial)
+                )
+                if in_group:
+                    snap = ui_snapshot(serial, chat=True, channel="announce")
+                    root = snap.root
+                elif not in_group:
+                    ctx_page = ctx_ann.page
+                    if serial and is_group_chat_activity(serial) and _chat_surface_open(root, serial):
+                        snap = ui_snapshot(serial, chat=True, channel="announce")
+                        root = snap.root
+                        in_group = True
+                    elif is_send_only_listener(bot):
+                        if ctx_page in ("search", "group_settings", "webview") or (
+                            root is not None and any(t == "发送图片" for t in collect_ui_texts(root))
+                        ):
+                            dismiss_listener_blockers(serial, root)
+                            snap = ui_snapshot(serial, chat=False, channel="announce")
+                            root = snap.root
+                        elif is_contact_detail_activity(serial):
+                            dismiss_contact_detail_page(serial, bot)
+                            snap = ui_snapshot(serial, chat=False, channel="announce")
+                            root = snap.root
+                        elif LISTENER_ZERO_NAV and ctx_page == "message_list":
+                            if tap_target_group_in_list(serial, bot, scrolls=0):
+                                snap = ui_snapshot(serial, chat=True, channel="announce")
                                 root = snap.root
-                        if not listener_in_group_for_send(root, bot, serial):
-                            if LISTENER_ZERO_NAV and is_group_chat_activity(serial):
-                                dismiss_listener_blockers(serial, root)
-                                snap = ui_snapshot(serial, chat=False, channel="announce")
-                                root = snap.root
-                            elif not LISTENER_ZERO_NAV:
-                                recover_listener_to_group_minimal(serial, bot)
-                                snap = ui_snapshot(serial, chat=False, channel="announce")
-                                root = snap.root
-                    if not listener_in_group_for_send(root, bot, serial):
-                        if is_send_only_listener(bot) and is_in_app_webview(root):
-                            log.warning("[%s] 右机在开奖外链页，系统返回", name)
-                            dismiss_in_app_webview(serial, max_steps=1)
-                        else:
-                            log.info("[%s] 右机不在群聊，跳过公告", name)
-                            time.sleep(ANNOUNCE_LOOP_SEC)
-                            continue
+                            else:
+                                log.warning("[%s] 列表点群失败 group=%s", name, bot.get("associatedGroup"))
+                        elif not LISTENER_ZERO_NAV and LISTENER_AUTO_RECOVER and ctx_page != "target_group":
+                            try_recover_listener_to_group(serial, bot, reason="announce-loop", force=True)
+                            snap = ui_snapshot(serial, chat=False, channel="announce")
+                            root = snap.root
+                    ctx_ann = describe_screen_context(root, bot, serial)
+                    in_group = (
+                    listener_in_group_for_send(root, bot, serial)
+                    or ctx_ann.page == "target_group"
+                    or _likely_target_group_surface(root, bot, serial)
+                )
+                    if not in_group:
+                        log.info("[%s] 右机不在群聊 ctx=%s（不 Back）", name, ctx_ann.summary(serial))
+                        time.sleep(ANNOUNCE_LOOP_SEC)
+                        continue
                 send_xy = listener_pinned_send_xy(settings, snap) if is_send_only_listener(bot) else (
                     snap.inbar_send or snap.keyboard_send
+                )
+                sync_open_gate_from_chat(serial, bot, settings)
+                try_dispatch_open_after_settle(
+                    serial, bot, settings, snap.input_xy, send_xy,
+                )
+                process_round_open_announce(
+                    serial, bot, settings, snap.input_xy, send_xy,
                 )
                 process_round_warn_announce(
                     serial, bot, settings, snap.input_xy, send_xy,
@@ -12219,17 +15023,58 @@ class Orchestrator:
                     serial, bot, settings, snap.input_xy, send_xy,
                 )
                 process_stale_open_after_capture()
-                # 开局公告由结算线程在播报完成后触发，避免与开奖结果抢顺序
+                try:
+                    from bot_ops.capture_ipc import dict_to_outbound, poll_capture_done
+
+                    for done in poll_capture_done():
+                        settled_rid = int(done.get("settled_rid") or 0)
+                        open_raw = done.get("open_job") or {}
+                        if done.get("images_ok") and open_raw:
+                            ojob = dict_to_outbound(open_raw, bot, serial)
+                            _CAPTURE_SUCCEEDED.add(settled_rid)
+                            outbound_enqueue(ojob)
+                            log.info(
+                                "[capture-ipc] 左机图成功 → 入队新一局 rid=%s (settled=%s)",
+                                ojob.round_id,
+                                settled_rid,
+                            )
+                        elif settled_rid:
+                            log.warning(
+                                "[capture-ipc] 左机图失败 settled_rid=%s，不发新一局",
+                                settled_rid,
+                            )
+                except Exception:
+                    log.exception("[capture-ipc] 处理 done 失败")
             except Exception:
                 log.exception("[%s] 公告异常", name)
-            time.sleep(ANNOUNCE_LOOP_SEC)
+            # API 临近封盘时毫秒级轮询
+            sleep_sec = ANNOUNCE_LOOP_SEC
+            try:
+                _, _, _, st = self.ctx.snapshot()
+                from bot_ops.time_sync import TIMING_SOURCE
+
+                if TIMING_SOURCE in ("api", "api_partial"):
+                    _, _, rem = active_round_timing(st)
+                    if rem <= WARN_ANNOUNCE_BEFORE_SEC + 5:
+                        sleep_sec = min(sleep_sec, 0.12)
+            except Exception:
+                pass
+            time.sleep(sleep_sec)
 
     def _sender_loop(self, bot: dict, serial: str) -> None:
         name = f"sender-{bot.get('id')}"
         log.info("[%s] 发送线程启动 serial=%s (优先级队列)", name, serial)
+        if is_clicker_bot(bot) or is_clicker_serial(serial, bot):
+            log.error("[%s] 左机禁止 sender 线程，退出", name)
+            return
         while self._running.is_set():
             job = outbound_for(serial).get(timeout=0.25)
             if not job:
+                continue
+            if _is_announce_outbound_job(job) and is_clicker_serial(job.serial, job.bot):
+                routed = _reroute_announce_off_clicker(job)
+                if routed:
+                    outbound_enqueue(routed)
                 continue
             if not job.image_paths and not job.image_path and _announce_job_redundant(job):
                 log.info(
@@ -12237,13 +15082,23 @@ class Orchestrator:
                     name, job.kind, job.round_id,
                 )
                 continue
+            if _skip_stale_open_job(serial, job):
+                continue
             if (
                 (job.image_paths or job.image_path)
                 and is_listener_send_only_serial(serial, job.bot)
-                and CLICKER_SEND_IMAGES
             ):
-                log.warning("[%s] 发图任务不应走右机，丢弃 rid=%s", name, job.round_id)
-                continue
+                try:
+                    from bot_ops.runtime import load_bot_runtime
+
+                    lp = load_bot_runtime().listener_adb_port
+                    if CLICKER_SEND_IMAGES or _adb_port_from_serial(serial) == lp:
+                        log.warning("[%s] 发图任务禁止走右机，丢弃 rid=%s", name, job.round_id)
+                        continue
+                except Exception:
+                    if CLICKER_SEND_IMAGES:
+                        log.warning("[%s] 发图任务不应走右机，丢弃 rid=%s", name, job.round_id)
+                        continue
             if (
                 (job.image_paths or job.image_path)
                 and outbound_pending_announce_text(serial)
@@ -12252,12 +15107,18 @@ class Orchestrator:
                 time.sleep(0.03)
                 continue
             if (
-                job.kind in ("warn", "close")
-                and _any_clicker_img_flow_busy()
+                job.kind == "open"
+                and job.prio >= SEND_PRIO_OPEN_AFTER_SETTLE
             ):
-                outbound_enqueue(job)
-                time.sleep(0.08)
-                continue
+                if _any_clicker_img_flow_busy():
+                    outbound_enqueue(job)
+                    time.sleep(0.05)
+                    continue
+                if not ensure_group_for_send(serial, job.bot):
+                    log.warning("[%s] 新一局：右机不在群，稍后重试 rid=%s", name, job.round_id)
+                    outbound_enqueue(job)
+                    continue
+                scroll_chat_toward_bottom(serial, 1)
             ok = False
             try:
                 _LISTENER_SEND_LOCK[serial] = True
@@ -12315,6 +15176,10 @@ class Orchestrator:
                         skip_fast=not use_fast,
                     )
                 if ok:
+                    if job.text and job.kind in ("warn", "close", "open"):
+                        snip = re.sub(r"\s+", "", message_snip(job.text))[:48]
+                        if snip:
+                            _OUTBOUND_TEXT_DEDUP[_outbound_dedup_key(serial, job.text)] = time.time()
                     if job.kind == "open" and job.round_id:
                         group = (job.bot.get("associatedGroup") or "").strip()
                         if group:
@@ -12339,6 +15204,10 @@ class Orchestrator:
                         f"[ADB] 队列发送(p{job.prio}): {label}",
                         "SUCCESS",
                     )
+                    if ok and job.kind in ("warn", "close", "open") and job.text:
+                        _physical_verify_announce(
+                            serial, job.bot, job.text, job.kind, job.round_id,
+                        )
                 elif job.prio <= SEND_PRIO_BRAIN:
                     log.warning("[%s] 用户回复发送失败: %s", name, message_snip(job.text)[:60])
                 elif job.image_paths or job.image_path:
@@ -12353,6 +15222,12 @@ class Orchestrator:
                         "[%s] 公告发送失败 kind=%s rid=%s: %s",
                         name, job.kind, job.round_id, message_snip(job.text)[:48],
                     )
+                    group = (job.bot.get("associatedGroup") or "").strip()
+                    if group and job.round_id:
+                        if job.kind == "warn" and _WARN_ANNOUNCED_ROUND.get(group) == job.round_id:
+                            _WARN_ANNOUNCED_ROUND.pop(group, None)
+                        elif job.kind == "close" and _CLOSE_ANNOUNCED_ROUND.get(group) == job.round_id:
+                            _CLOSE_ANNOUNCED_ROUND.pop(group, None)
                 if not ok and job.text.strip():
                     _release_outbound_dedup(job.serial, job.text)
             except Exception:
@@ -12364,34 +15239,31 @@ class Orchestrator:
                 invalidate_roi_cache(serial)
 
     def _listener_stay_loop(self, bot: dict, serial: str) -> None:
-        """右机看门狗：仅系统 Back 关外链，禁止 Tab/群名乱点。"""
+        """右机轻量看门狗：仅关外链 + 消息列表点一次目标群，禁止 Back/冷启动乱点。"""
         name = f"listener-stay-{bot.get('id')}"
-        interval = max(LISTENER_STAY_RECOVER_SEC, 15.0 if LISTENER_ZERO_NAV else LISTENER_STAY_RECOVER_SEC)
-        log.info("[%s] 右机驻群看门狗 serial=%s interval=%.0fs zero_nav=%s", name, serial, interval, LISTENER_ZERO_NAV)
+        interval = max(20.0, LISTENER_STAY_RECOVER_SEC * 3)
+        log.info("[%s] 右机轻量看门狗 serial=%s interval=%.0fs", name, serial, interval)
         while self._running.is_set():
             try:
                 if not is_send_only_listener(bot):
                     time.sleep(interval)
                     continue
+                if listener_in_group_for_send(ui_hierarchy(serial, channel="stay"), bot, serial):
+                    time.sleep(interval)
+                    continue
                 root = ui_hierarchy(serial, channel="stay")
+                wake_device_screen(serial)
                 if not is_55m_foreground(serial):
-                    log.warning("[%s] 右机不在 55M 前台，拉起", name)
                     launch_messenger_app(serial)
-                    recover_listener_to_group_minimal(serial, bot)
                     root = ui_hierarchy(serial, channel="stay")
-                if listener_send_blocked(root, serial):
-                    dismiss_listener_blockers(serial, root)
-                elif is_in_app_webview(root) and not is_group_chat_activity(serial):
-                    log.warning("[%s] 右机卡在开奖外链，系统返回", name)
-                    dismiss_in_app_webview(serial, max_steps=1)
-                elif not listener_in_group_for_send(root, bot, serial):
-                    log.warning(
-                        "[%s] 右机不在群 page=%s",
-                        name,
-                        describe_screen_context(root, bot, serial).page,
-                    )
-                    if is_group_chat_activity(serial) or not LISTENER_ZERO_NAV:
-                        recover_listener_to_group_minimal(serial, bot)
+                if is_contact_detail_activity(serial):
+                    dismiss_contact_detail_page(serial, bot)
+                    root = ui_hierarchy(serial, channel="stay")
+                ctx = describe_screen_context(root, bot, serial)
+                if ctx.page == "message_list":
+                    tap_target_group_in_list(serial, bot, scrolls=0)
+                elif ctx.page not in ("target_group",):
+                    log.info("[%s] 离群 ctx=%s（不自动 Back）", name, ctx.summary(serial))
             except Exception:
                 log.exception("[%s] 驻群看门狗异常", name)
             time.sleep(interval)
@@ -12402,17 +15274,40 @@ class Orchestrator:
         log.info("[%s] 左机驻群看门狗 serial=%s interval=%.0fs", name, serial, CLICKER_STAY_SEC)
         while self._running.is_set():
             try:
-                if CLICKER_STAY_IN_CHAT:
-                    dismiss_clicker_dialogs(serial)
-                    if is_on_launcher(serial) or not is_55m_foreground(serial):
+                if os.environ.get("BOT_CLICKER_STAY_IN_CHAT", "1").lower() not in ("1", "true", "yes"):
+                    time.sleep(CLICKER_STAY_SEC)
+                    continue
+                dismiss_clicker_dialogs(serial)
+                maybe_periodic_gallery_purge(serial)
+                img_busy = _clicker_img_flow_active(serial) or _any_clicker_img_flow_busy()
+                try:
+                    from bot_ops.capture_ipc import has_pending_captures
+                    img_busy = img_busy or has_pending_captures()
+                except Exception:
+                    pass
+                if not img_busy:
+                    act = current_activity_hint(serial)
+                    if any(
+                        m in act
+                        for m in ("ChannelMediaSelect", "ImagePicker", "MediaSelect", "PictureSelector")
+                    ):
+                        dismiss_clicker_album_stuck(serial)
+                if is_on_launcher(serial) or not is_55m_foreground(serial):
+                    if _clicker_img_flow_active(serial) or _any_clicker_img_flow_busy():
+                        pass
+                    else:
                         log.warning("[%s] 左机离桌面/退后台，拉回 55M", name)
                         ensure_clicker_in_group(serial, bot, reason="watchdog")
-                    elif not in_target_group_chat(ui_hierarchy(serial), bot, serial):
+                elif not in_target_group_chat(ui_hierarchy(serial), bot, serial):
+                    if _clicker_img_flow_active(serial) or _any_clicker_img_flow_busy():
+                        pass
+                    else:
                         root = ui_hierarchy(serial)
-                        if is_in_app_webview(root):
-                            log.warning("[%s] 左机在开奖外链页，拉回群聊", name)
+                        ctx = describe_screen_context(root, bot, serial)
+                        if is_in_app_webview(root, serial):
+                            log.warning("[%s] 左机在开奖外链 ctx=%s", name, ctx.summary(serial))
                         else:
-                            log.warning("[%s] 左机不在目标群，尝试回群", name)
+                            log.warning("[%s] 左机不在目标群 ctx=%s", name, ctx.summary(serial))
                         clicker_back_to_group(serial, bot)
             except Exception:
                 log.exception("[%s] 驻群看门狗异常", name)
@@ -12422,38 +15317,161 @@ class Orchestrator:
         """左机专用：仅处理出站队列中的发图任务（UI +→图片→勾选→发送）。"""
         name = f"clicker-img-{bot.get('id')}"
         log.info("[%s] 左机 UI 发图线程 serial=%s mode=%s", name, serial, BOT_IMG_SEND_MODE)
+        last_stay_heal = 0.0
         while self._running.is_set():
             global _CAPTURE_SUCCEEDED, _SETTLE_DISPATCHED, _SETTLED_ROUNDS
-            job = outbound_for(serial).get(timeout=0.25)
+            job: OutboundSend | None = None
+            ipc_open_job: dict | None = None
+            try:
+                from bot_ops.capture_ipc import claim_pending_captures
+
+                for ipc in claim_pending_captures():
+                    ipc_serial = str(ipc.get("clicker_serial") or serial).strip()
+                    if _adb_port_from_serial(ipc_serial) != _adb_port_from_serial(serial):
+                        continue
+                    paths = [p for p in (ipc.get("image_paths") or []) if p]
+                    rid = int(ipc.get("round_id") or 0)
+                    if not paths or rid <= 0:
+                        continue
+                    _, _, _, settings = self.ctx.snapshot()
+                    pix, psy = _clicker_settle_pinned_pair()
+                    preloaded = bool(ipc.get("gallery_preloaded"))
+                    if preloaded:
+                        ix, sy = pix, psy
+                    else:
+                        snap = ui_snapshot(serial, chat=True, channel="clicker-img")
+                        ix = snap.input_xy or pix
+                        sy = snap.inbar_send or snap.keyboard_send or psy
+                    job = OutboundSend(
+                        serial,
+                        bot,
+                        "",
+                        settings,
+                        input_xy=ix,
+                        send_xy=sy,
+                        prio=SEND_PRIO_CAPTURE,
+                        kind="capture_batch",
+                        round_id=rid,
+                        image_paths=paths,
+                        group_ok=True,
+                        gallery_preloaded=preloaded,
+                    )
+                    ipc_open_job = ipc.get("open_job") or {}
+                    log.info("[%s] capture-ipc 认领 rid=%s paths=%d", name, rid, len(paths))
+                    break
+            except Exception:
+                log.exception("[%s] capture-ipc 认领异常", name)
+            if not job:
+                now = time.time()
+                if not _clicker_img_flow_active(serial):
+                    try:
+                        from bot_ops.capture_ipc import has_pending_captures
+                        pending_cap = has_pending_captures()
+                    except Exception:
+                        pending_cap = False
+                    if not pending_cap:
+                        now = time.time()
+                        if now - last_stay_heal >= 12.0:
+                            last_stay_heal = now
+                            root = ui_hierarchy(serial)
+                            if not in_target_group_chat(root, bot, serial):
+                                ensure_clicker_in_group(serial, bot, reason="img-loop-stay")
+                job = outbound_for(serial).get(timeout=0.25)
             if not job:
                 continue
             if not (job.image_paths or job.image_path):
                 continue
             if job.kind == "capture_batch" and job.round_id:
                 if job.round_id in _CAPTURE_SUCCEEDED:
-                    flush_open_after_capture(job.round_id, images_ok=True)
+                    if ipc_open_job is not None:
+                        try:
+                            from bot_ops.capture_ipc import mark_capture_done
+
+                            mark_capture_done(
+                                job.round_id, images_ok=True, open_job=ipc_open_job,
+                            )
+                        except Exception:
+                            flush_open_after_capture(job.round_id, images_ok=True)
+                    else:
+                        flush_open_after_capture(job.round_id, images_ok=True)
                     continue
             ok = False
+            clicker_img_flow_begin(serial)
             try:
-                if not ensure_clicker_in_group(serial, bot, reason="before-ui-image"):
+                preloaded_job = bool(job.gallery_preloaded)
+                if not preloaded_job:
+                    root_pre = ui_hierarchy(serial)
+                    if not in_target_group_chat(root_pre, bot, serial):
+                        if not _is_gallery_media_picker_activity(serial):
+                            dismiss_clicker_album_stuck(serial)
+                in_group = True
+                if not preloaded_job and not _settle_cloud_no_audit(serial):
+                    in_group = False
+                    heal_attempts = 4
+                    for attempt in range(heal_attempts):
+                        if ensure_clicker_in_group(
+                            serial, bot, reason=f"before-ui-image-{attempt + 1}",
+                        ):
+                            in_group = True
+                            break
+                        if clicker_img_task_surface_ready(serial):
+                            in_group = True
+                            break
+                        dismiss_clicker_album_stuck(serial)
+                        clicker_w(0.9, 1.3)
+                if not in_group:
                     log.warning("[%s] 左机不在目标群，跳过发图", name)
                     if job.kind == "capture_batch" and job.round_id:
-                        flush_open_after_capture(job.round_id, images_ok=False)
+                        if ipc_open_job is not None:
+                            from bot_ops.capture_ipc import mark_capture_done
+
+                            mark_capture_done(
+                                job.round_id, images_ok=False, open_job=ipc_open_job,
+                            )
+                        else:
+                            flush_open_after_capture(job.round_id, images_ok=False)
                     continue
-                if not _verify_chat_composer_ready_serial(serial):
+                if job.kind != "capture_batch" and not (
+                    _verify_chat_composer_ready_serial(serial)
+                    or clicker_img_task_surface_ready(serial)
+                    or _is_gallery_media_picker_activity(serial)
+                ):
                     log.warning("[%s] 左机输入栏未就绪，跳过发图", name)
                     if job.kind == "capture_batch" and job.round_id:
-                        flush_open_after_capture(job.round_id, images_ok=False)
+                        if ipc_open_job is not None:
+                            from bot_ops.capture_ipc import mark_capture_done
+
+                            mark_capture_done(
+                                job.round_id, images_ok=False, open_job=ipc_open_job,
+                            )
+                        else:
+                            flush_open_after_capture(job.round_id, images_ok=False)
                     continue
                 dismiss_clicker_popup_overlay(serial)
-                snap = ui_snapshot(serial, chat=True, channel="clicker-img")
-                ix = job.input_xy or snap.input_xy
-                sy = job.send_xy or snap.inbar_send or snap.keyboard_send
+                if preloaded_job:
+                    ix = job.input_xy or _clicker_settle_pinned_pair()[0]
+                    sy = job.send_xy or _clicker_settle_pinned_pair()[1]
+                else:
+                    snap = ui_snapshot(serial, chat=True, channel="clicker-img")
+                    ix = job.input_xy or snap.input_xy
+                    sy = job.send_xy or snap.inbar_send or snap.keyboard_send
                 if job.image_paths:
-                    ok = send_chat_images_batch(
-                        serial, bot, job.image_paths, ix, sy, job.settings, group_ok=True,
-                        settle_rid=job.round_id or 0,
-                    )
+                    send_tries = 1 if job.gallery_preloaded else 3
+                    for send_try in range(send_tries):
+                        ok = send_chat_images_batch(
+                            serial, bot, job.image_paths, ix, sy, job.settings, group_ok=True,
+                            settle_rid=job.round_id or 0,
+                            gallery_preloaded=job.gallery_preloaded,
+                        )
+                        if ok:
+                            break
+                        if send_try < 2:
+                            log.warning(
+                                "[%s] 左机发图重试 rid=%s try=%d",
+                                name, job.round_id, send_try + 2,
+                            )
+                            dismiss_clicker_album_stuck(serial)
+                            clicker_w(0.35, 0.6)
                 else:
                     ok = send_chat_image(
                         serial, bot, job.image_path, ix, sy, job.settings, group_ok=True,
@@ -12467,21 +15485,40 @@ class Orchestrator:
                         else os.path.basename(job.image_path)
                     )
                     post_log(f"[ADB] 左机 UI 发图成功: {label}", "SUCCESS")
-                    clicker_return_to_group(serial, bot, label="after-ui-image")
+                    if not (job.kind == "capture_batch" and IMG_LOCKED):
+                        clicker_return_to_group(serial, bot, label="after-ui-image")
                     if job.kind == "capture_batch" and job.round_id:
                         _SETTLE_DISPATCHED.add(job.round_id)
                 else:
                     log.warning("[%s] 左机 UI 发图失败 rid=%s", name, job.round_id)
                 if job.kind == "capture_batch" and job.round_id:
-                    flush_open_after_capture(job.round_id, images_ok=ok)
+                    if ipc_open_job is not None:
+                        from bot_ops.capture_ipc import mark_capture_done
+
+                        mark_capture_done(
+                            job.round_id, images_ok=ok, open_job=ipc_open_job,
+                        )
+                    else:
+                        flush_open_after_capture(job.round_id, images_ok=ok)
                     if ok:
                         _SETTLED_ROUNDS.add(job.round_id)
                         save_settled_rounds_persisted()
             except Exception:
                 log.exception("[%s] 左机发图异常", name)
                 if job.kind == "capture_batch" and job.round_id:
-                    flush_open_after_capture(job.round_id, images_ok=False)
+                    if ipc_open_job is not None:
+                        try:
+                            from bot_ops.capture_ipc import mark_capture_done
+
+                            mark_capture_done(
+                                job.round_id, images_ok=False, open_job=ipc_open_job,
+                            )
+                        except Exception:
+                            flush_open_after_capture(job.round_id, images_ok=False)
+                    else:
+                        flush_open_after_capture(job.round_id, images_ok=False)
             finally:
+                clicker_img_flow_end(serial)
                 invalidate_roi_cache(serial)
 
     def _settlement_loop(self, bot: dict, serial: str) -> None:
@@ -12499,17 +15536,9 @@ class Orchestrator:
                         )
                 if SETTLE_ENABLED and not is_clicker_bot(bot) and not is_clicker_serial(serial, bot) and not in_maintenance_window():
                     users, _, _, settings = self.ctx.snapshot()
-                    snap = ui_snapshot(serial, channel="settle")
-                    if not listener_in_group_for_send(snap.root, bot, serial):
-                        ctx = describe_screen_context(snap.root, bot, serial)
-                        log.info("[%s] 右机不在群聊，跳过结算（禁止导航） page=%s", name, ctx.summary())
-                        time.sleep(SETTLE_LOOP_SEC)
-                        continue
-                    send_xy = listener_pinned_send_xy(settings, snap) if is_send_only_listener(bot) else (
-                        snap.inbar_send or snap.keyboard_send
-                    )
+                    # 28.run 轮询 + 截图入队不依赖右机 UI 在群（避免 wrong_chat 拖慢 2min+）
                     process_round_settlement(
-                        serial, bot, settings, users, snap.input_xy, send_xy,
+                        serial, bot, settings, users, None, None,
                     )
             except Exception:
                 log.exception("[%s] 结算异常", name)
@@ -12533,6 +15562,128 @@ class Orchestrator:
                 continue
             delay = LISTENER_TICK_SEC if had_work or not worker._tick_idle else LISTENER_IDLE_TICK_SEC
             time.sleep(delay)
+
+    def _listener_ingest_loop(self, bot: dict, serial: str) -> None:
+        """异步 ingest：逻辑判断 + 出站，与 listener tick 解耦。"""
+        name = f"listener-ingest-{bot.get('id')}"
+        log.info("[%s] ingest 线程启动 serial=%s", name, serial)
+        while self._running.is_set():
+            try:
+                job = _LISTENER_INGEST.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            t0 = time.perf_counter()
+            try:
+                users, products, combo_rules, settings = self.ctx.snapshot()
+                rid = current_round_id(settings)
+                if not try_claim_command(job.bot_id, job.sender, job.cmd, job.cmd_y, round_id=rid):
+                    log.info("[INGEST] 重复指令跳过 sender=%s cmd=%s", job.sender, job.cmd[:32])
+                    continue
+                worker = self._workers.get(job.bot_id)
+                if not worker:
+                    continue
+                gateway_fast = job.cmd_y >= 900
+                if gateway_fast:
+                    inbar, kb = listener_pinned_send_pair(settings)
+                    input_xy = pinned_xy("listener", "input") or (360, 1234)
+                    send_xy = inbar
+                    in_group = True
+                    snap = None
+                else:
+                    snap = ui_snapshot(job.serial, chat=False)
+                    send_xy = resolve_listener_send_xy(worker.bot, settings, snap)
+                    input_xy = snap.input_xy
+                    in_group = in_target_group_chat(snap.root, worker.bot, job.serial)
+                try:
+                    from bot_ops.precision_guard import verify_cmd_rid
+
+                    ok_cmd, reason = verify_cmd_rid(job.cmd, current_round_id(settings))
+                    if not ok_cmd:
+                        log.warning("[PRECISION] 指令校核拒绝 cmd=%s reason=%s", job.cmd[:32], reason)
+                        continue
+                except Exception:
+                    pass
+                if not gateway_fast and not in_group:
+                    log.warning("[%s] ingest 不在群 cmd=%s", name, job.cmd[:24])
+                    ctx = describe_screen_context(snap.root, worker.bot, job.serial)
+                    if ctx.page == "message_list":
+                        tap_target_group_in_list(job.serial, worker.bot, scrolls=0)
+                    elif LISTENER_AUTO_RECOVER:
+                        try_recover_listener_to_group(
+                            job.serial, worker.bot, reason="ingress-off-group", force=True,
+                        )
+                    snap = ui_snapshot(job.serial, chat=False)
+                    in_group = in_target_group_chat(snap.root, worker.bot, job.serial)
+                    if not in_group:
+                        try:
+                            from bot_ops.sre_self_heal import touch_cmd_heartbeat
+
+                            touch_cmd_heartbeat("ingress_off_group", cmd=job.cmd[:32])
+                        except Exception:
+                            pass
+                        log.warning("[%s] ingest 回群失败，re-queue cmd=%s", name, job.cmd[:24])
+                        try:
+                            _LISTENER_INGEST.put_nowait(job)
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+                        continue
+                if (
+                    worker._listener_no_click()
+                    and command_needs_identity(job.cmd)
+                    and not resolve_panel_user(
+                        job.bot_id, job.sender, users, job.serial,
+                        allow_profile_read=False, bot=worker.bot,
+                    )
+                ):
+                    gw = listener_gateway_resolve(job.serial, job.bot_id, job.sender, job.cmd)
+                    if gw == "hit":
+                        reply = handle_command(
+                            job.cmd, worker.bot, users, products, combo_rules, settings, job.sender,
+                            worker._cmd_serial(job.serial), cache_serial=job.serial,
+                        )
+                        if reply:
+                            reply = with_user_header(reply, job.sender)
+                            enqueue_send(
+                                job.serial, worker.bot, reply, settings,
+                                input_xy=input_xy, send_xy=send_xy, group_ok=in_group,
+                                prio=SEND_PRIO_CMD,
+                            )
+                            log.info("[INGRESS] 已入队回复 sender=%s cmd=%s", job.sender, job.cmd[:32])
+                            try:
+                                from bot_ops.sre_self_heal import touch_cmd_heartbeat
+
+                                touch_cmd_heartbeat("ingress_reply_queued", sender=job.sender, cmd=job.cmd[:32])
+                            except Exception:
+                                pass
+                        continue
+                    mid = f"ingress:{job.sender}:{job.cmd}"
+                    worker.brain.submit_resolve_cmd(job.bot_id, job.sender, job.cmd_y, mid, job.cmd)
+                    continue
+                reply = handle_command(
+                    job.cmd, worker.bot, users, products, combo_rules, settings, job.sender,
+                    worker._cmd_serial(job.serial), cache_serial=job.serial,
+                )
+                ms = (time.perf_counter() - t0) * 1000
+                if not reply:
+                    log.info("[DEBUG] 逻辑判断完成 %.0fms 无回复 cmd=%s", ms, job.cmd[:24])
+                    continue
+                reply = with_user_header(reply, job.sender)
+                enqueue_send(
+                    job.serial, worker.bot, reply, settings,
+                    input_xy=input_xy, send_xy=send_xy, group_ok=in_group,
+                    prio=SEND_PRIO_CMD,
+                )
+                log.info("[DEBUG] 逻辑判断完成 %.0fms 已入队发送 cmd=%s", ms, job.cmd[:24])
+                try:
+                    from bot_ops.precision_guard import latency_warn_ms
+
+                    latency_warn_ms(ms, f"ingest:{job.cmd[:16]}")
+                except Exception:
+                    pass
+                post_log(f"[PROBE] 已回复: {reply[:100]}", "SUCCESS")
+            except Exception:
+                log.exception("[%s] ingest 失败 cmd=%s", name, job.cmd[:32])
 
     def _clicker_loop(self, bot: dict, serial: str) -> None:
         bid = bot["id"]
@@ -12636,6 +15787,7 @@ class Orchestrator:
                     self.brain.release_resolve_cmd(task.listener_id, task.nick, task.cmd, task.cmd_y)
 
     def start(self, active: list[dict]) -> None:
+        _reload_deploy_constants()
         active = [b for b in active if str(b.get("id") or "") not in SKIP_BOT_IDS]
         active = [b for b in active if bot_matches_deployment_role(b)]
         if BOT_ROLE:
@@ -12644,6 +15796,12 @@ class Orchestrator:
             log.info("跳过 bot: %s", ",".join(sorted(SKIP_BOT_IDS)))
         validate_deploy_roles(active)
         register_deploy_serial_roles(active)
+        try:
+            from bot_ops.time_sync import startup_time_guard
+
+            startup_time_guard()
+        except Exception as ex:
+            log.warning("time guard skip: %s", ex)
         clicker_ids = [
             b["id"] for b in active if bot_device_role(b) == "CLICKER"
         ]
@@ -12662,6 +15820,8 @@ class Orchestrator:
                 continue
             self._workers[bot["id"]] = Worker(bot, role=role, brain=self.brain)
             self._serials[bot["id"]] = serial
+            if role == "LISTENER":
+                _register_ingress_defaults(bot["id"], serial)
             by_serial[serial].append((bot, role))
             log.info(
                 "编排 %s role=%s serial=%s group=%s",
@@ -12689,6 +15849,7 @@ class Orchestrator:
 
         if PROBE_ENABLED:
             start_probe_server()
+        start_ingress_server()
         for bot in active:
             serial = self._serials.get(bot["id"])
             if not serial:
@@ -12699,6 +15860,14 @@ class Orchestrator:
                     setup_probe_adb_reverse(serial)
                     ensure_trime_installed(serial)
                     enable_probe_accessibility(serial)
+                st_ingest = threading.Thread(
+                    target=self._listener_ingest_loop,
+                    args=(bot, serial),
+                    name=f"listener-ingest-{bot['id']}",
+                    daemon=True,
+                )
+                st_ingest.start()
+                self._threads.append(st_ingest)
 
         th_log = threading.Thread(target=_log_worker_loop, name="log-worker", daemon=True)
         th_log.start()
@@ -12778,7 +15947,7 @@ class Orchestrator:
                     )
                     st_send.start()
                     self._threads.append(st_send)
-                if LISTENER_STAY_IN_GROUP:
+                if LISTENER_STAY_LOOP:
                     st_lstay = threading.Thread(
                         target=self._listener_stay_loop, args=(bot, serial),
                         name=f"listener-stay-{bot['id']}", daemon=True,
@@ -12807,11 +15976,26 @@ class Orchestrator:
                     if not serial:
                         continue
                     if is_send_bot(bot):
-                        try_recover_listener_to_group(
-                            serial, bot, reason="boot", force=True,
-                        )
+                        if not LISTENER_ZERO_NAV:
+                            try_recover_listener_to_group(
+                                serial, bot, reason="boot", force=True,
+                            )
+                        else:
+                            if not is_55m_foreground(serial):
+                                launch_messenger_app(serial)
+                            root = ui_hierarchy(serial)
+                            if describe_screen_context(root, bot, serial).page == "message_list":
+                                tap_target_group_in_list(serial, bot, scrolls=0)
                         listener_hide_keyboard(serial, reason="boot")
                     elif bot_device_role(bot) == "CLICKER":
+                        try:
+                            from bot_ops.capture_ipc import has_pending_captures
+                            from bot_ops.clicker_busy_ipc import any_clicker_busy_glob
+
+                            if any_clicker_busy_glob() or has_pending_captures():
+                                continue
+                        except Exception:
+                            pass
                         ensure_clicker_in_group(serial, bot, reason="boot")
             finally:
                 if prev is None:
@@ -12884,10 +16068,20 @@ class Worker:
     ) -> bool:
         """Listener 双机：检测是否在群；离群时限流自动回群。"""
         if is_send_only_listener(self.bot):
-            if in_target_group_chat(ui_hierarchy(serial), self.bot, serial):
+            root = ui_hierarchy(serial)
+            if in_target_group_chat(root, self.bot, serial) or listener_in_group_for_send(
+                root, self.bot, serial,
+            ):
                 return True
             if not is_55m_foreground(serial):
                 launch_messenger_app(serial)
+            if LISTENER_ZERO_NAV:
+                ctx = describe_screen_context(root, self.bot, serial)
+                if ctx.page == "message_list":
+                    return tap_target_group_in_list(serial, self.bot, scrolls=0)
+                return False
+            if not LISTENER_AUTO_RECOVER:
+                return False
             return try_recover_listener_to_group(
                 serial, self.bot, reason=reason, force=force,
             )
@@ -12927,20 +16121,13 @@ class Worker:
         combo_rules: list,
         settings: dict[str, str],
     ) -> bool:
-        """无障碍探针事件：跳过 ROI 轮询，直接处理指令。"""
+        """无障碍探针：仅入队 ingest，不阻塞下一次抓取。"""
         if not PROBE_ENABLED or self.role != "LISTENER":
             return False
         events = drain_probe_events()
         if not events:
             return False
-        snap = ui_snapshot(serial, chat=False)
-        input_xy = snap.input_xy
-        send_xy = resolve_listener_send_xy(self.bot, settings, snap)
-        in_group = in_target_group_chat(snap.root, self.bot, serial)
-        if not in_group:
-            log.warning("探针事件到达但右机不在群聊，忽略")
-            return False
-        worked = False
+        enqueued = 0
         for ev in events:
             cmd = str(ev.get("command") or "").strip()
             sender = str(ev.get("sender") or "").strip()
@@ -12948,36 +16135,21 @@ class Worker:
                 continue
             if sender and not is_plausible_sender(sender, settings, products, self.bot["id"]):
                 continue
-            if not try_claim_command(self.bot["id"], sender, cmd, 0):
-                continue
-            log.info("探针拦截 [%s] %s", sender or "?", cmd)
-            if (
-                self._listener_no_click()
-                and command_needs_identity(cmd)
-                and not resolve_panel_user(
-                    self.bot["id"], sender, users, serial,
-                    allow_profile_read=False, bot=self.bot,
+            log.info("[DEBUG] 正在解析消息 sender=%s cmd=%s", sender or "?", cmd)
+            try:
+                _LISTENER_INGEST.put_nowait(
+                    _ListenerIngestJob(
+                        bot_id=self.bot["id"],
+                        serial=serial,
+                        sender=sender,
+                        cmd=cmd,
+                        cmd_y=int(ev.get("y") or 0),
+                    )
                 )
-            ):
-                mid = f"probe:{sender}:{cmd}"
-                if self.brain.submit_resolve_cmd(self.bot["id"], sender, 0, mid, cmd):
-                    worked = True
-                continue
-            reply = handle_command(
-                cmd, self.bot, users, products, combo_rules, settings, sender,
-                self._cmd_serial(serial), cache_serial=serial,
-            )
-            if not reply:
-                continue
-            reply = with_user_header(reply, sender)
-            enqueue_send(
-                serial, self.bot, reply, settings,
-                input_xy=input_xy, send_xy=send_xy, group_ok=in_group,
-                prio=SEND_PRIO_CMD,
-            )
-            post_log(f"[PROBE] 已回复: {reply[:100]}", "SUCCESS")
-            worked = True
-        return worked
+                enqueued += 1
+            except queue.Full:
+                log.warning("ingest 队列满，丢弃探针 cmd=%s", cmd[:24])
+        return enqueued > 0
 
     def tick(
         self,
@@ -13034,11 +16206,9 @@ class Worker:
                 pending = bool(texts or draft)
                 recovered = False
                 if ctx.page == "webview":
-                    dismiss_in_app_webview(serial)
-                    invalidate_ui_cache(serial)
-                    snap = ui_snapshot(serial)
-                    ctx = describe_screen_context(snap.root, self.bot, serial)
-                    recovered = ctx.page == "target_group"
+                    log.info("右机疑似外链页，跳过 tick（不 Back） serial=%s", serial)
+                    self.in_group = False
+                    return had_work
                 elif not LISTENER_ZERO_NAV:
                     recovered = self._enter_group_for_worker(
                         serial, force=pending, reason="worker-tick-pending" if pending else "worker-tick",
@@ -13047,6 +16217,8 @@ class Worker:
                         recovered = self._enter_group_for_worker(
                             serial, force=True, reason="worker-tick-force",
                         )
+                elif ctx.page == "message_list":
+                    recovered = tap_target_group_in_list(serial, self.bot, scrolls=2)
                 if recovered:
                     invalidate_ui_cache(serial)
                     snap = ui_snapshot(serial)
@@ -13075,14 +16247,9 @@ class Worker:
             snap = ui_snapshot(serial)
             ctx = describe_screen_context(snap.root, self.bot, serial)
         elif ctx.page == "webview":
-            log.warning("右机在内嵌开奖页，系统返回")
-            dismiss_in_app_webview(serial)
-            invalidate_ui_cache(serial)
-            snap = ui_snapshot(serial)
-            texts, input_xy, send_xy, draft = snap.texts, snap.input_xy, (
-                snap.inbar_send or snap.keyboard_send
-            ), snap.draft
-            ctx = describe_screen_context(snap.root, self.bot, serial)
+            log.info("右机在内嵌开奖页，跳过 tick（不 Back）")
+            self.in_group = False
+            return had_work
         if not is_send_only_listener(self.bot) and ctx.page != "target_group":
             log.info("屏幕定位 %s", ctx.summary())
         in_group = ctx.page == "target_group"
@@ -13225,7 +16392,9 @@ class Worker:
                 log.info("认人进行中，跳过 [%s] %s @ %s", snd, cmd, mid)
                 mark_cmds_seen(self.seen_ids, msgs, cmd, snd, hint)
                 continue
-            if not try_claim_command(self.bot["id"], snd, cmd, cmd_y or 0):
+            if not try_claim_command(
+                self.bot["id"], snd, cmd, cmd_y or 0, round_id=current_round_id(settings),
+            ):
                 log.info("重复指令跳过 [%s] %s @ %s", snd, cmd, mid)
                 mark_cmds_seen(self.seen_ids, msgs, cmd, snd, hint)
                 continue
@@ -13399,13 +16568,25 @@ def active_messenger_bots(bots: list[dict]) -> list[dict]:
     ]
 
 
+def _try_exclusive_file_lock(fp) -> None:
+    """非阻塞独占锁：Linux fcntl / Windows msvcrt（与 bot_tunnel.lock 一致）。"""
+    if sys.platform == "win32":
+        import msvcrt
+
+        msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 def acquire_singleton_lock() -> None:
     """禁止多实例同时跑，避免同一条消息被回复多次。"""
     global _LOCK_FP
     os.makedirs(os.path.dirname(BOT_LOCK_FILE) or ".", exist_ok=True)
     fp = open(BOT_LOCK_FILE, "w", encoding="utf-8")
     try:
-        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _try_exclusive_file_lock(fp)
     except OSError:
         log.error("已有 bot 守护进程在运行（%s），本进程退出", BOT_LOCK_FILE)
         sys.exit(0)
@@ -13464,8 +16645,65 @@ def main_legacy() -> None:
             time.sleep(3)
 
 
+def _reload_deploy_constants() -> None:
+    """子进程 spawn 后 env 已就绪 — 刷新模块级 DEPLOY 常量。"""
+    global BOT_LISTENER_ID, CLICKER_BOT_IDS, DEPLOY_ADB_ROLES, _LISTENER_ADB_PORT, _CLICKER_ADB_PORT, BOT_ROLE
+    global CLICKER_SEND_IMAGES, CLICKER_STAY_IN_CHAT, LISTENER_AUTO_RECOVER, LISTENER_STAY_LOOP
+    global BOT_IMG_SEND_MODE, IMG_PINNED, IMG_TRUST_CLICK, IMG_LOCKED, IMG_FAST
+    global IMG_CHECK_W_SEC, IMG_SEND_W_SEC, IMG_ATTACH_W_SEC
+    global CLICKER_IMG_TAP_ONLY, CLICK_VERIFY, CLICK_VERIFY_TRIES
+    global GALLERY_OPEN_RETRIES, GALLERY_PUSH_SETTLE_SEC
+    BOT_LISTENER_ID = os.environ.get("BOT_LISTENER_ID", "bot-4").strip()
+    BOT_ROLE = os.environ.get("BOT_ROLE", "").strip().upper()
+    CLICKER_BOT_IDS = {
+        x.strip()
+        for x in os.environ.get("BOT_CLICKER_IDS", "bot-3").split(",")
+        if x.strip()
+    }
+    _LISTENER_ADB_PORT = os.environ.get("BOT_LISTENER_ADB_PORT", "58433").strip()
+    _CLICKER_ADB_PORT = os.environ.get("BOT_CLICKER_ADB_PORT", "59162").strip()
+    DEPLOY_ADB_ROLES = {
+        "bot-3": (_CLICKER_ADB_PORT, "CLICKER"),
+        "bot-4": (_LISTENER_ADB_PORT, "LISTENER"),
+    }
+    CLICKER_SEND_IMAGES = os.environ.get("BOT_CLICKER_SEND_IMAGES", "0").lower() in ("1", "true", "yes")
+    CLICKER_STAY_IN_CHAT = os.environ.get("BOT_CLICKER_STAY_IN_CHAT", "1").lower() in ("1", "true", "yes")
+    LISTENER_AUTO_RECOVER = os.environ.get("BOT_LISTENER_AUTO_RECOVER", "0").lower() in ("1", "true", "yes")
+    LISTENER_STAY_LOOP = os.environ.get("BOT_LISTENER_STAY_LOOP", "0").lower() in ("1", "true", "yes")
+    BOT_IMG_SEND_MODE = os.environ.get("BOT_IMG_SEND_MODE", "ui").lower()
+    IMG_PINNED = os.environ.get("BOT_IMG_PINNED", "1").lower() in ("1", "true", "yes")
+    IMG_TRUST_CLICK = os.environ.get("BOT_IMG_TRUST_CLICK", "1").lower() in ("1", "true", "yes")
+    IMG_LOCKED = os.environ.get("BOT_IMG_LOCKED", "1").lower() in ("1", "true", "yes")
+    IMG_FAST = os.environ.get("BOT_IMG_FAST", "1").lower() in ("1", "true", "yes")
+    IMG_CHECK_W_SEC = max(0.06, float(os.environ.get("BOT_IMG_CHECK_W_SEC", "0.10") or 0.10))
+    IMG_SEND_W_SEC = max(0.12, float(os.environ.get("BOT_IMG_SEND_W_SEC", "0.22") or 0.22))
+    IMG_ATTACH_W_SEC = max(0.20, float(os.environ.get("BOT_IMG_ATTACH_W_SEC", "0.32") or 0.32))
+    CLICKER_IMG_TAP_ONLY = os.environ.get("BOT_CLICKER_IMG_TAP_ONLY", "1").lower() in ("1", "true", "yes")
+    CLICK_VERIFY = os.environ.get("BOT_CLICK_VERIFY", "1").lower() in ("1", "true", "yes")
+    CLICK_VERIFY_TRIES = max(1, int(os.environ.get("BOT_CLICK_VERIFY_TRIES", "3") or 3))
+    GALLERY_OPEN_RETRIES = max(1, int(os.environ.get("BOT_GALLERY_OPEN_RETRIES", "3") or 3))
+    GALLERY_PUSH_SETTLE_SEC = max(0.15, float(os.environ.get("BOT_GALLERY_PUSH_SETTLE_SEC", "0.28") or 0.28))
+    if CLICKER_SEND_IMAGES and BOT_IMG_SEND_MODE in ("auto", "in_app_copy", "copy"):
+        BOT_IMG_SEND_MODE = "ui"
+
+
 def main() -> None:
+    try:
+        from bot_ops.runtime import apply_bot_start_env
+
+        apply_bot_start_env(Path(os.environ.get("BOT_ROOT", "/home/bot/55chat-bot")))
+        _reload_deploy_constants()
+    except Exception as ex:
+        log.warning("runtime env load skip: %s", ex)
     acquire_singleton_lock()
+    try:
+        from bot_ops.adb_isolated import ensure_adb_servers
+        from bot_ops.sqlite_wal import enable_wal_tree
+
+        ensure_adb_servers()
+        enable_wal_tree(Path(os.environ.get("BOT_ROOT", "/home/bot/55chat-bot")))
+    except Exception as ex:
+        log.warning("isolate/wal init skip: %s", ex)
     load_mid_cache()
     load_round_bets_persisted()
     global _MAINT_WAS_ACTIVE
@@ -13483,6 +16721,8 @@ def main() -> None:
         LISTENER_SEND_MODE if LISTENER_FAST_SEND else "off",
     )
     orch = Orchestrator()
+    global _ACTIVE_ORCH
+    _ACTIVE_ORCH = orch
     while True:
         try:
             bots = api("GET", "/api/bots")
@@ -13514,10 +16754,31 @@ if __name__ == "__main__":
         serial = resolve_serial(host)
         print(json.dumps(benchmark_ime_send(serial), ensure_ascii=False, indent=2))
     elif len(sys.argv) > 1 and sys.argv[1] == "--recover-group":
+        from bot_ops.runtime import apply_bot_start_env
+
         host = sys.argv[2] if len(sys.argv) > 2 else f"127.0.0.1:{_LISTENER_ADB_PORT}"
         serial = resolve_serial(host)
+        apply_bot_start_env(Path(os.environ.get("BOT_ROOT", Path(__file__).resolve().parent)))
+        bots = api("GET", "/api/bots") or []
+        bot = None
+        for b in active_messenger_bots(bots):
+            sh = str(b.get("adbHost") or "").strip()
+            if sh and resolve_serial_optional(sh, label="recover") == serial:
+                bot = b
+                break
+        if bot is None:
+            bot = next((b for b in active_messenger_bots(bots) if is_clicker_bot(b)), None)
+            if bot is None:
+                bot = next((b for b in active_messenger_bots(bots) if is_send_bot(b)), None)
+        if bot is None:
+            print("recover fail: no bot")
+            sys.exit(1)
         os.environ["BOT_ALLOW_LISTENER_NAV"] = "1"
-        ok = recover_listener_to_group(serial)
+        os.environ["BOT_ALLOW_CLICKER_NAV"] = "1"
+        if is_clicker_bot(bot) or is_clicker_serial(serial, bot):
+            ok = recover_clicker_to_group_minimal(serial, bot)
+        else:
+            ok = recover_listener_to_group_minimal(serial, bot)
         print("recover", "ok" if ok else "fail")
         sys.exit(0 if ok else 1)
     elif len(sys.argv) > 1 and sys.argv[1] == "--probe-test":
