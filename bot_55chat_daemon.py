@@ -5453,8 +5453,24 @@ def is_group_chat_activity(serial: str) -> bool:
     now = time.time()
     cached = _GROUP_ACTIVITY_CACHE.get(serial)
     if cached and now - cached[0] < GROUP_ACTIVITY_CACHE_SEC:
-        return cached[1]
-    ok = False
+        if cached[1]:
+            return True
+        if _resumed_activity_is_group_chat(serial):
+            _GROUP_ACTIVITY_CACHE[serial] = (now, True)
+            return True
+        return False
+    ok = _probe_group_chat_activity(serial)
+    if not ok:
+        wake_device_screen(serial)
+        invalidate_roi_cache(serial)
+        _GROUP_ACTIVITY_CACHE.pop(serial, None)
+        ok = _probe_group_chat_activity(serial)
+    _GROUP_ACTIVITY_CACHE[serial] = (now, ok)
+    return ok
+
+
+def _probe_group_chat_activity(serial: str) -> bool:
+    """dumpsys 多屏 focus 行扫描；IME/ADB 浮层时看 resumed Activity。"""
     try:
         out = adb_run(serial, "shell", "dumpsys", "window", "displays")
         for line in out.splitlines():
@@ -5462,21 +5478,15 @@ def is_group_chat_activity(serial: str) -> bool:
                 continue
             low = line.lower()
             if "groupchatactivity" in low or "group.chat" in low:
-                ok = True
-                break
-            # PopupWindow/IME/ADB Keyboard 浮层盖住群聊时，焦点行不含 GroupChatActivity
+                return True
             if any(
                 m in low
                 for m in ("popupwindow", "inputmethod", "adbkeyboard", "keyboard")
             ):
-                ok = _resumed_activity_is_group_chat(serial)
-                break
+                return _resumed_activity_is_group_chat(serial)
     except Exception:
         pass
-    if not ok:
-        ok = _resumed_activity_is_group_chat(serial)
-    _GROUP_ACTIVITY_CACHE[serial] = (now, ok)
-    return ok
+    return _resumed_activity_is_group_chat(serial)
 
 
 def _resumed_activity_is_group_chat(serial: str) -> bool:
@@ -10445,8 +10455,16 @@ def _verify_settle_fast_image_sent(
         return True
     if _settle_cloud_no_audit(serial) and not _is_gallery_media_picker_activity(serial):
         if not _verify_attach_menu_open_serial(serial):
-            log.info("发图快验：已离相册且附件栏关闭")
-            return True
+            root = ui_hierarchy(serial, force=True, channel="clicker-img")
+            if root is not None:
+                snap = ui_snapshot(serial, chat=False)
+                ib = snap.input_bounds
+                y_max = (ib[1] - 16) if ib else 0
+                if y_max > 0 and _count_chat_media_bubbles(root, y_max) >= 1:
+                    log.info("发图快验：离相册后媒体气泡验真成功")
+                    return True
+            log.warning("发图快验：离相册但聊天区未见媒体气泡")
+            return False
     if _settle_cloud_no_audit(serial):
         log.warning("发图快验：云机不审但指纹未变且仍在相册/附件栏")
         return False
@@ -14636,6 +14654,7 @@ def guard_listener_no_nav(serial: str, bot: dict, action: str) -> bool:
 def ensure_group_for_send(serial: str, bot: dict) -> bool:
     """发送前入群：Listener 双机模式检测并在离群时限流自动回群；左机发图可导航回群。"""
     if is_send_only_listener(bot):
+        wake_device_screen(serial)
         root = ui_hierarchy(serial)
         if listener_in_group_for_send(root, bot, serial):
             return True
@@ -14644,6 +14663,19 @@ def ensure_group_for_send(serial: str, bot: dict) -> bool:
         ctx = describe_screen_context(root, bot, serial)
         if ctx.page == "message_list":
             tap_target_group_in_list(serial, bot, scrolls=0)
+            return listener_in_group_for_send(ui_hierarchy(serial), bot, serial)
+        if ctx.page == "wrong_chat" and (
+            is_group_chat_activity(serial)
+            or _title_looks_like_unread_badge(ctx.title)
+        ):
+            dismiss_listener_blockers(serial, root)
+            root = ui_hierarchy(serial)
+            if listener_in_group_for_send(root, bot, serial) or _likely_target_group_surface(
+                root, bot, serial
+            ):
+                return True
+        if ctx.page in ("wrong_chat", "other", "profile"):
+            recover_listener_to_group_minimal(serial, bot)
             return listener_in_group_for_send(ui_hierarchy(serial), bot, serial)
         log.warning(
             "纯发送机未在目标群 %s（请手动停留在群聊界面）",
@@ -14957,6 +14989,7 @@ class Orchestrator:
                 if is_clicker_bot(bot) or is_clicker_serial(serial, bot) or in_maintenance_window():
                     time.sleep(ANNOUNCE_LOOP_SEC)
                     continue
+                wake_device_screen(serial)
                 _, _, _, settings = self.ctx.snapshot()
                 snap = ui_snapshot(serial, chat=False, channel="announce")
                 root = snap.root
@@ -14992,6 +15025,17 @@ class Orchestrator:
                                 root = snap.root
                             else:
                                 log.warning("[%s] 列表点群失败 group=%s", name, bot.get("associatedGroup"))
+                        elif LISTENER_ZERO_NAV and ctx_page == "wrong_chat":
+                            if is_group_chat_activity(serial) or _title_looks_like_unread_badge(
+                                ctx_ann.title
+                            ):
+                                dismiss_listener_blockers(serial, root)
+                                snap = ui_snapshot(serial, chat=True, channel="announce")
+                                root = snap.root
+                            else:
+                                recover_listener_to_group_minimal(serial, bot)
+                                snap = ui_snapshot(serial, chat=True, channel="announce")
+                                root = snap.root
                         elif not LISTENER_ZERO_NAV and LISTENER_AUTO_RECOVER and ctx_page != "target_group":
                             try_recover_listener_to_group(serial, bot, reason="announce-loop", force=True)
                             snap = ui_snapshot(serial, chat=False, channel="announce")
@@ -15071,6 +15115,7 @@ class Orchestrator:
             job = outbound_for(serial).get(timeout=0.25)
             if not job:
                 continue
+            wake_device_screen(serial)
             if _is_announce_outbound_job(job) and is_clicker_serial(job.serial, job.bot):
                 routed = _reroute_announce_off_clicker(job)
                 if routed:
