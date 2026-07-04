@@ -12,13 +12,13 @@
     "adb_server_port": 5038
   },
   "left": {
-    "pad_code": "APPSA148R269OR35",
-    "pad_code_legacy": "APP5AU4BB269OR35",
+    "pad_code": "APP5AU4BB269OR35",
+    "pad_code_legacy": "APPSA148R269OR35",
     "role": "CLICKER",
     "bot_id": "bot-3",
     "match_android": 15,
     "match_egress_ip": "195.114.193.136",
-    "local_port": 52840,
+    "local_port": 55612,
     "adb_server_port": 5039,
     "expect_model": "Pixel XL"
   }

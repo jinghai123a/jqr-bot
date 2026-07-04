@@ -12958,6 +12958,8 @@ def process_round_close_announce(
         return
     if not current_round_open_gate(group, rid):
         return
+    if _WARN_ANNOUNCED_ROUND.get(group) != rid:
+        return
     tpl = (settings.get("closeAnnounceTemplate") or DEFAULT_CLOSE_ANNOUNCE).strip()
     if not tpl:
         return
@@ -13011,6 +13013,9 @@ def process_round_open_announce(
     if not OPEN_ANNOUNCE_ENABLED:
         return
     if is_clicker_bot(bot):
+        return
+    # 左机结算链：新的一局仅由 open_after_settle 在三图后发出，禁止定时 open 抢序
+    if CLICKER_SETTLE_ENABLED and SETTLE_CAPTURE_ENABLED:
         return
     if in_maintenance_window():
         return
@@ -13212,10 +13217,29 @@ def _clicker_bot_ids() -> set[str]:
     return set(CLICKER_BOT_IDS)
 
 
+def _align_deploy_adb_hosts(active: list[dict]) -> None:
+    """面板 adbHost 滞后时，以 bot-start.env 端口为准对齐（避免 DEPLOY LOCK 卡死）。"""
+    desired: dict[str, str] = {
+        BOT_LISTENER_ID: f"localhost:{_LISTENER_ADB_PORT}",
+    }
+    for bid in CLICKER_BOT_IDS:
+        desired[bid] = f"localhost:{_CLICKER_ADB_PORT}"
+    for bot in active:
+        bid = str(bot.get("id") or "")
+        want = desired.get(bid)
+        if not want:
+            continue
+        cur = str(bot.get("adbHost") or "")
+        if want not in cur:
+            log.warning("DEPLOY LOCK align %s adbHost %s -> %s", bid, cur or "?", want)
+            bot["adbHost"] = want
+
+
 def validate_deploy_roles(active: list[dict]) -> None:
     """启动时校验 DEPLOY LOCK，防止左右机角色/端口被调换。"""
     if not ORCHESTRATOR:
         return
+    _align_deploy_adb_hosts(active)
     by_id = {str(b.get("id") or ""): b for b in active}
     dual = os.environ.get("BOT_DUAL_PROCESS", "0").lower() in ("1", "true", "yes")
     if dual and len(by_id) == 1:
@@ -13845,8 +13869,13 @@ class Orchestrator:
                         continue
                     if job.kind == "warn" and _WARN_ANNOUNCED_ROUND.get(group) == job.round_id:
                         continue
-                    if job.kind == "close" and _CLOSE_ANNOUNCED_ROUND.get(group) == job.round_id:
-                        continue
+                    if job.kind == "close":
+                        if _CLOSE_ANNOUNCED_ROUND.get(group) == job.round_id:
+                            continue
+                        if _WARN_ANNOUNCED_ROUND.get(group) != job.round_id:
+                            outbound_enqueue(job)
+                            time.sleep(0.05)
+                            continue
                 except Exception:
                     pass
             if (
@@ -13864,28 +13893,12 @@ class Orchestrator:
                 time.sleep(0.03)
                 continue
             if (
-                job.kind in ("warn", "close", "open", "open_after_settle")
-                and job.kind != "open_after_settle"
+                job.kind in ("warn", "close", "open")
                 and (_any_clicker_img_flow_busy() or settle_announce_chain_busy(serial))
             ):
-                if _any_clicker_img_flow_busy():
-                    outbound_enqueue(job)
-                    time.sleep(0.12)
-                    continue
-                now_busy = time.time()
-                defer_until = _ANNOUNCE_BUSY_DEFER_UNTIL.get(serial, 0.0)
-                if defer_until <= 0:
-                    _ANNOUNCE_BUSY_DEFER_UNTIL[serial] = now_busy + ANNOUNCE_BUSY_DEFER_SEC
-                    defer_until = _ANNOUNCE_BUSY_DEFER_UNTIL[serial]
-                if now_busy < defer_until:
-                    outbound_enqueue(job)
-                    time.sleep(0.08)
-                    continue
-                _ANNOUNCE_BUSY_DEFER_UNTIL.pop(serial, None)
-                log.info(
-                    "[%s] 左机发图中仍发公告 kind=%s rid=%s",
-                    name, job.kind, job.round_id,
-                )
+                outbound_enqueue(job)
+                time.sleep(0.12 if _any_clicker_img_flow_busy() else 0.08)
+                continue
             if not job.image_paths and not job.image_path and job.kind in (
                 "warn", "close", "open", "open_after_settle",
             ):

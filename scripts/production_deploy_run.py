@@ -28,6 +28,9 @@ UPLOAD = (
     "bot_ops/config.py",
     "bot_ops/ssh_client.py",
     "config/vmos-pads.json",
+    "config/tunnel-left.env",
+    "scripts/watch-adb-tunnels.sh",
+    "scripts/vps_minimal_cron.sh",
     "config/pinned-coords.json",
     "scripts/tunnel-connect-official.sh",
     "scripts/tunnel-left.sh",
@@ -49,7 +52,7 @@ ENV_KV = (
     "BOT_CLICKER_SETTLE=1",
     "BOT_LISTENER_ZERO_NAV=1",
     "BOT_LISTENER_ADB_PORT=58433",
-    "BOT_CLICKER_ADB_PORT=52840",
+    "BOT_CLICKER_ADB_PORT=55612",
     "BOT_SRE_HEAL_COOLDOWN_SEC=300",
     "BOT_ANNOUNCE_LOCKED=1",
     "BOT_IMG_TRUST_CLICK=1",
@@ -124,19 +127,34 @@ def main() -> int:
                 f"echo '{k}={v}' >> {R}/config/bot-start.env",
                 12,
             )
+        ssh.run(
+            f"sed -i 's/\"adb_port\": 52840/\"adb_port\": 55612/g; "
+            f"s/127.0.0.1:52840/127.0.0.1:55612/g; "
+            f"s/localhost:52840/localhost:55612/g' "
+            f"{R}/config/device-lock.json 2>/dev/null; echo device_lock_patched",
+            12,
+        )
         ssh.run(f"{PY} {R}/scripts/patch_speed_env.py 2>&1 | tail -5", 30)
         step("env", True, ssh.run(f"grep -E 'MANUAL_IN_GROUP|CLICKER_SEND|EDGE_ADB|LISTENER_ADB|CLICKER_ADB' {R}/config/bot-start.env", 15))
 
+        ssh.run(f"bash {R}/scripts/vps_minimal_cron.sh 2>&1 | tail -8", 30)
+
         recon = ssh.run(f"bash {R}/scripts/reconnect-dual-adb.sh 2>&1", 180)
-        adb = ssh.run("adb devices -l", 20)
-        ok_adb = lport in adb and rport in adb
+        adb = ssh.run(
+            f"adb -P 5038 devices -l; echo '---'; adb -P 5039 devices -l",
+            20,
+        )
+        ok_adb = lport in adb and rport in adb and "device" in adb
         step("tunnels", ok_adb, f"{recon[-1500:]}\n{adb}")
 
         if not ok_adb:
             for script in ("tunnel-right.sh", "tunnel-left.sh"):
                 ssh.run(f"bash {R}/scripts/{script} 2>&1", 90)
-            adb = ssh.run("adb devices -l", 20)
-            ok_adb = lport in adb and rport in adb
+            adb = ssh.run(
+                f"adb -P 5038 devices -l; echo '---'; adb -P 5039 devices -l",
+                20,
+            )
+            ok_adb = lport in adb and rport in adb and "device" in adb
             step("tunnels_retry", ok_adb, adb)
 
         ssh.run(f"bash {R}/scripts/edge_brain_start.sh 2>&1 | tail -3", 25)

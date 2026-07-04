@@ -11,9 +11,12 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import json
+
 from bot_ops.config import load_vps_config
 from bot_ops.ssh_client import VpsSSH
 from bot_tunnel import (
+    load_env_file,
     parse_ssh_command,
     rewrite_adb_connect_port,
     rewrite_ssh_forward_port,
@@ -21,10 +24,41 @@ from bot_tunnel import (
 )
 
 R = "/home/bot/55chat-bot"
-SIDES = {
-    "right": {"canonical": "58433", "bind": "195.114.193.237", "tunnel": "tunnel-right.sh", "adb_p": "5038"},
-    "left": {"canonical": "52840", "bind": "195.114.193.136", "tunnel": "tunnel-left.sh", "adb_p": "5039"},
-}
+
+
+def _canonical_ports() -> dict[str, str]:
+    pads_path = ROOT / "config" / "vmos-pads.json"
+    pads = json.loads(pads_path.read_text(encoding="utf-8")) if pads_path.exists() else {}
+    bot_env = load_env_file(ROOT / "config" / "bot-start.env")
+    return {
+        "right": str(
+            (pads.get("right") or {}).get("local_port")
+            or bot_env.get("BOT_LISTENER_ADB_PORT", "58433")
+        ),
+        "left": str(
+            (pads.get("left") or {}).get("local_port")
+            or bot_env.get("BOT_CLICKER_ADB_PORT", "55612")
+        ),
+    }
+
+
+def _side_meta() -> dict[str, dict]:
+    ports = _canonical_ports()
+    pads = json.loads((ROOT / "config" / "vmos-pads.json").read_text(encoding="utf-8"))
+    return {
+        "right": {
+            "canonical": ports["right"],
+            "bind": str((pads.get("right") or {}).get("match_egress_ip") or "195.114.193.237"),
+            "tunnel": "tunnel-right.sh",
+            "adb_p": "5038",
+        },
+        "left": {
+            "canonical": ports["left"],
+            "bind": str((pads.get("left") or {}).get("match_egress_ip") or "195.114.193.136"),
+            "tunnel": "tunnel-left.sh",
+            "adb_p": "5039",
+        },
+    }
 
 
 def _side_from_env(side: str) -> tuple[str, str, str]:
@@ -34,13 +68,14 @@ def _side_from_env(side: str) -> tuple[str, str, str]:
     adb_cmd = (os.environ.get(f"{prefix}_ADB_COMMAND") or "").strip()
     if not ssh_cmd or not ssh_pass:
         raise SystemExit(f"需要环境变量 {prefix}_SSH_COMMAND / {prefix}_SSH_PASS")
+    sides = _side_meta()
     if not adb_cmd:
-        adb_cmd = f"adb connect localhost:{SIDES[side]['canonical']}"
+        adb_cmd = f"adb connect localhost:{sides[side]['canonical']}"
     return ssh_cmd, ssh_pass, adb_cmd
 
 
 def _write_env(side: str, td: Path) -> Path:
-    cfg = SIDES[side]
+    cfg = _side_meta()[side]
     ssh_cmd, ssh_pass, adb_raw = _side_from_env(side)
     norm_ssh = rewrite_ssh_forward_port(ssh_cmd, cfg["canonical"])
     norm_adb = rewrite_adb_connect_port(adb_raw, cfg["canonical"])
@@ -68,6 +103,7 @@ def _write_env(side: str, td: Path) -> Path:
 def main() -> int:
     which = (os.environ.get("TUNNEL_SIDES") or "both").strip().lower()
     sides = ["right", "left"] if which == "both" else [which]
+    side_meta = _side_meta()
 
     cfg = load_vps_config(ROOT)
     py = f"{R}/.venv/bin/python3"
@@ -89,18 +125,18 @@ def main() -> int:
                 remote = f"{R}/config/tunnel-{side}.env"
                 ssh.sftp_put(str(env_path), remote)
                 ssh.run(f"chmod 600 {remote}", 10)
-                print(f"uploaded tunnel-{side}.env -> {SIDES[side]['canonical']}")
+                print(f"uploaded tunnel-{side}.env -> {side_meta[side]['canonical']}")
 
             ssh.run("pkill -f vmos-refresh-tunnels.py 2>/dev/null || true", 10)
             ssh.run(f"rm -f {R}/logs/.vmos-refresh.lock", 8)
 
             for side in sides:
-                port = SIDES[side]["canonical"]
+                port = side_meta[side]["canonical"]
                 ssh.run(f"pkill -f 'ssh.*{port}:' 2>/dev/null || true", 10)
             ssh.run("sleep 2", 5)
 
             for side in sides:
-                script = SIDES[side]["tunnel"]
+                script = side_meta[side]["tunnel"]
                 print(f">>> bash scripts/{script}")
                 out = ssh.run(f"bash {R}/scripts/{script} 2>&1", 90)
                 print(out[-1500:] if len(out) > 1500 else out)
@@ -124,7 +160,8 @@ def main() -> int:
                 print(">>> skip vmos-refresh (TUNNEL_SKIP_API_REFRESH)")
 
             print(">>> verify")
-            print(ssh.run("ss -tlnp | grep -E '52840|58433' || echo NO_PORTS", 15))
+            ports = side_meta["left"]["canonical"], side_meta["right"]["canonical"]
+            print(ssh.run(f"ss -tlnp | grep -E '{ports[0]}|{ports[1]}' || echo NO_PORTS", 15))
             print(ssh.run("adb -P 5038 devices -l; adb -P 5039 devices -l", 20))
 
             print(">>> reload workers")

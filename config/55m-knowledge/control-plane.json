@@ -1,6 +1,6 @@
 {
   "bots": {
-    "bot-3": {"role": "CLICKER", "adb_port": 52840, "adb_server": 5039, "serial": "127.0.0.1:52840"},
+    "bot-3": {"role": "CLICKER", "adb_port": 55612, "adb_server": 5039, "serial": "127.0.0.1:55612"},
     "bot-4": {"role": "LISTENER", "adb_port": 58433, "adb_server": 5038, "serial": "127.0.0.1:58433"}
   },
   "ports": {
