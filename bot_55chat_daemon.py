@@ -10229,9 +10229,8 @@ def _send_chat_images_ui_batch(
             clicker_w(0.35, 0.55) if IMG_FAST else clicker_w(0.8, 1.0)
             already_gallery = _verify_gallery_picker_open(serial)
         if not already_gallery and not _open_chat_image_picker(serial, bot, settings, input_xy):
-            if not (IMG_TRUST_CLICK and is_clicker_serial(serial)):
-                return False
-            log.warning("发图：相册未打开仍继续勾选（信任点击）")
+            log.warning("发图：相册未打开，取消批量发送")
+            return False
         _scroll_picker_for_newest(serial, times=1)
         clicker_w(0.1, 0.12) if is_clicker_serial(serial) else w(0.35, 0.12)
 
@@ -10245,6 +10244,13 @@ def _send_chat_images_ui_batch(
             log.warning("批量发图未点到发送按钮")
             return False
         clicker_w(0.22, 0.34) if is_clicker_serial(serial) else w(0.45, 0.15)
+        if is_clicker_serial(serial):
+            for _ in range(3):
+                if not _verify_gallery_picker_open_serial(serial):
+                    break
+                device_safe_back(serial, reason="gallery-send→群聊")
+                clicker_w(0.28, 0.45)
+                invalidate_step_verify_cache(serial)
 
         if IMG_TRUST_CLICK and is_clicker_serial(serial):
             if _wait_outgoing_images_delivered(
@@ -10261,6 +10267,12 @@ def _send_chat_images_ui_batch(
                 return True
             if _batch_newly_visible_in_chat():
                 post_log(f"[ADB] 批量发图成功 {len(paths)}张(群聊已见)", "SUCCESS")
+                ok = True
+                return True
+            fp_after = _screencap_bottom_fingerprint(serial)
+            if fp_before and fp_after and fp_before != fp_after:
+                log.info("批量发图区指纹变化，视为成功 %d 张", len(paths))
+                post_log(f"[ADB] 批量发图成功 {len(paths)}张(指纹)", "SUCCESS")
                 ok = True
                 return True
             log.warning("批量发图上传未确认(可能红圈失败)，他端不可见")
@@ -10425,6 +10437,21 @@ def _attach_menu_icon_count(root: ET.Element | None) -> int:
     return n
 
 
+def _attach_menu_label_hits(texts: list[str]) -> int:
+    """附件栏短标签命中数（排除群聊长文案误含「图片」）。"""
+    hits = 0
+    for t in texts:
+        s = t.strip()
+        if not s or len(s) > 20:
+            continue
+        if s in ATTACH_MENU_MARKERS:
+            hits += 1
+            continue
+        if s in ("图片", "拍摄", "照片", "图库"):
+            hits += 1
+    return hits
+
+
 def _verify_attach_menu_open_serial(serial: str) -> bool:
     root = ui_hierarchy(serial, force=True, channel="clicker-img")
     if root is None:
@@ -10433,14 +10460,15 @@ def _verify_attach_menu_open_serial(serial: str) -> bool:
         return False
     sh = screen_height(root)
     texts = collect_ui_texts_in_band(root, int(sh * 0.45), sh - 40)
-    if any("图片" in t for t in texts):
-        return True
+    label_hits = _attach_menu_label_hits(texts)
     icons = _attach_menu_icon_count(root)
+    if label_hits >= 2:
+        return True
+    if label_hits >= 1 and icons >= 1:
+        return True
     if icons >= 3:
         return True
-    if icons >= 2 and any(
-        any(m in t for t in texts) for m in ("拍摄", "名片", "文件")
-    ):
+    if icons >= 2 and label_hits >= 1:
         return True
     # W49: 55M 附件菜单用自定义视图，uiautomator 无法检测图标。
     # 备选方案：检测输入栏是否被顶到中间（菜单打开时 y < 0.55*sh，关闭时 y > 0.85*sh）
@@ -10458,8 +10486,12 @@ def _verify_attach_menu_open_serial(serial: str) -> bool:
             if keyboard_chars >= 10:
                 log.debug("附件菜单检测: 输入栏在中间但检测到键盘(%d个字母键)", keyboard_chars)
                 return False
-            log.debug("附件菜单检测(输入栏位置): y=%d < %d，判定已打开", input_y, int(sh * 0.55))
-            return True
+            if label_hits >= 1 or icons >= 2:
+                log.debug(
+                    "附件菜单检测(输入栏位置): y=%d labels=%d icons=%d",
+                    input_y, label_hits, icons,
+                )
+                return True
     return False
 
 
@@ -10642,23 +10674,79 @@ def resolve_clicker_attach_image_xy(serial: str) -> tuple[int, int]:
     if root is not None and not _clicker_composer_raised(root):
         pt = pinned_attach_image_xy()
     else:
-        pt = pinned_attach_image_xy()
+        pt = (
+            pinned_xy("clicker", "attach_image_raised")
+            or pinned_attach_image_xy()
+        )
     return pt
 
 
 def clicker_fire_attach_image(serial: str) -> bool:
     """附件栏已开：立即点「图片」，不做多轮 recover。"""
+    candidates: list[tuple[int, int, str]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add(x: int, y: int, tag: str) -> None:
+        key = (x, y)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((x, y, tag))
+
+    root = ui_hierarchy(serial, force=True, channel="clicker-img")
+    if root is not None:
+        y_lo, y_hi = _attach_menu_band(root)
+        icons: list[tuple[int, int, int]] = []
+        for node in root.iter("node"):
+            if node.attrib.get("clickable") != "true":
+                continue
+            cls = node.attrib.get("class") or ""
+            if "Image" not in cls:
+                continue
+            b = parse_bounds(node.attrib.get("bounds", ""))
+            if not b:
+                continue
+            x1, y1, x2, y2 = b
+            cy = (y1 + y2) // 2
+            if cy < y_lo or cy > y_hi:
+                continue
+            cw, ch = x2 - x1, y2 - y1
+            if 40 <= cw <= 180 and 40 <= ch <= 180:
+                icons.append((x1, cy, *node_center(b)))
+        if icons:
+            icons.sort(key=lambda t: (t[1], t[0]))
+            cx, cy = icons[0][2], icons[0][3]
+            add(cx, cy, "screen_icon0")
     ix, iy = resolve_clicker_attach_image_xy(serial)
-    clicker_tap_pinned(serial, ix, iy, "attach_image")
-    # W49: 55M 自定义 UI 导致验证不可靠，等待更长时间再验证
-    clicker_w(0.8, 1.2)  # 从 0.06-0.12 增加到 0.8-1.2 秒
-    invalidate_step_verify_cache(serial)
-    if _verify_gallery_picker_open(serial):
-        return True
-    # 验证失败时，再等待并重试验证一次（55M 加载慢）
-    clicker_w(0.5, 0.8)
-    invalidate_step_verify_cache(serial)
-    return _verify_gallery_picker_open(serial)
+    add(ix, iy, "resolve")
+    for pt, tag in (
+        (pinned_xy("clicker", "attach_image"), "pinned"),
+        (pinned_xy("clicker", "attach_image_bottom"), "pinned_bottom"),
+        ((72, 720), "legacy_raised"),
+        (pinned_xy("clicker", "attach_image_raised"), "pinned_raised"),
+        ((90, 800), "mid_fb"),
+    ):
+        if pt:
+            add(pt[0], pt[1], tag)
+    for ix, iy, tag in candidates:
+        clicker_tap_pinned(serial, ix, iy, f"attach_image_{tag}")
+        clicker_w(0.8, 1.2)
+        invalidate_step_verify_cache(serial)
+        if _verify_gallery_picker_open(serial):
+            log.info("点图片进相册 @(%d,%d) tag=%s", ix, iy, tag)
+            return True
+        root2 = ui_hierarchy(serial, force=True, channel="clicker-img")
+        if _is_gallery_fullscreen_viewer(root2):
+            device_safe_back(serial, reason="单张浏览→网格")
+            clicker_w(0.55, 0.70)
+            invalidate_step_verify_cache(serial)
+            if _verify_gallery_picker_open(serial):
+                log.info("点图片进相册(单张返回) @(%d,%d) tag=%s", ix, iy, tag)
+                return True
+        if _count_gallery_thumbnails(root2) >= 3:
+            log.info("点图片见缩略图网格 @(%d,%d) tag=%s", ix, iy, tag)
+            return True
+    return False
 
 
 def resolve_clicker_chat_plus_xy(serial: str) -> tuple[int, int]:
@@ -10705,8 +10793,10 @@ def clicker_tap_plus_until_attach_menu(
         if _verify_gallery_picker_open(serial):
             return True
         root = ui_hierarchy(serial, force=True, channel="clicker-img")
-        if _attach_menu_icon_count(root) >= 3:
-            log.info("附件菜单已开(图标计数)，跳过点+")
+        sh = screen_height(root) if root is not None else 1280
+        band_texts = collect_ui_texts_in_band(root, int(sh * 0.45), sh - 40) if root else []
+        if _attach_menu_icon_count(root) >= 3 and _attach_menu_label_hits(band_texts) >= 1:
+            log.info("附件菜单已开(图标+标签)，跳过点+")
             return True
         layout = "raised" if (_clicker_composer_raised(root) or _clicker_emoji_panel_open(root)) else "bottom"
         coords_try = _clicker_plus_coord_candidates(serial)
@@ -10888,9 +10978,7 @@ def _attach_menu_visible(root: ET.Element | None) -> bool:
         return False
     sh = screen_height(root)
     texts = collect_ui_texts_in_band(root, int(sh * 0.45), sh - 40)
-    if not any("图片" in t for t in texts):
-        return False
-    return any(any(m in t for t in texts) for m in ATTACH_MENU_MARKERS[1:3])
+    return _attach_menu_label_hits(texts) >= 2
 
 
 def _verify_gallery_picker_open_serial(serial: str) -> bool:
@@ -10999,45 +11087,60 @@ def _resolve_plus_xy(
     return px, py
 
 
-def _open_chat_image_picker_trust(serial: str) -> bool:
-    """W49：信任钉死坐标点击，跳过 uiautomator 验证（55M 自定义 UI 不可靠）。
-    
-    验证坐标 (720x1280 屏幕):
-    - chat_plus: (45, 1235) - 输入栏左侧+按钮
-    - attach_image: (72, 720) - 附件菜单第一个图标(图片)
-    """
-    # 使用验证过的固定坐标；优先读 config/pinned-coords.json，避免分支漂移。
-    px, py = pinned_xy("clicker", "chat_plus") or (45, 1235)
-    ix, iy = pinned_attach_image_xy()
-    if _verify_gallery_picker_open(serial):
-        log.info("发图信任模式：已在相册网格")
-        return True
-    if _verify_attach_menu_open(serial):
-        log.info("发图信任模式：附件栏已开，直接点图片 @(%d,%d)", ix, iy)
-        clicker_tap_pinned(serial, ix, iy, "trust_image_from_menu")
-        clicker_w(0.55, 0.85) if IMG_FAST else clicker_w(1.5, 2.0)
-    else:
-        log.info("发图信任模式: + @(%d,%d) 图片 @(%d,%d)", px, py, ix, iy)
-        clicker_tap_pinned(serial, px, py, "trust_plus")
-        clicker_w(0.35, 0.55) if IMG_FAST else clicker_w(1.0, 1.2)
-        clicker_tap_pinned(serial, ix, iy, "trust_image")
-        clicker_w(0.55, 0.85) if IMG_FAST else clicker_w(1.5, 2.0)
-    invalidate_step_verify_cache(serial)
+def _gallery_open_confirmed(serial: str) -> bool:
     root = ui_hierarchy(serial, force=True, channel="clicker-img")
-    if _is_gallery_fullscreen_viewer(root):
-        log.warning("发图信任模式进入单张浏览，返回网格")
+    if root is not None and _is_gallery_fullscreen_viewer(root):
         device_safe_back(serial, reason="单张浏览→网格")
         clicker_w(0.55, 0.70)
         invalidate_step_verify_cache(serial)
-    ok = _verify_gallery_picker_open(serial)
-    if ok:
-        log.info("发图信任模式：已确认相册网格")
-    elif IMG_TRUST_CLICK:
-        log.info("发图信任模式：未验网格仍继续（BOT_IMG_TRUST_CLICK）")
+        root = ui_hierarchy(serial, force=True, channel="clicker-img")
+    if _verify_gallery_picker_open(serial):
         return True
-    else:
-        log.warning("发图信任模式：未确认相册网格")
-    return ok
+    return _count_gallery_thumbnails(root) >= 3
+
+
+def _open_chat_image_picker_trust(serial: str) -> bool:
+    """W49：信任钉死 + fire 进相册；须见到网格才继续（禁止盲勾选）。"""
+    if _gallery_open_confirmed(serial):
+        log.info("发图信任模式：已在相册网格")
+        return True
+    for attempt in range(3):
+        if attempt:
+            dismiss_soft_keyboard(serial)
+            clicker_hide_keyboard_for_attach(serial)
+            invalidate_step_verify_cache(serial)
+        if _gallery_open_confirmed(serial):
+            log.info("发图信任模式：已确认相册网格 try=%d", attempt + 1)
+            return True
+        if clicker_fire_attach_image(serial) and _gallery_open_confirmed(serial):
+            log.info("发图信任模式：快速 fire 进相册 try=%d", attempt + 1)
+            return True
+        if _verify_attach_menu_open(serial):
+            ix, iy = resolve_clicker_attach_image_xy(serial)
+            log.info("发图信任模式：附件栏已开，点图片 @(%d,%d) try=%d", ix, iy, attempt + 1)
+            if clicker_fire_attach_image(serial) and _gallery_open_confirmed(serial):
+                log.info("发图信任模式：附件栏 fire 进相册 try=%d", attempt + 1)
+                return True
+            clicker_tap_pinned(serial, ix, iy, "trust_image_from_menu")
+            clicker_w(0.8, 1.2)
+            invalidate_step_verify_cache(serial)
+        else:
+            px, py = resolve_clicker_chat_plus_xy(serial)
+            ix, iy = resolve_clicker_attach_image_xy(serial)
+            log.info("发图信任模式: + @(%d,%d) 图片 @(%d,%d) try=%d", px, py, ix, iy, attempt + 1)
+            clicker_tap_plus_until_attach_menu(serial, max_tries=2)
+        if clicker_fire_attach_image(serial) and _gallery_open_confirmed(serial):
+            log.info("发图信任模式：fire 进相册 try=%d", attempt + 1)
+            return True
+        ix, iy = resolve_clicker_attach_image_xy(serial)
+        clicker_tap_pinned(serial, ix, iy, "trust_image_direct")
+        clicker_w(0.8, 1.2)
+        invalidate_step_verify_cache(serial)
+        if _gallery_open_confirmed(serial):
+            log.info("发图信任模式：直接点图片进相册 try=%d", attempt + 1)
+            return True
+        log.warning("发图信任模式：相册未确认 try=%d/3", attempt + 1)
+    return False
 
 
 def _open_chat_image_picker(
@@ -11420,11 +11523,11 @@ def _select_gallery_image_checkboxes(serial: str, count: int) -> int:
         log.warning("发图未确认相册网格，取消本次勾选")
         return 0
     if not _verify_gallery_picker_open(serial):
-        if IMG_TRUST_CLICK and is_clicker_serial(serial):
-            log.info("发图信任：未验网格仍勾选")
-        else:
+        root_chk = ui_hierarchy(serial, force=True, channel="clicker-img")
+        if _count_gallery_thumbnails(root_chk) < 3:
             log.warning("发图未确认相册网格，取消本次勾选")
             return 0
+        log.info("发图：见缩略图网格，继续勾选")
 
     dynamic_pts = _resolve_gallery_toprow_checkpoints(root, count)
     pinned_pts: list[tuple[int, int]] = []
@@ -11445,7 +11548,7 @@ def _select_gallery_image_checkboxes(serial: str, count: int) -> int:
     if tap_pts and BOT_IMG_NEWEST_AT == "top" and len(tap_pts) >= 2:
         tap_pts = list(reversed(tap_pts[:count]))
 
-    if tap_pts and is_clicker_serial(serial) and IMG_TRUST_CLICK and not IMG_LOCKED:
+    if tap_pts and is_clicker_serial(serial) and IMG_TRUST_CLICK:
         for i, (tx, ty) in enumerate(tap_pts[:count]):
             clicker_tap_pinned(serial, tx, ty, f"gallery_check_{i + 1}")
             clicker_w(0.14, 0.22)

@@ -7,6 +7,7 @@
     "chat_plus_raised": [45, 654],
     "attach_image": [90, 1110],
     "attach_image_bottom": [90, 1110],
+    "attach_image_raised": [72, 720],
     "gallery_check_top3": [[654, 374], [429, 374], [205, 374]],
     "gallery_batch_send": [668, 1210],
     "header_back": [34, 86],
