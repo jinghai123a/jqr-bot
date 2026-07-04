@@ -2964,8 +2964,10 @@ def settle_round(
                             break
                 except Exception:
                     pass
-                for s in (f"127.0.0.1:{cp}", f"localhost:{cp}"):
-                    return s, cb
+                for host in (f"localhost:{cp}", f"127.0.0.1:{cp}"):
+                    resolved = resolve_serial_optional(host, label="clicker-settle")
+                    if resolved:
+                        return resolved, cb
             log.warning("左机发图不可用，本批截图跳过（右机仅发文字公告）")
             return "", bot
         return serial, bot
@@ -5307,6 +5309,33 @@ def resolve_messenger_pkg(serial: str) -> str | None:
     return None
 
 
+def _launch_messenger_pkg(serial: str, pkg: str) -> bool:
+    """拉起 55M：resolve-activity / monkey（wuwu 包 am start -p 常失败）。"""
+    if not pkg:
+        return False
+    component = ""
+    try:
+        out = adb_run(serial, "shell", "cmd", "package", "resolve-activity", "--brief", pkg)
+        for line in out.splitlines():
+            line = line.strip()
+            if "/" in line and not line.startswith("priority"):
+                component = line
+                break
+    except Exception:
+        component = ""
+    if component:
+        adb_run(serial, "shell", "am", "start", "-n", component)
+        w(2.0, 0.65)
+        if is_55m_foreground(serial) or in_messenger_app(ui_hierarchy(serial), serial):
+            return True
+    adb_run(
+        serial, "shell", "monkey", "-p", pkg,
+        "-c", "android.intent.category.LAUNCHER", "1",
+    )
+    w(2.0, 0.65)
+    return is_55m_foreground(serial) or in_messenger_app(ui_hierarchy(serial), serial)
+
+
 def force_restart_messenger(serial: str, *, reason: str = "") -> bool:
     """am force-stop 后立刻 launcher 重进（仅用于升级弹窗等 W49 指定场景）。"""
     pkg = resolve_messenger_pkg(serial)
@@ -5319,29 +5348,13 @@ def force_restart_messenger(serial: str, *, reason: str = "") -> bool:
     except Exception:
         pass
     w(0.4, 0.15)
-    try:
-        adb_run(
-            serial,
-            "shell",
-            "am",
-            "start",
-            "-a",
-            "android.intent.action.MAIN",
-            "-c",
-            "android.intent.category.LAUNCHER",
-            "-p",
-            pkg,
-        )
-    except Exception:
-        return False
-    w(2.0, 0.65)
+    ok = _launch_messenger_pkg(serial, pkg)
     _MESSENGER_PKG_CACHE[serial] = pkg
     invalidate_ui_cache(serial)
     root = ui_hierarchy(serial)
     if is_upgrade_popup(root):
         log.warning("大退重进后仍见升级弹窗")
         return False
-    ok = is_55m_foreground(serial) or in_messenger_app(root, serial)
     if ok:
         log.info("大退重进成功 %s", pkg)
     return ok
@@ -5455,6 +5468,74 @@ def is_on_launcher(serial: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def _current_focus_line(serial: str) -> str:
+    try:
+        out = adb_run(serial, "shell", "dumpsys", "window", "displays")
+        for line in out.splitlines():
+            if "mCurrentFocus" in line:
+                return line.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def clicker_needs_messenger_restart(serial: str) -> bool:
+    """左机卡在联系人编辑/非主界面等深层页，需大退重进。"""
+    if is_on_launcher(serial):
+        return True
+    focus = _current_focus_line(serial).lower()
+    if not focus:
+        return False
+    if "wuwu." not in focus and "telegram.business" not in focus:
+        return True
+    bad = (
+        "contactedit",
+        "contactactivity",
+        "addfriend",
+        "profileactivity",
+        "secretkey",
+        "webviewactivity",
+        "picker",
+        "gallery",
+    )
+    return any(b in focus for b in bad)
+
+
+def relaunch_clicker_messenger(serial: str, *, reason: str = "") -> bool:
+    if clicker_needs_messenger_restart(serial):
+        return force_restart_messenger(serial, reason=reason or "clicker-relaunch")
+    if not is_55m_foreground(serial):
+        return launch_messenger_app(serial)
+    return True
+
+
+def dismiss_clicker_contact_compose(serial: str) -> bool:
+    """左机误进「搜索或新建 / 联系人编辑」等阻塞页，退回消息列表。"""
+    root = ui_hierarchy(serial)
+    if root is None:
+        return False
+    title = get_chat_title(root)
+    texts = collect_ui_texts(root)
+    blob = " ".join(texts)
+    stuck = (
+        "搜索或新建" in title
+        or "搜索或新建" in blob
+        or "contactedit" in _current_focus_line(serial).lower()
+        or clicker_needs_messenger_restart(serial)
+    )
+    if not stuck and not any(t.startswith("搜索或新") for t in texts):
+        if "contactedit" not in _current_focus_line(serial).lower():
+            return False
+    log.info("左机退出阻塞页 title=%r", title[:24] if title else "")
+    for _ in range(3):
+        clicker_safe_back(serial, reason="退出搜索/联系人")
+        clicker_w(0.35, 0.12)
+    dismiss_search_page(serial)
+    tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
+    wc(0.55, 0.2)
+    return True
 
 
 def dismiss_clicker_dialogs(serial: str) -> bool:
@@ -5729,11 +5810,19 @@ def recover_clicker_to_group_minimal(serial: str, bot: dict, *, max_steps: int =
     os.environ["BOT_ALLOW_CLICKER_NAV"] = "1"
     try:
         dismiss_clicker_stuck_surface(serial)
-        if not is_55m_foreground(serial):
-            launch_messenger_app(serial)
-            wc(0.9, 0.3)
+        relaunch_clicker_messenger(serial, reason="clicker-recover")
+        wc(0.9, 0.3)
+        dismiss_clicker_contact_compose(serial)
         if _verify_chat_composer_ready_serial(serial):
-            return True
+            root0 = ui_hierarchy(serial)
+            if in_target_group_chat(root0, bot, serial):
+                return True
+            title = get_chat_title(root0)
+            group = (bot.get("associatedGroup") or "").strip()
+            if title and group and not _group_title_matches(title, group):
+                log.warning("左机 recover 在错误群 %s，返回列表", title)
+                clicker_safe_back(serial, reason="recover-退出错误群")
+                wc(0.55, 0.2)
         root = ui_hierarchy(serial)
         if in_target_group_chat(root, bot, serial):
             return True
@@ -5816,22 +5905,48 @@ def ensure_clicker_in_group(serial: str, bot: dict, *, reason: str = "") -> bool
         log.info("左机驻群检查 (%s)", reason)
     dismiss_clicker_dialogs(serial)
     dismiss_clicker_popup_overlay(serial)
-    if not is_55m_foreground(serial):
-        launch_messenger_app(serial)
-        wc(0.8, 0.25)
+    relaunch_clicker_messenger(serial, reason=reason or "ensure-clicker")
+    wc(0.8, 0.25)
+    dismiss_clicker_contact_compose(serial)
     root = ui_hierarchy(serial)
-    if _verify_chat_composer_ready_serial(serial):
-        log.info("左机已在群聊输入态，跳过群名导航")
-        return True
     if in_target_group_chat(root, bot, serial):
         return True
+    if _verify_chat_composer_ready_serial(serial):
+        root2 = ui_hierarchy(serial)
+        if in_target_group_chat(root2, bot, serial):
+            log.info("左机已在群聊输入态，跳过群名导航")
+            return True
+        title = get_chat_title(root2)
+        group = (bot.get("associatedGroup") or "").strip()
+        if title and group and not _group_title_matches(title, group):
+            log.warning("左机在错误群 %s（目标=%s），返回列表", title, group)
+            clicker_safe_back(serial, reason="退出错误群")
+            wc(0.6, 0.25)
+    if in_target_group_chat(ui_hierarchy(serial), bot, serial):
+        return True
     dismiss_message_list_overlay(serial)
+    group = (bot.get("associatedGroup") or "").strip()
+    for _ in range(5):
+        root = ui_hierarchy(serial)
+        if in_target_group_chat(root, bot, serial):
+            return True
+        title = get_chat_title(root)
+        if title and group and not _group_title_matches(title, group):
+            if _verify_chat_composer_ready_serial(serial) or is_group_chat_activity(serial):
+                log.warning("左机在错误群 %s（目标=%s），返回列表", title, group)
+                clicker_safe_back(serial, reason="退出错误群")
+                wc(0.55, 0.2)
+                tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
+                wc(0.45, 0.15)
+                continue
+        break
     tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
     wc(0.5, 0.15)
-    group = (bot.get("associatedGroup") or "").strip()
-    if group and tap_target_group_in_list(serial, bot, scrolls=4):
+    if group and tap_target_group_in_list(serial, bot, scrolls=6):
         return True
-    return recover_clicker_to_group_minimal(serial, bot)
+    if enter_group_via_contacts(serial, bot):
+        return True
+    return clicker_back_to_group(serial, bot, max_steps=8)
 
 
 def ensure_group_chat(serial: str, bot: dict) -> bool:
@@ -13931,10 +14046,17 @@ class Orchestrator:
                     dismiss_upgrade_popup(serial)
                     root = ui_hierarchy(serial)
                     if is_clicker_serial(serial) and root is not None:
-                        ctx = describe_screen_context(root, bot, serial)
-                        if ctx.page == "message_list" and not in_target_group_chat(root, bot, serial):
-                            log.info("[%s] 左机在消息列表，点群名回群（MANUAL_IN_GROUP）", name)
-                            tap_target_group_in_list(serial, bot, scrolls=2)
+                        if is_on_launcher(serial) or not is_55m_foreground(serial):
+                            log.warning("[%s] 左机离桌面/退后台，拉回 55M（MANUAL_IN_GROUP）", name)
+                            ensure_clicker_in_group(serial, bot, reason="manual-watchdog")
+                        elif not in_target_group_chat(root, bot, serial):
+                            ctx = describe_screen_context(root, bot, serial)
+                            if ctx.page == "message_list":
+                                log.info("[%s] 左机在消息列表，点群名回群（MANUAL_IN_GROUP）", name)
+                                tap_target_group_in_list(serial, bot, scrolls=2)
+                            elif not clicker_img_task_surface_ready(serial, root):
+                                log.warning("[%s] 左机不在目标群 page=%s，尝试回群", name, ctx.page)
+                                recover_clicker_to_group_minimal(serial, bot)
                     time.sleep(CLICKER_STAY_SEC)
                     continue
                 if CLICKER_STAY_IN_CHAT:

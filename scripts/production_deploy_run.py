@@ -36,6 +36,7 @@ UPLOAD = (
     "scripts/vmos_visual_monitor.py",
     "scripts/patch_speed_env.py",
     "scripts/edge_brain_start.sh",
+    "scripts/_vps_heal_clicker_once.py",
 )
 
 ENV_KV = (
@@ -50,6 +51,10 @@ ENV_KV = (
     "BOT_CLICKER_ADB_PORT=52840",
     "BOT_SRE_HEAL_COOLDOWN_SEC=300",
     "BOT_ANNOUNCE_LOCKED=1",
+    "BOT_IMG_TRUST_CLICK=1",
+    "BOT_IMG_LOCKED=1",
+    "BOT_IMG_PINNED=1",
+    "BOT_CLICKER_STAY_IN_CHAT=1",
     "EDGE_BRAIN_JWT_SECRET=w49-edge-aps-jwt-secret",
 )
 
@@ -137,6 +142,25 @@ def main() -> int:
         procs = ssh.run("pgrep -af 'edge_brain|bot_dual_supervisor|spawn_main' | grep -v pgrep", 20)
         step("supervisor", "spawn_main" in procs and "bot_dual_supervisor" in procs, f"{reload}\n{procs}")
 
+        # 等左机发图链空闲后再做视觉验收（避免 reload 中途快照误判）
+        for i in range(12):
+            busy = ssh.run(
+                f"grep -E 'clicker-img|capture-ipc|发图' {R}/logs/dual-supervisor.log | tail -3",
+                15,
+            )
+            if "capture-ipc] done" in busy and "ok=True" in busy:
+                break
+            if i >= 4 and "批量发图成功" in busy:
+                break
+            time.sleep(10)
+
+        heal = ssh.run(
+            f"set -a; source {R}/config/bot-start.env 2>/dev/null; set +a; "
+            f"cd {R} && {PY} {R}/scripts/_vps_heal_clicker_once.py 2>&1",
+            150,
+        )
+        step("clicker_heal", "ensure_ok True" in heal, heal[-800:])
+        time.sleep(6)
         visual = ssh.run(
             f"W49_VISUAL_CAPTURE_DIR={R}/logs/visual-captures "
             f"{PY} {R}/scripts/vmos_visual_monitor.py --both --once 2>&1",
