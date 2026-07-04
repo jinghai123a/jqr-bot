@@ -1,4 +1,4 @@
-"""LISTENER 结算 → CLICKER 发图 → LISTENER 新一局：跨进程文件队列（双进程栈）。"""
+"""CLICKER 结算 → 发图 → 同机 open 公告：跨进程文件队列（双进程栈）。"""
 from __future__ import annotations
 
 import json

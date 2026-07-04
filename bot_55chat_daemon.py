@@ -71,9 +71,11 @@ CLICKER_BOT_IDS = {
     if x.strip()
 }
 CLICKER_OPTIONAL = os.environ.get("BOT_CLICKER_OPTIONAL", "0").lower() in ("1", "true", "yes")
-# 左机仅负责 UI 发图（+→图片→勾选→发送）；右机 LISTENER 仍发文字
+# 左机仅负责 UI 发图（+→图片→勾选→发送）
 CLICKER_SEND_IMAGES = os.environ.get("BOT_CLICKER_SEND_IMAGES", "0").lower() in ("1", "true", "yes")
-# 左机 CLICKER 进程内闭环：28.run → 截图 → UI 发图；右机 LISTENER 仅收 capture-ipc done 发「新的一局」
+# 左机 CLICKER 负责 warn/close/open 文字公告；右机 LISTENER 仅热路径用户回复
+CLICKER_SEND_ANNOUNCE = os.environ.get("BOT_CLICKER_SEND_ANNOUNCE", "1").lower() in ("1", "true", "yes")
+# 左机 CLICKER 进程内闭环：28.run → 截图 → UI 发图 → 三图后新一局（同机公告线程）
 CLICKER_SETTLE_ENABLED = os.environ.get("BOT_CLICKER_SETTLE", "0").lower() in ("1", "true", "yes")
 # 左机驻留群聊：慢任务/发图全程在 55M 内完成，禁止系统 Back 退出 App
 CLICKER_STAY_IN_CHAT = os.environ.get("BOT_CLICKER_STAY_IN_CHAT", "1").lower() in ("1", "true", "yes")
@@ -1627,7 +1629,7 @@ def process_maintenance_resume(
     send_xy: tuple[int, int] | None,
 ) -> None:
     """维护结束：不补停机期间漏发的封盘/开奖公告，仅恢复当前期「新的一局」与正常接单。"""
-    if is_clicker_bot(bot):
+    if not runs_announce_loop(bot):
         return
     group = (bot.get("associatedGroup") or "").strip()
     rid, _, _ = active_round_timing(settings)
@@ -2798,8 +2800,60 @@ def should_run_settlement(bot: dict | None, serial: str) -> bool:
     return not on_clicker
 
 
+def clicker_announce_enabled() -> bool:
+    return CLICKER_SEND_ANNOUNCE
+
+
+def runs_announce_loop(bot: dict | None) -> bool:
+    if not bot:
+        return False
+    if clicker_announce_enabled():
+        return is_clicker_bot(bot)
+    return is_send_bot(bot)
+
+
+def announce_serial_skipped(bot: dict, serial: str) -> bool:
+    """公告线程：本机是否应跳过（休眠）。"""
+    if clicker_announce_enabled():
+        return not (is_clicker_bot(bot) or is_clicker_serial(serial, bot))
+    return is_clicker_bot(bot) or is_clicker_serial(serial, bot)
+
+
+def outbound_uses_queue(bot: dict) -> bool:
+    if not SEND_QUEUE_ENABLED:
+        return False
+    if is_send_bot(bot):
+        return True
+    return clicker_announce_enabled() and is_clicker_bot(bot)
+
+
+def resolve_open_announce_target(settings: dict[str, str] | None = None) -> tuple[str, dict]:
+    """三图后「新的一局」目标 serial/bot（左机公告模式走 CLICKER）。"""
+    if clicker_announce_enabled():
+        from bot_ops.runtime import load_bot_runtime
+
+        _ = settings
+        rt = load_bot_runtime()
+        cp = (rt.clicker_adb_port or _CLICKER_ADB_PORT).strip()
+        clicker_bot: dict = {"id": next(iter(CLICKER_BOT_IDS), "bot-3"), "associatedGroup": ""}
+        try:
+            bots = api("GET", "/api/bots") or []
+            for bid in CLICKER_BOT_IDS:
+                hit = next((x for x in bots if str(x.get("id") or "") == bid), None)
+                if hit:
+                    clicker_bot = dict(hit)
+                    break
+        except Exception:
+            pass
+        if cp:
+            for s in (f"127.0.0.1:{cp}", f"localhost:{cp}"):
+                return s, clicker_bot
+        return "", clicker_bot
+    return resolve_listener_settle_target(settings)
+
+
 def resolve_listener_settle_target(settings: dict[str, str] | None = None) -> tuple[str, dict]:
-    """左机结算完成后，右机 open_after_settle 目标（跨进程 capture-ipc done）。"""
+    """左机结算完成后，右机 open_after_settle 目标（跨进程 capture-ipc done，非左机公告模式）。"""
     from bot_ops.runtime import load_bot_runtime
 
     _ = settings
@@ -2922,9 +2976,9 @@ def settle_round(
         log.warning("结算截图生成失败 rid=%s: %s", round_id, ex)
 
     if clicker_settle_enabled() and (is_clicker_bot(bot) or is_clicker_serial(serial, bot)):
-        ls, lb = resolve_listener_settle_target(settings)
+        ls, lb = resolve_open_announce_target(settings)
         if not ls:
-            log.warning("左机结算：右机 LISTENER 不可用 rid=%s", round_id)
+            log.warning("左机结算：公告目标机不可用 rid=%s", round_id)
             return
         open_job = OutboundSend(
             ls, lb, open_text, settings,
@@ -2937,7 +2991,7 @@ def settle_round(
         if not capture_paths:
             mark_capture_done(round_id, images_ok=True, open_job=outbound_to_dict(open_job))
             _SETTLE_DISPATCHED.add(round_id)
-            post_log(f"[ADB] 结算 rid={round_id} 无截图 → 右机新一局", "SUCCESS")
+            post_log(f"[ADB] 结算 rid={round_id} 无截图 → 新一局", "SUCCESS")
             return
         snap = ui_snapshot(serial, chat=True, channel="settle")
         ix = snap.input_xy
@@ -12826,7 +12880,7 @@ def dispatch_send(
     """统一发送入口：Listener 入优先级队列，其它同步发送。"""
     if not text.strip():
         return False
-    if block_clicker_send(serial, bot, text, where="dispatch"):
+    if block_clicker_send(serial, bot, text, where="dispatch", kind=kind):
         return False
     snip = re.sub(r"\s+", "", message_snip(text))[:48]
     out_key = _outbound_dedup_key(serial, text)
@@ -12838,7 +12892,7 @@ def dispatch_send(
         return False
     if snip:
         _OUTBOUND_TEXT_DEDUP[out_key] = now
-    if SEND_QUEUE_ENABLED and is_send_bot(bot):
+    if outbound_uses_queue(bot):
         outbound_enqueue(
             OutboundSend(
                 serial, bot, text, settings,
@@ -12885,7 +12939,7 @@ def process_round_warn_announce(
     """结束前 WARN_ANNOUNCE_BEFORE_SEC 秒发「距离封盘还有60秒」（每群每期一次）。"""
     if not WARN_ANNOUNCE_ENABLED:
         return
-    if is_clicker_bot(bot):
+    if not runs_announce_loop(bot):
         return
     if in_maintenance_window():
         return
@@ -12939,7 +12993,7 @@ def process_round_close_announce(
     """结束前 CLOSE_ANNOUNCE_BEFORE_SEC 秒发「已封盘停止下注」（每群每期一次）。"""
     if not CLOSE_ANNOUNCE_ENABLED:
         return
-    if is_clicker_bot(bot):
+    if not runs_announce_loop(bot):
         return
     if in_maintenance_window():
         return
@@ -13012,7 +13066,7 @@ def process_round_open_announce(
     """新一期开始 OPEN_ANNOUNCE_AFTER_SEC 秒后发「新的一局」（须等上期开奖已播报）。"""
     if not OPEN_ANNOUNCE_ENABLED:
         return
-    if is_clicker_bot(bot):
+    if not runs_announce_loop(bot):
         return
     # 左机结算链：新的一局仅由 open_after_settle 在三图后发出，禁止定时 open 抢序
     if CLICKER_SETTLE_ENABLED and SETTLE_CAPTURE_ENABLED:
@@ -13190,7 +13244,7 @@ def bot_matches_deployment_role(bot: dict) -> bool:
 
 
 def is_clicker_bot(bot: dict | None) -> bool:
-    """Clicker（左机）：只执行点击任务，禁止在群内发任何消息。"""
+    """Clicker（左机）：点击/发图；公告在 BOT_CLICKER_SEND_ANNOUNCE=1 时由本机发送。"""
     if not bot:
         return False
     return bot_device_role(bot) == "CLICKER"
@@ -13207,7 +13261,7 @@ def clicker_return_to_group(serial: str, bot: dict, *, label: str = "") -> bool:
 
 
 def is_send_bot(bot: dict | None) -> bool:
-    """Listener（右机）负责群内所有回复与公告发送。"""
+    """Listener（右机）负责群内用户回复；公告在 BOT_CLICKER_SEND_ANNOUNCE=0 时由本机发送。"""
     if not bot:
         return False
     return bot_device_role(bot) == "LISTENER" and not is_clicker_bot(bot)
@@ -13427,9 +13481,18 @@ def try_recover_listener_to_group(
             os.environ["BOT_ALLOW_LISTENER_NAV"] = prev
 
 
-def block_clicker_send(serial: str, bot: dict | None, text: str, *, where: str) -> bool:
-    """左机禁止群内发文字。发图在 BOT_CLICKER_SEND_IMAGES=1 时放行。"""
+def block_clicker_send(
+    serial: str,
+    bot: dict | None,
+    text: str,
+    *,
+    where: str,
+    kind: str = "",
+) -> bool:
+    """左机禁止群内发用户文字。发图/公告（BOT_CLICKER_SEND_ANNOUNCE）放行。"""
     if CLICKER_SEND_IMAGES and where.startswith("send-image"):
+        return False
+    if clicker_announce_enabled() and kind in ("warn", "close", "open", "open_after_settle"):
         return False
     if is_clicker_bot(bot) or is_clicker_serial(serial, bot):
         log.warning("左机禁止群发送(%s): %s", where, message_snip(text)[:40])
@@ -13754,55 +13817,70 @@ class Orchestrator:
 
     def _announce_loop(self, bot: dict, serial: str) -> None:
         name = f"announce-{bot.get('id')}"
-        log.info("[%s] 公告线程启动 serial=%s", name, serial)
+        log.info("[%s] 公告线程启动 serial=%s clicker_announce=%s", name, serial, clicker_announce_enabled())
         while self._running.is_set():
             try:
                 drain_capture_ipc_open_jobs(serial, bot)
-                if is_clicker_bot(bot) or is_clicker_serial(serial, bot) or in_maintenance_window():
+                if announce_serial_skipped(bot, serial) or in_maintenance_window():
                     time.sleep(ANNOUNCE_LOOP_SEC)
                     continue
                 reload_round_state_from_disk()
                 _, _, _, settings = self.ctx.snapshot()
-                snap = ui_snapshot(serial, chat=False, channel="announce")
-                root = snap.root
-                if not listener_in_group_for_send(root, bot, serial):
-                    if MANUAL_IN_GROUP:
-                        log.info(
-                            "[%s] MANUAL_IN_GROUP 右机未在群，跳过公告（请手动进「%s」）",
-                            name,
-                            bot.get("associatedGroup") or "",
-                        )
-                        time.sleep(ANNOUNCE_LOOP_SEC)
-                        continue
-                    if is_send_only_listener(bot):
-                        if listener_send_blocked(root) or is_in_app_webview(root):
-                            if dismiss_listener_blockers(serial, root):
-                                snap = ui_snapshot(serial, chat=False, channel="announce")
-                                root = snap.root
-                        if not listener_in_group_for_send(root, bot, serial):
-                            if LISTENER_ZERO_NAV and is_group_chat_activity(serial):
-                                dismiss_listener_blockers(serial, root)
-                                snap = ui_snapshot(serial, chat=False, channel="announce")
-                                root = snap.root
-                            elif not LISTENER_ZERO_NAV:
-                                recover_listener_to_group_minimal(serial, bot)
-                                snap = ui_snapshot(serial, chat=False, channel="announce")
-                                root = snap.root
-                    if not listener_in_group_for_send(root, bot, serial):
-                        if is_send_only_listener(bot) and is_in_app_webview(root):
-                            log.warning("[%s] 右机在开奖外链页，系统返回", name)
-                            dismiss_in_app_webview(serial, max_steps=1)
-                        else:
-                            log.info("[%s] 右机不在群聊，跳过公告", name)
+                if is_clicker_bot(bot):
+                    snap = ui_snapshot(serial, chat=False, channel="clicker-img")
+                    root = snap.root
+                    if not in_target_group_chat(root, bot, serial):
+                        if ensure_clicker_in_group(serial, bot, reason="announce"):
+                            snap = ui_snapshot(serial, chat=False, channel="clicker-img")
+                            root = snap.root
+                        if not in_target_group_chat(root, bot, serial):
+                            log.info("[%s] 左机不在群聊，跳过公告", name)
                             time.sleep(ANNOUNCE_LOOP_SEC)
                             continue
-                send_xy = listener_pinned_send_xy(settings, snap) if is_send_only_listener(bot) else (
-                    snap.inbar_send or snap.keyboard_send
-                )
+                    input_xy = snap.input_xy
+                    send_xy = snap.inbar_send or snap.keyboard_send
+                else:
+                    snap = ui_snapshot(serial, chat=False, channel="announce")
+                    root = snap.root
+                    if not listener_in_group_for_send(root, bot, serial):
+                        if MANUAL_IN_GROUP:
+                            log.info(
+                                "[%s] MANUAL_IN_GROUP 右机未在群，跳过公告（请手动进「%s」）",
+                                name,
+                                bot.get("associatedGroup") or "",
+                            )
+                            time.sleep(ANNOUNCE_LOOP_SEC)
+                            continue
+                        if is_send_only_listener(bot):
+                            if listener_send_blocked(root) or is_in_app_webview(root):
+                                if dismiss_listener_blockers(serial, root):
+                                    snap = ui_snapshot(serial, chat=False, channel="announce")
+                                    root = snap.root
+                            if not listener_in_group_for_send(root, bot, serial):
+                                if LISTENER_ZERO_NAV and is_group_chat_activity(serial):
+                                    dismiss_listener_blockers(serial, root)
+                                    snap = ui_snapshot(serial, chat=False, channel="announce")
+                                    root = snap.root
+                                elif not LISTENER_ZERO_NAV:
+                                    recover_listener_to_group_minimal(serial, bot)
+                                    snap = ui_snapshot(serial, chat=False, channel="announce")
+                                    root = snap.root
+                        if not listener_in_group_for_send(root, bot, serial):
+                            if is_send_only_listener(bot) and is_in_app_webview(root):
+                                log.warning("[%s] 右机在开奖外链页，系统返回", name)
+                                dismiss_in_app_webview(serial, max_steps=1)
+                            else:
+                                log.info("[%s] 右机不在群聊，跳过公告", name)
+                                time.sleep(ANNOUNCE_LOOP_SEC)
+                                continue
+                    input_xy = snap.input_xy
+                    send_xy = listener_pinned_send_xy(settings, snap) if is_send_only_listener(bot) else (
+                        snap.inbar_send or snap.keyboard_send
+                    )
                 try:
                     if EDGE_LEFT_JS:
                         poll_edge_brain_open_dispatch(
-                            serial, bot, settings, snap.input_xy, send_xy,
+                            serial, bot, settings, input_xy, send_xy,
                         )
                     else:
                         drain_capture_ipc_open_jobs(serial, bot)
@@ -13811,13 +13889,13 @@ class Orchestrator:
                 process_stale_open_after_capture()
                 draw_data = fetch_28run_recent(force=False)
                 process_round_open_announce(
-                    serial, bot, settings, snap.input_xy, send_xy, data=draw_data,
+                    serial, bot, settings, input_xy, send_xy, data=draw_data,
                 )
                 process_round_warn_announce(
-                    serial, bot, settings, snap.input_xy, send_xy,
+                    serial, bot, settings, input_xy, send_xy,
                 )
                 process_round_close_announce(
-                    serial, bot, settings, snap.input_xy, send_xy,
+                    serial, bot, settings, input_xy, send_xy,
                 )
                 # 开局公告由结算线程在播报完成后触发，避免与开奖结果抢顺序
             except Exception:
@@ -13828,9 +13906,16 @@ class Orchestrator:
         name = f"sender-{bot.get('id')}"
         log.info("[%s] 发送线程启动 serial=%s (优先级队列)", name, serial)
         while self._running.is_set():
-            drain_capture_ipc_open_jobs(serial, bot)
+            if runs_announce_loop(bot):
+                drain_capture_ipc_open_jobs(serial, bot)
             job = outbound_for(serial).get(timeout=0.25)
             if not job:
+                continue
+            if (job.image_paths or job.image_path) and (
+                is_clicker_bot(bot) or is_clicker_serial(serial, bot)
+            ):
+                outbound_enqueue(job)
+                time.sleep(0.02)
                 continue
             if not job.image_paths and not job.image_path and _announce_job_redundant(job):
                 log.info(
@@ -14169,6 +14254,8 @@ class Orchestrator:
             if not job:
                 continue
             if not (job.image_paths or job.image_path):
+                outbound_enqueue(job)
+                time.sleep(0.02)
                 continue
             if job.kind == "capture_batch" and job.round_id:
                 if job.round_id in _CAPTURE_SUCCEEDED:
@@ -14314,7 +14401,8 @@ class Orchestrator:
         log.info("[%s] 监听线程启动 serial=%s", name, serial)
         while self._running.is_set():
             try:
-                drain_capture_ipc_open_jobs(serial, bot)
+                if not clicker_announce_enabled():
+                    drain_capture_ipc_open_jobs(serial, bot)
                 users, products, combo_rules, settings = self.ctx.snapshot()
                 had_work = worker.tick(serial, users, products, combo_rules, settings)
             except RuntimeError as ex:
@@ -14563,6 +14651,25 @@ class Orchestrator:
                     )
                     st_stay.start()
                     self._threads.append(st_stay)
+                if clicker_announce_enabled():
+                    clicker_ensure_fire_worker(serial)
+                    at = threading.Thread(
+                        target=self._announce_loop, args=(bot, serial),
+                        name=f"announce-{bot['id']}", daemon=True,
+                    )
+                    at.start()
+                    self._threads.append(at)
+                    if SEND_QUEUE_ENABLED:
+                        st_ann = threading.Thread(
+                            target=self._sender_loop, args=(bot, serial),
+                            name=f"sender-{bot['id']}", daemon=True,
+                        )
+                        st_ann.start()
+                        self._threads.append(st_ann)
+                    log.info(
+                        "左机 CLICKER %s @ %s — 公告 warn/close/open 本机发送",
+                        bot.get("id"), serial,
+                    )
                 continue
             if is_clicker_serial(serial, bot):
                 log.error("左机 serial 被标为 LISTENER，拒绝启动发送线程 %s", serial)
@@ -14575,12 +14682,13 @@ class Orchestrator:
                 st.start()
                 self._threads.append(st)
             if is_send_bot(bot):
-                at = threading.Thread(
-                    target=self._announce_loop, args=(bot, serial),
-                    name=f"announce-{bot['id']}", daemon=True,
-                )
-                at.start()
-                self._threads.append(at)
+                if not clicker_announce_enabled():
+                    at = threading.Thread(
+                        target=self._announce_loop, args=(bot, serial),
+                        name=f"announce-{bot['id']}", daemon=True,
+                    )
+                    at.start()
+                    self._threads.append(at)
                 if SEND_QUEUE_ENABLED:
                     listener_ensure_fire_worker(serial)
                     st_send = threading.Thread(
@@ -14596,7 +14704,12 @@ class Orchestrator:
                     )
                     st_lstay.start()
                     self._threads.append(st_lstay)
-                log.info("右机 LISTENER %s @ %s — 仅群内发送/监听，禁止导航点击", bot.get("id"), serial)
+                log.info(
+                    "右机 LISTENER %s @ %s — %s",
+                    bot.get("id"),
+                    serial,
+                    "仅用户回复" if clicker_announce_enabled() else "群内发送/监听",
+                )
 
         log.info(
             "大脑编排已启动 右机发送=%s 左机点击=%s tick=%.0fms debounce=%.1fs",
@@ -14806,7 +14919,7 @@ class Worker:
         combo_rules: list,
         settings: dict[str, str],
     ) -> bool:
-        if is_send_bot(self.bot):
+        if is_send_bot(self.bot) and not clicker_announce_enabled():
             drain_capture_ipc_open_jobs(serial, self.bot)
         if self._process_probe_events(serial, users, products, combo_rules, settings):
             self._last_full_tick_at = time.time()
