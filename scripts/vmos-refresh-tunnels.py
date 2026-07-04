@@ -45,6 +45,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 
 def _bootstrap_env() -> None:
@@ -93,8 +94,7 @@ from bot_tunnel.expire_schedule import (  # noqa: E402
 
 from bot_tunnel.post_refresh import verify_dual_tunnels
 
-
-
+from vmos_api_client import VmosApiClient  # noqa: E402
 
 
 def _build_sides(root: Path, side_filter: str) -> dict:

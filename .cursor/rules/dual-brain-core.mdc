@@ -5,15 +5,21 @@ globs:
 alwaysApply: true
 ---
 
-# 双脑机器人 · 本仓库
+# 双脑机器人 · Edge 新架构
+
+> **规格入口**：**`docs/用户使用.md`**（最高标准）· `config/55m-knowledge/INDEX.md`  
+> `docs/固定文档.md` 铁律/禁止/禁改 **已解除**，仅历史参考。
 
 ## 代码地图
 
 | 路径 | 职责 |
 |------|------|
-| `bot_55chat_daemon.py` | 主守护进程：API、读屏、下注解析、双机编排、Probe |
-| `probe-android/` | Trime/无障碍 Probe（Kotlin） |
-| `scripts/vps_*.py` | VPS 部署、日志、审计脚本 |
+| `edge_brain/` | FastAPI 数据中台（timeline / settle / gates） |
+| `edge_android/` | AutoJs6 云机 Agent |
+| `scripts/edge_adb_agent.py` | Linux 发图/公告执行器 |
+| `bot_55chat_daemon.py` | 旧栈 + edge 复用 UI 发图/解析 |
+| `probe-android/` | 无障碍 Probe（Kotlin） |
+| `config/55m-knowledge/` | API/APK/坐标/公告/指令 知识库 |
 
 ## 双机架构（硬约束）
 
@@ -25,7 +31,7 @@ alwaysApply: true
 ## 业务规则
 
 - 下注金额后缀只认 **「各」**；「合+数字」报格式错误，不自动等同「各」。
-- 对外性能表述用「亚秒级/秒级」，不夸大「毫秒级」。
+- **性能**：用户指令回复、公告、结算 **毫秒级**（见 `docs/用户使用.md` §〇）。
 
 ## 编码偏好
 
@@ -35,7 +41,9 @@ alwaysApply: true
 
 ## 项目记忆
 
-完整坐标、部署、成败记录见 **`project-memory-55chat.mdc`**（alwaysApply）。
+- Edge 知识库：`config/55m-knowledge/`
+- 开源永久栈：`config/55m-knowledge/oss-stack.json`
+- 本地 VM：`/opt/55m-lab` · `local_vm/README-55M.md`
 
 ## ADD 流程
 

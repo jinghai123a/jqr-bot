@@ -1,0 +1,30 @@
+---
+description: 55chat 项目 Cursor 上下文/Automations 勾选与列表过滤预设（W49 固定）
+alwaysApply: true
+---
+
+# Cursor 上下文勾选（Docs / Automations 来源）
+
+**必开**：Desktop · Mobile · CLI · Setup · Source Control · **API** · **Automations**
+
+**保留**：Web（panel 偶发）
+
+**关闭**：Slack · Linear · Frontend QA
+
+**按需**：SDK（查 PyJWT/FastAPI/paramiko/uiautomator2 时开）· Bugbot（改代码审查时开）
+
+# Agent / Automations 列表过滤
+
+| 项 | 设置 |
+|---|---|
+| Grouping | Updated |
+| Ordering | Updated |
+| Source | **Reset**（全来源；避免漏本机 gate / VPS handoff） |
+| Status | 默认全开；排障时只看 Failed / Running |
+| Environment | **不收窄**（本机 Windows + APS `46.183.27.174` 都要见） |
+| PR | **关闭**（本仓库以本地/VPS 部署为主） |
+| Archived | 隐藏已归档 |
+
+# 与本项目无关（勿加载）
+
+Netlify · Zapier · 爬虫 SaaS · Asana — 除非 W49 明确要求。

@@ -1,0 +1,29 @@
+{
+  "autojs6": {
+    "name": "AutoJs6",
+    "pkg": "org.autojs.autojs6",
+    "abi": "arm64-v8a",
+    "version": "v6.7.0",
+    "download": "https://github.com/SuperMonster003/AutoJs6/releases/download/v6.7.0/autojs6-v6.7.0-arm64-v8a-62db1ff8.apk",
+    "local_cache": "artifacts/autojs6-arm64.apk",
+    "install": "adb -P {5039|5038} -s {serial} install -r -g",
+    "a11y": "settings put secure enabled_accessibility_services {autojs_service}",
+    "run_activity": "org.autojs.autojs6/org.autojs.autojs.external.open.RunIntentActivity",
+    "scripts_sdcard": [
+      "/sdcard/Scripts/w49-settle-left/settle_left.js",
+      "/sdcard/Scripts/w49-listener-right/listener_right.js"
+    ]
+  },
+  "chat_probe": {
+    "name": "55Chat Probe",
+    "pkg": "com.w49.chatprobe",
+    "project": "probe-android/",
+    "build": "cd probe-android && ./gradlew app:assembleRelease",
+    "role": "Trime/无障碍读屏 messengerId"
+  },
+  "adb_keyboard": {
+    "name": "ADB Keyboard",
+    "role": "listener_prepare_b64_outgoing 灌字",
+    "note": "云机 allowlist 仅 55M + ADB Keyboard"
+  }
+}

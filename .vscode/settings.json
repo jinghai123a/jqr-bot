@@ -1,0 +1,19 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.analysis.extraPaths": ["${workspaceFolder}"],
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "probe-android/.gradle": true
+  },
+  "files.watcherExclude": {
+    "**/__pycache__/**": true,
+    "**/logs/**": true,
+    "**/artifacts/**": true
+  },
+  "editor.formatOnSave": false,
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "cursorpyright.analysis.extraPaths": [
+    "${workspaceFolder}"
+  ]
+}

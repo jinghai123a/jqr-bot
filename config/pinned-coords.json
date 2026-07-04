@@ -1,13 +1,14 @@
 {
-  "_comment": "W49 钉死 — 720x1280。2026-06-27 实机视觉校准坐标",
+  "_comment": "W49 钉死 — 720x1280。2026-06-30 04:16 左机实弹成功闭环坐标",
+  "_verified": "V03 苍井空测试 批量发图成功3张 @04:16",
   "clicker": {
     "screen": "720x1280",
     "chat_plus": [45, 1235],
     "chat_plus_raised": [45, 654],
-    "attach_image": [72, 720],
-    "attach_image_bottom": [72, 720],
-    "gallery_check_top3": [[214, 394], [439, 394], [664, 394]],
-    "gallery_batch_send": [660, 1235],
+    "attach_image": [90, 1110],
+    "attach_image_bottom": [90, 1110],
+    "gallery_check_top3": [[654, 374], [429, 374], [205, 374]],
+    "gallery_batch_send": [668, 1210],
     "header_back": [34, 86],
     "add_header_back": [34, 86]
   },

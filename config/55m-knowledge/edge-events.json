@@ -1,0 +1,64 @@
+{
+  "model": "时间驱动 timeline + 事件门控 gates",
+  "flow": [
+    {
+      "event": "warn_window",
+      "trigger": "now in timeline.windows.warn",
+      "actor": "right",
+      "action": "发送 DEFAULT_WARN_ANNOUNCE",
+      "api": "GET /edge/timeline"
+    },
+    {
+      "event": "close_window",
+      "trigger": "now in timeline.windows.close",
+      "actor": "right",
+      "action": "发送 DEFAULT_CLOSE_ANNOUNCE",
+      "api": "GET /edge/timeline"
+    },
+    {
+      "event": "draw_ready",
+      "trigger": "28.run expect==pending_rid",
+      "actor": "brain",
+      "action": "生成 settle-bundle 三图",
+      "api": "GET /settle-bundle?period={rid}"
+    },
+    {
+      "event": "settle_images",
+      "trigger": "bundle 200",
+      "actor": "left",
+      "action": "DCIM 写图 + 相册勾选发送",
+      "api": "POST /settle-done"
+    },
+    {
+      "event": "open_gate",
+      "trigger": "settle-done images_ok",
+      "actor": "brain",
+      "action": "gates.open=true open_rid=period+1",
+      "api": "internal mark_settle_done"
+    },
+    {
+      "event": "round_open",
+      "trigger": "gates.open",
+      "actor": "right",
+      "action": "发送 DEFAULT_ROUND_OPEN_ANNOUNCE",
+      "api": "GET /edge/open-job"
+    }
+  ],
+  "e2e_acceptance": [
+    "双机 ADB online 在目标群",
+    "封盘提醒在群",
+    "封盘公告在群",
+    "左机三图 PC28→六合→流水",
+    "右机新的一局在三图之后",
+    "无 0/3 假成功",
+    "双机持续在岗"
+  ],
+  "implementation": {
+    "brain": "edge_brain/app.py",
+    "production_executor": "bot_dual_supervisor.py → bot_55chat_daemon spawn",
+    "oss_deploy_right": "scripts/deploy-listener-oss-stack.sh",
+    "lab_executor": "scripts/edge_adb_agent.py",
+    "cloud_js_optional": "edge_android/ (BOT_EDGE_AUTOJS6=1, left tap only)",
+    "matrix": "config/55m-knowledge/executor-matrix.json"
+  }
+}

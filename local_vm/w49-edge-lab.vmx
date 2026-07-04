@@ -1,0 +1,81 @@
+.encoding = "UTF-8"
+config.version = "8"
+virtualHW.version = "20"
+virtualHW.productCompatibility = "hosted"
+displayName = "w49-edge-lab"
+guestOS = "ubuntu-64"
+annotation = "W49 Edge Lab — 本地 APS 镜像；NAT；4C/4G/40G split"
+
+pciBridge0.present = "TRUE"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge4.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+pciBridge0.present = "TRUE"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge4.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+vmci0.present = "TRUE"
+hpet0.present = "TRUE"
+virtualHW.productCompatibility = "hosted"
+
+# --- 123.txt 硬件 ---
+numvcpus = "4"
+cpuid.coresPerSocket = "4"
+memsize = "4096"
+
+# 网络：NAT（123.txt #4）
+ethernet0.present = "TRUE"
+ethernet0.connectionType = "nat"
+ethernet0.virtualDev = "e1000"
+ethernet0.addressType = "generated"
+
+# 磁盘：推荐 SCSI + 动态拆分（123.txt #5 #6）
+scsi0.present = "TRUE"
+scsi0.virtualDev = "lsilogic"
+scsi0:0.present = "TRUE"
+scsi0:0.fileName = "w49-edge-lab.vmdk"
+scsi0:0.deviceType = "scsi-hardDisk"
+scsi0:0.mode = "persistent"
+
+# 不嵌套虚拟化（123.txt #7）
+vhv.enable = "FALSE"
+monitor_control.restrict_backdoor = "TRUE"
+
+# 显示：Server 无 3D
+svga.graphicsMemoryKB = "8388608"
+
+# 安装介质：setup_vm.ps1 会改写 iso 路径
+ide1:0.present = "TRUE"
+ide1:0.fileName = "auto"
+ide1:0.deviceType = "cdrom-image"
+ide1:0.autodetect = "TRUE"
+
+# 共享文件夹：宿主机项目（需 VMware Tools）
+sharedFolder0.present = "TRUE"
+sharedFolder0.enabled = "TRUE"
+sharedFolder0.readOnly = "FALSE"
+sharedFolder0.hostPath = "HOST_PROJECT_PLACEHOLDER"
+sharedFolder0.guestName = "55chat-bot"
+sharedFolder0.expiration = "never"
+
+floppy0.present = "FALSE"
+usb.present = "FALSE"
+sound.present = "FALSE"

@@ -1,0 +1,38 @@
+{
+  "screen": "720x1280",
+  "source": "config/pinned-coords.json",
+  "calibrated": "2026-06-27",
+  "clicker_bot3": {
+    "chat_plus": [45, 1235],
+    "chat_plus_raised": [45, 654],
+    "attach_image": [72, 720],
+    "attach_image_bottom": [72, 720],
+    "gallery_check_top3": [[214, 394], [439, 394], [664, 394]],
+    "gallery_check_locked_deploy": [[654, 374], [429, 374], [205, 374]],
+    "gallery_batch_send": [660, 1235],
+    "gallery_send_locked_deploy": [668, 1210],
+    "header_back": [34, 86]
+  },
+  "listener_bot4": {
+    "send": [674, 1234],
+    "keyboard_send": [675, 1190],
+    "input": [360, 1234]
+  },
+  "image_flow_locked": [
+    "tap + (45,1235)",
+    "tap 图片 (90,1110) 或 attach_image",
+    "勾选 (654,374)→(429,374)→(205,374) newest_at=top",
+    "tap 发送 (668,1210)"
+  ],
+  "add_replies": {
+    "ok": "已发送请求，刷新后请同意",
+    "already": "您已是好友，无需重复添加",
+    "fail": "添加失败请检查是否开启允许添加功能，或联系群主关闭群内禁止添加好友功能"
+  },
+  "env": {
+    "BOT_IMG_LOCKED": "1",
+    "BOT_IMG_NEWEST_AT": "top",
+    "BOT_CLICKER_ZERO_NAV": "1",
+    "BOT_LISTENER_ZERO_NAV": "1"
+  }
+}

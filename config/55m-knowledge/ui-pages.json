@@ -1,0 +1,113 @@
+{
+  "_doc": "完整说明见 docs/新文档.md §8；检测实现 bot_ops/nav_guard.py",
+  "app": "55Messenger / 55M",
+  "screen": "720x1280",
+  "target_group": "苍井空测试",
+  "pages": {
+    "target_group": {
+      "activity": "GroupChatActivity",
+      "header_regex": "^.+\\(\\d+\\)$",
+      "header_example": "苍井空测试 (9)",
+      "composer": ["输入消息", "Enter message"],
+      "detector": "is_target_group_surface",
+      "forbidden": ["回群导航", "Tab点击", "连环Back", "header返回退群(左)"]
+    },
+    "message_list": {
+      "header": "消息",
+      "markers": ["搜索", "消息", "通讯录", "通话", "我"],
+      "detector": "is_message_list_surface",
+      "action": "点目标群名进群；禁止连环Back"
+    },
+    "wrong_chat": {"rule": "有输入框但抬头非目标群"},
+    "search": {
+      "markers": ["支持搜索联系人", "支持搜索", "频道别名", "群别名", "取消"],
+      "action": "点取消"
+    },
+    "secret_key": {"markers": ["加密密钥", "秘密聊天加密密钥", "端到端加密"]},
+    "group_settings": {"markers": ["群成员", "删除并退出", "群别名", "群简介", "清空聊天记录"], "min_hits": 2},
+    "webview": {"markers": ["28.run", "luck h5", "加拿大28", "开奖网", "pc28.am"]},
+    "profile": {"markers": ["添加好友", "通过验证", "Add Friend"]},
+    "other": {"markers": ["System Tools", "文件管理", "Chrome", "Downloads"]}
+  },
+  "overlays": {
+    "upgrade_popup": {
+      "markers": ["发现新版本", "立即升级"],
+      "resource_id": ["fullPopupContainer", "tvUploadCommit"],
+      "action": "am force-stop 后 am start 大退重进",
+      "forbidden": ["点立即升级", "Back关闭"]
+    },
+    "exit_toast": {
+      "markers": ["再按一次退出", "再按一次退出程序"],
+      "action": "禁止再Back；点群或Home圆点KEYCODE_HOME"
+    },
+    "nav_drawer": {
+      "markers": ["打开侧拉抽屉", "Open navigation drawer"],
+      "action": "单次Back关抽屉"
+    },
+    "forward_hint": {
+      "markers": ["最近转发", "快速分享"],
+      "action": "点消息Tab刷新"
+    },
+    "clicker_dialog": {
+      "markers": ["强制更新", "安全密码", "要退出"],
+      "dismiss_labels": ["稍后", "暂不", "取消", "知道了", "关闭"]
+    }
+  },
+  "navigation": {
+    "home_key": "KEYCODE_HOME (3)",
+    "back_key": "KEYCODE_BACK (4) — 见exit_toast时禁用",
+    "warm_start_flag": "0x20000 REORDER_TO_FRONT",
+    "nav_bar_reserve_px": 130,
+    "search_bar_y_max": 220
+  },
+  "terminology": {
+    "回群": "拉回目标群聊，不是退群",
+    "退群": "本机器人禁止"
+  },
+  "bottom_tabs": {
+    "消息": {"labels": ["消息", "Chats", "会话"], "action": "进入会话列表；heal 时点目标群名"},
+    "通讯录": {"labels": ["通讯录", "联系人", "Contacts"], "action": "ADD 认人链；左机 heal 禁止绕路"},
+    "通话": {"labels": ["通话"], "action": "禁止自动化点击"},
+    "我": {"labels": ["我"], "action": "禁止自动化点击"}
+  },
+  "group_chat_composer": {
+    "input": {"labels": ["输入消息", "Enter message"], "pinned_right": "input (360,1234)"},
+    "plus_attach": {"labels": ["+"], "pinned_left": "chat_plus (45,1235)", "opens": "attach_menu"},
+    "send": {"labels": ["发送"], "pinned_right": "send (674,1234)", "role": "LISTENER only"}
+  },
+  "attach_menu": {
+    "markers": ["图片", "拍摄", "名片", "文件", "红包", "群聊转账"],
+    "image": {"label": "图片", "pinned": "attach_image (90,1110)", "opens": "gallery_picker"},
+    "dismiss": "再点 + 或 ESC 或 pinned 空白区"
+  },
+  "gallery_picker": {
+    "select": {"pinned": ["gallery_check_top3"], "rule": "勾选最新 3 张（top 模式）"},
+    "send_batch": {"pinned": "gallery_batch_send (668,1210)"},
+    "back": {"pinned": "header_back (34,86)", "allowed_in_group": false}
+  },
+  "group_settings_buttons": {
+    "markers_page": ["群成员", "删除并退出", "群别名", "群简介", "清空聊天记录"],
+    "danger": ["删除并退出"],
+    "back": "header 返回或单次 Back（非目标群聊内）"
+  },
+  "search_page_buttons": {
+    "cancel": {"labels": ["取消"], "action": "dismiss_search_page"},
+    "forbidden": ["盲 Back", "连环 Back"]
+  },
+  "profile_page_buttons": {
+    "markers": ["添加好友", "加好友", "Add Friend", "添加为好友", "通过验证"],
+    "action": "ADD 点头像链；完成后 header 返回"
+  },
+  "task_preflight": {
+    "doc": "docs/新文档.md §8",
+    "compare_script": "scripts/compare_ui_context.py",
+    "steps": [
+      "dumpsys window → Activity",
+      "describe_screen_context.page vs ui-pages.json",
+      "左机在 target_group 时禁止 header_back",
+      "右机 LISTENER_ZERO_NAV 禁止 Tab/群名"
+    ]
+  },
+  "pinned_coords": "config/pinned-coords.json",
+  "daemon": "bot_55chat_daemon.py describe_screen_context"
+}

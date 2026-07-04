@@ -69,7 +69,7 @@ def main() -> int:
     which = (os.environ.get("TUNNEL_SIDES") or "both").strip().lower()
     sides = ["right", "left"] if which == "both" else [which]
 
-    cfg = load_vps_config(ROOT, prompt_password=False)
+    cfg = load_vps_config(ROOT)
     py = f"{R}/.venv/bin/python3"
 
     with tempfile.TemporaryDirectory() as td:
@@ -108,17 +108,20 @@ def main() -> int:
             print(">>> reconnect-dual-adb")
             print(ssh.run(f"bash {R}/scripts/reconnect-dual-adb.sh 2>&1 | tail -15", 120))
 
-            print(">>> vmos-refresh --status (API expire after OpenAPI sync)")
-            print(ssh.run(f"cd {R} && {py} scripts/vmos-refresh-tunnels.py --status 2>&1", 60))
+            if os.environ.get("TUNNEL_SKIP_API_REFRESH", "").strip() not in ("1", "true", "yes"):
+                print(">>> vmos-refresh --status (API expire after OpenAPI sync)")
+                print(ssh.run(f"cd {R} && {py} scripts/vmos-refresh-tunnels.py --status 2>&1", 60))
 
-            for side in sides:
-                print(
-                    ssh.run(
-                        f"cd {R} && timeout 120 {py} scripts/vmos-refresh-tunnels.py "
-                        f"--side {side} 2>&1 | tail -8",
-                        130,
+                for side in sides:
+                    print(
+                        ssh.run(
+                            f"cd {R} && timeout 120 {py} scripts/vmos-refresh-tunnels.py "
+                            f"--side {side} 2>&1 | tail -8",
+                            130,
+                        )
                     )
-                )
+            else:
+                print(">>> skip vmos-refresh (TUNNEL_SKIP_API_REFRESH)")
 
             print(">>> verify")
             print(ssh.run("ss -tlnp | grep -E '52840|58433' || echo NO_PORTS", 15))

@@ -1,0 +1,43 @@
+---
+description: Edge 新架构 — 知识库入口、双机分工、事件门控（替代固定文档约束）
+alwaysApply: true
+---
+
+# Edge 新架构（W49 2026）
+
+> 本规则 **覆盖** `fixed-announce-and-resources.mdc` 对 Edge 路径的约束。业务正文仍从 `config/55m-knowledge/announce-templates.json` 读取，禁止擅自改字。
+
+## 代码地图
+
+| 路径 | 职责 |
+|------|------|
+| `edge_brain/` | FastAPI 数据中台：timeline、settle-bundle、gates、WS |
+| `w49_core/` | 28.run 拉取、210s 时间窗 |
+| `w49_render/` | 三图 PNG（board_capture 优先） |
+| `edge_android/` | AutoJs6 云机脚本 |
+| `scripts/edge_adb_agent.py` | VPS/VM Linux 执行器（daemon 发图/公告） |
+| `config/55m-knowledge/` | **唯一规格知识库** |
+| `/opt/55m-lab` | 本地 VM 实验专区 |
+
+## 双机（硬约束）
+
+- **右 LISTENER** `bot-4` `58433`：读屏、warn/close/open 文字
+- **左 CLICKER** `bot-3` `52840`：三图 UI 链
+- 认人：**messengerId**；下注金额后缀只认 **「各」**
+
+## 事件顺序（时间 + 门控）
+
+1. `timeline.windows.warn` → 右机封盘提醒
+2. `timeline.windows.close` → 右机封盘公告
+3. 28.run 开奖 → `GET /settle-bundle` → 左机三图 → `POST /settle-done`
+4. `gates.open` → 右机「新的一局」
+
+## 部署顺序
+
+1. 本地 VM：`python scripts/local_vm/host_deploy.py --all`
+2. E2E 群聊验收
+3. `python scripts/local_vm/host_pack_deploy.py --deploy-aps`
+
+## 开源永久栈
+
+见 `config/55m-knowledge/oss-stack.json` — **禁止**用自写轮子替代已锁定项。

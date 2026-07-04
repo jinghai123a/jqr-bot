@@ -1,0 +1,10 @@
+{
+  "name": "55m-lab",
+  "version": "0.1.0-edge",
+  "vm_root": "/opt/55m-lab",
+  "app_root": "/opt/55m-lab/app",
+  "knowledge_root": "/opt/55m-lab/knowledge",
+  "knowledge_source": "config/55m-knowledge",
+  "aps_root": "/home/bot/55chat-bot",
+  "iso_default": "D:/ISO/ubuntu-24.04.4-desktop-amd64.iso"
+}

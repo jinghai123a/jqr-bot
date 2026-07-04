@@ -1,0 +1,10 @@
+# 本地 VM 实验环境 — 全量 Python 依赖（edge + daemon + 部署工具）
+-r requirements-edge.txt
+paramiko>=3.4.0
+httpx>=0.27.0
+pytest>=8.0.0
+# daemon / board 常用
+Pillow>=10.4.0
+numpy<2.0
+opencv-contrib-python>=4.4.0.46,<=4.6.0.66
+adbutils>=2.7.0

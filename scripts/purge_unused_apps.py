@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
-"""双云机：只保留 55M(wuwu) + ADB Keyboard，其余第三方 App 全部卸载。"""
+"""双云机：只保留 55M(wuwu) + ADB Keyboard，其余第三方 App 卸载（在 VPS 上执行）。"""
 from __future__ import annotations
 
+import argparse
+import os
 import re
-import time
+import subprocess
+import sys
+from pathlib import Path
 
-import paramiko
+BOT_ROOT = Path(os.environ.get("BOT_ROOT", "/home/bot/55chat-bot"))
 
-HOST, USER, PW = "46.183.27.174", "root", "Aa112211@@785*"
-R = "/home/bot/55chat-bot"
-
-# 精确保留
 KEEP_EXACT = frozenset({
     "com.android.adbkeyboard",
     "com.zx.adbkeyboard",
 })
-
-# 前缀保留（55M 包名 wuwu.*）
 KEEP_PREFIX = ("wuwu.",)
-
-# 优先卸载（Root/探针/乱点/多余 IME）
 PRIORITY_UNINSTALL = (
     "com.topjohnwu.magisk",
     "io.github.huskydg.magisk",
     "io.github.vvb2060.magisk",
     "com.kitsune.magisk",
     "com.w49.chatprobe",
-    "com.tengu.sharetoclipboard",
     "com.osfans.trime",
+    "com.tengu.sharetoclipboard",
     "dev.patrickgold.florisboard",
     "com.github.uiautomator",
     "com.github.uiautomator.test",
@@ -35,29 +31,15 @@ PRIORITY_UNINSTALL = (
 )
 
 
-def run(ssh: paramiko.SSHClient, cmd: str, t: int = 180) -> str:
-    chan = ssh.get_transport().open_session()
-    chan.settimeout(t)
-    chan.exec_command(cmd)
-    buf = b""
-    deadline = time.time() + t
-    while time.time() < deadline:
-        if chan.recv_ready():
-            buf += chan.recv(8192)
-        if chan.exit_status_ready():
-            while chan.recv_ready():
-                buf += chan.recv(8192)
-            break
-        time.sleep(0.1)
-    return buf.decode("utf-8", "replace")
-
-
-def pick_serial(ssh: paramiko.SSHClient, port: str) -> str | None:
-    for host in (f"127.0.0.1:{port}", f"localhost:{port}"):
-        out = run(ssh, f"adb -s {host} shell echo OK 2>/dev/null", 15)
-        if "OK" in out:
-            return host
-    return None
+def _sh(cmd: str, timeout: int = 120) -> str:
+    try:
+        r = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+        return (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT"
 
 
 def keep_pkg(pkg: str) -> bool:
@@ -66,8 +48,27 @@ def keep_pkg(pkg: str) -> bool:
     return any(pkg.startswith(p) for p in KEEP_PREFIX)
 
 
-def list_third_party(ssh: paramiko.SSHClient, serial: str) -> list[str]:
-    out = run(ssh, f"adb -s {serial} shell pm list packages -3 2>/dev/null", 60)
+def read_ports() -> tuple[str, str]:
+    env = BOT_ROOT / "config" / "bot-start.env"
+    rport, lport = "58433", "52840"
+    if env.is_file():
+        for line in env.read_text(encoding="utf-8").splitlines():
+            if line.startswith("BOT_LISTENER_ADB_PORT="):
+                rport = line.split("=", 1)[1].strip()
+            elif line.startswith("BOT_CLICKER_ADB_PORT="):
+                lport = line.split("=", 1)[1].strip()
+    return rport, lport
+
+
+def pick_serial(port: str) -> str | None:
+    for host in (f"127.0.0.1:{port}", f"localhost:{port}"):
+        if "OK" in _sh(f"adb -s {host} shell echo OK 2>/dev/null", 15):
+            return host
+    return None
+
+
+def list_third_party(serial: str) -> list[str]:
+    out = _sh(f"adb -s {serial} shell pm list packages -3 2>/dev/null", 60)
     pkgs: list[str] = []
     for line in out.splitlines():
         m = re.match(r"package:(.+)", line.strip())
@@ -76,17 +77,17 @@ def list_third_party(ssh: paramiko.SSHClient, serial: str) -> list[str]:
     return sorted(set(pkgs))
 
 
-def uninstall_pkg(ssh: paramiko.SSHClient, serial: str, pkg: str) -> str:
-    cmd = (
+def uninstall_pkg(serial: str, pkg: str) -> str:
+    return _sh(
         f"adb -s {serial} shell pm uninstall --user 0 {pkg} 2>&1; "
-        f"adb -s {serial} uninstall {pkg} 2>&1"
-    )
-    return run(ssh, cmd, 45).strip().replace("\n", " | ")[:120]
+        f"adb -s {serial} uninstall {pkg} 2>&1",
+        45,
+    ).replace("\n", " | ")[:120]
 
 
-def purge_device(ssh: paramiko.SSHClient, serial: str, label: str) -> None:
+def purge_device(serial: str, label: str) -> None:
     print(f"\n=== {label} {serial} ===")
-    installed = list_third_party(ssh, serial)
+    installed = list_third_party(serial)
     print(f"第三方包 {len(installed)} 个: {', '.join(installed) or '(无)'}")
 
     todo: list[str] = []
@@ -102,55 +103,43 @@ def purge_device(ssh: paramiko.SSHClient, serial: str, label: str) -> None:
         print("无需卸载")
     else:
         for pkg in todo:
-            tag = "KEEP-SKIP" if keep_pkg(pkg) else "UNINSTALL"
-            if tag == "KEEP-SKIP":
+            if keep_pkg(pkg):
                 continue
-            res = uninstall_pkg(ssh, serial, pkg)
-            print(f"  - {pkg}: {res}")
+            print(f"  - {pkg}: {uninstall_pkg(serial, pkg)}")
 
-    print(run(ssh, f"""
+    print(_sh(f"""
 adb -s {serial} shell settings put secure enabled_accessibility_services '' 2>/dev/null || true
 adb -s {serial} shell settings put secure accessibility_enabled 0 2>/dev/null || true
 adb -s {serial} shell ime enable com.android.adbkeyboard/.AdbIME 2>/dev/null || true
 adb -s {serial} shell ime set com.android.adbkeyboard/.AdbIME 2>/dev/null || true
-adb -s {serial} shell rm -rf /data/local/tmp/chatprobe.apk /data/local/tmp/trime.apk /data/local/tmp/florisboard.apk 2>/dev/null || true
+adb -s {serial} shell rm -rf /data/local/tmp/chatprobe.apk /data/local/tmp/trime.apk 2>/dev/null || true
 adb -s {serial} shell pm list packages -3 2>/dev/null
 """, 90))
 
 
-def read_ports(ssh: paramiko.SSHClient) -> tuple[str, str]:
-    env = run(ssh, f"grep -E 'BOT_LISTENER_ADB_PORT|BOT_CLICKER_ADB_PORT' {R}/config/bot-start.env", 10)
-    rport, lport = "60478", "56121"
-    for line in env.splitlines():
-        if "LISTENER" in line and "=" in line:
-            rport = line.split("=", 1)[1].strip()
-        if "CLICKER" in line and "=" in line:
-            lport = line.split("=", 1)[1].strip()
-    return rport, lport
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--no-restart", action="store_true")
+    args = ap.parse_args()
 
-
-def main() -> None:
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(HOST, username=USER, password=PW, timeout=30)
-
-    rport, lport = read_ports(ssh)
-    rs = pick_serial(ssh, rport)
-    ls = pick_serial(ssh, lport)
+    rport, lport = read_ports()
+    rs = pick_serial(rport)
+    ls = pick_serial(lport)
     if rs:
-        purge_device(ssh, rs, "右机 LISTENER")
+        purge_device(rs, "右机 LISTENER")
     else:
         print(f"WARN: 右机离线 port={rport}")
     if ls:
-        purge_device(ssh, ls, "左机 CLICKER")
+        purge_device(ls, "左机 CLICKER")
     else:
         print(f"WARN: 左机离线 port={lport}")
 
-    print("\n=== restart bot ===")
-    print(run(ssh, f"bash {R}/scripts/restart-55chat-bot.sh 2>&1 | tail -10", 120))
-    ssh.close()
+    if not args.no_restart:
+        print("\n=== restart bot ===")
+        print(_sh(f"bash {BOT_ROOT}/scripts/restart-55chat-bot.sh 2>&1 | tail -10", 120))
     print("\ndone purge_unused_apps")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

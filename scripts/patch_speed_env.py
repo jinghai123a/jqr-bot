@@ -53,6 +53,7 @@ patch = {
     "BOT_CLICK_VERIFY": "1",
     "BOT_IMG_NEWEST_AT": "top",
     "BOT_CLICKER_SEND_IMAGES": "1",
+    "BOT_CLICKER_SETTLE": "1",
     "BOT_CLICKER_OPTIONAL": "0",
     "BOT_LOG_WORKERS": "2",
 }

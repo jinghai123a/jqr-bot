@@ -1,0 +1,135 @@
+{
+  "policy": "星标较高成熟开源优先；减少自写代码；先读项目文档；永久使用",
+  "locked": true,
+  "stacks": [
+    {
+      "id": "autojs6",
+      "name": "AutoJs6",
+      "repo": "https://github.com/SuperMonster003/AutoJs6",
+      "stars_approx": 6000,
+      "license": "MPL-2.0",
+      "role": "云机 UI tap 备用（仅左机发图；BOT_EDGE_AUTOJS6=1）；右机文字禁止用 AutoJs6",
+      "apk_url": "https://github.com/SuperMonster003/AutoJs6/releases/download/v6.7.0/autojs6-v6.7.0-arm64-v8a-62db1ff8.apk",
+      "pkg": "org.autojs.autojs6",
+      "docs": "https://github.com/SuperMonster003/AutoJs6/blob/master/README.md",
+      "usage_permanent": [
+        "scripts/edge_auto_bootstrap.sh 下载安装 arm64-v8a",
+        "脚本路径 /sdcard/Scripts/w49-settle-left|listener-right/",
+        "RunIntentActivity 启动 .js",
+        "adb reverse tcp:8790 → brain"
+      ],
+      "project_paths": ["edge_android/settle-left/settle_left.js", "edge_android/listener-right/listener_right.js"]
+    },
+    {
+      "id": "fastapi",
+      "name": "FastAPI + Uvicorn",
+      "repo": "https://github.com/tiangolo/fastapi",
+      "stars_approx": 85000,
+      "license": "MIT",
+      "role": "edge_brain HTTP/WS 服务",
+      "docs": "https://fastapi.tiangolo.com/",
+      "usage_permanent": ["python -m edge_brain", "requirements-edge.txt"],
+      "project_paths": ["edge_brain/"]
+    },
+    {
+      "id": "pillow",
+      "name": "Pillow",
+      "repo": "https://github.com/python-pillow/Pillow",
+      "stars_approx": 12000,
+      "role": "settle-bundle 占位图 fallback",
+      "docs": "https://pillow.readthedocs.io/",
+      "usage_permanent": ["w49_render/png_bundle.py"],
+      "project_paths": ["w49_render/png_bundle.py"]
+    },
+    {
+      "id": "adbutils",
+      "name": "adbutils",
+      "repo": "https://github.com/openatx/adbutils",
+      "stars_approx": 2000,
+      "role": "ADB 封装（可选）",
+      "docs": "https://github.com/openatx/adbutils",
+      "usage_permanent": ["vendor/adbutils pip -e 安装"],
+      "project_paths": ["vendor/adbutils/"]
+    },
+    {
+      "id": "airtest",
+      "name": "Airtest",
+      "repo": "https://github.com/AirtestProject/Airtest",
+      "stars_approx": 9000,
+      "role": "图像 fallback / 视觉辅助",
+      "docs": "https://airtest.readthedocs.io/",
+      "usage_permanent": ["vendor/airtest pip -e", "rpa/aircv_helper.py"],
+      "project_paths": ["vendor/airtest/", "rpa/aircv_helper.py"]
+    },
+    {
+      "id": "paramiko",
+      "name": "Paramiko",
+      "repo": "https://github.com/paramiko/paramiko",
+      "stars_approx": 9000,
+      "role": "VPS/VM SSH 部署",
+      "docs": "https://www.paramiko.org/",
+      "usage_permanent": ["bot_ops/ssh_client.py", "scripts/local_vm/host_deploy.py"],
+      "project_paths": ["bot_ops/ssh_client.py"]
+    },
+    {
+      "id": "android-platform-tools",
+      "name": "Android platform-tools (adb)",
+      "repo": "https://developer.android.com/tools/releases/platform-tools",
+      "role": "隧道 ADB、发图 tap、reverse",
+      "usage_permanent": ["adb -P 5038/5039", "scripts/edge_adb_connect.sh"],
+      "project_paths": ["scripts/reconnect-dual-adb.sh", "scripts/edge_adb_connect.sh"]
+    },
+    {
+      "id": "ui-tars-desktop",
+      "name": "UI-TARS-desktop (ByteDance)",
+      "repo": "https://github.com/bytedance/UI-TARS-desktop",
+      "stars_approx": 37000,
+      "license": "Apache-2.0",
+      "role": "本地 GUI 调试 / MCP Agent（不替代云机 AutoJs6）",
+      "docs": "https://github.com/bytedance/UI-TARS-desktop/blob/main/README.md",
+      "usage_permanent": ["vendor/UI-TARS-desktop 浅 clone", "本地断点/坐标校准辅助"],
+      "project_paths": ["vendor/UI-TARS-desktop/"]
+    },
+    {
+      "id": "uiautomator2",
+      "name": "uiautomator2",
+      "repo": "https://github.com/openatx/uiautomator2",
+      "stars_approx": 7000,
+      "role": "云机读屏 dump / 验发",
+      "docs": "https://github.com/openatx/uiautomator2",
+      "usage_permanent": ["bot_55chat_daemon ui_hierarchy", "deploy-listener-oss-stack.sh"],
+      "project_paths": ["bot_55chat_daemon.py"]
+    },
+    {
+      "id": "adb-keyboard",
+      "name": "ADB Keyboard (senzhk)",
+      "repo": "https://github.com/senzhk/ADBKeyBoard",
+      "role": "右机长文 B64 灌字",
+      "usage_permanent": ["listener_prepare_b64_outgoing", "deploy-listener-oss-stack.sh"],
+      "project_paths": ["bot_55chat_daemon.py", "config/55m-knowledge/apks.json"]
+    },
+    {
+      "id": "adb-clip",
+      "name": "adb-clip",
+      "repo": "https://github.com/polygraphene/adb-clip",
+      "role": "云机剪贴板写入备用",
+      "usage_permanent": ["deploy-listener-oss-stack.sh"],
+      "project_paths": ["scripts/deploy-listener-oss-stack.sh"]
+    },
+    {
+      "id": "bot-dual-supervisor",
+      "name": "bot_dual_supervisor + spawn",
+      "role": "APS 生产唯一 ADB 执行器（发字+发图）",
+      "usage_permanent": ["bot_dual_supervisor.py", "BOT_DUAL_PROCESS=1"],
+      "project_paths": ["bot_dual_supervisor.py", "bot_55chat_daemon.py"]
+    },
+    {
+      "id": "vmos-openapi",
+      "name": "VMOS Cloud OpenAPI",
+      "repo": "https://cloud.vmoscloud.com/vmoscloud/doc/zh/server/OpenAPI.html",
+      "role": "隧道凭证 refresh、padApi/adb",
+      "usage_permanent": ["scripts/vmos-refresh-tunnels.py", "bot_tunnel/refresh.py"],
+      "project_paths": ["scripts/vmos-refresh-tunnels.py", "config/vmos-api.env"]
+    }
+  ]
+}

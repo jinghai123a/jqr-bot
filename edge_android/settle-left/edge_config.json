@@ -1,0 +1,38 @@
+{
+  "brain_url": "http://127.0.0.1:8790",
+  "token": "w49-edge-local",
+  "dcim_dir": "/sdcard/DCIM/Camera/",
+  "coords": {
+    "chat_plus": [
+      45,
+      1235
+    ],
+    "attach_image": [
+      90,
+      1110
+    ],
+    "attach_image_bottom": [
+      90,
+      1110
+    ],
+    "gallery_check_top3": [
+      [
+        654,
+        374
+      ],
+      [
+        429,
+        374
+      ],
+      [
+        205,
+        374
+      ]
+    ],
+    "gallery_batch_send": [
+      668,
+      1210
+    ]
+  },
+  "_synced_from": "config/pinned-coords.json"
+}

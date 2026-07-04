@@ -2,6 +2,7 @@
 """从本机调 VMOS API（绕过 VPS IP 封禁/限流），成功后写回 VPS tunnel env 并重连。"""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -9,10 +10,12 @@ from pathlib import Path
 
 import paramiko
 
-HOST, PW, R = "46.183.27.174", "Aa112211@@785*", "/home/bot/55chat-bot"
+HOST, R = "46.183.27.174", "/home/bot/55chat-bot"
 ROOT = Path(__file__).resolve().parents[1]
+PADS_JSON = ROOT / "config" / "vmos-pads.json"
 sys.path.insert(0, str(ROOT))
 
+from bot_ops.config import load_vps_config  # noqa: E402
 from bot_tunnel import (  # noqa: E402
     fetch_adb_with_backoff,
     parse_local_port,
@@ -23,12 +26,26 @@ from scripts.vmos_api_client import VmosApiClient  # noqa: E402
 
 
 def ssh_run(cmd: str, t: int = 120) -> str:
+    cfg = load_vps_config(ROOT)
     s = paramiko.SSHClient()
     s.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    s.connect(HOST, username="root", password=PW, timeout=30)
+    s.connect(cfg.host, username=cfg.user, password=cfg.password, timeout=30)
     _, o, e = s.exec_command(cmd, timeout=t)
     out = (o.read() + e.read()).decode("utf-8", "replace")
     s.close()
+    return out
+
+
+def load_env(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
     return out
 
 
@@ -76,9 +93,10 @@ def write_tunnel_on_vps(
         )
     try:
         remote = f"{R}/config/tunnel-{side}.env"
+        cfg = load_vps_config(ROOT)
         s = paramiko.SSHClient()
         s.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        s.connect(HOST, username="root", password=PW, timeout=30)
+        s.connect(cfg.host, username=cfg.user, password=cfg.password, timeout=30)
         sftp = s.open_sftp()
         sftp.put(str(tmp_path), remote)
         s.exec_command(f"chmod 600 {remote}")
@@ -104,12 +122,18 @@ def main() -> int:
     if not pads:
         print("  list_pads unavailable — use hardcoded padCode", flush=True)
 
-    right_code = "ATP6416I3I1E6KPM"
-    left_code = "APP5AU4BB269OR35"
+    pads_cfg = {}
+    if PADS_JSON.exists():
+        pads_cfg = json.loads(PADS_JSON.read_text(encoding="utf-8"))
+    bot_env = load_env(ROOT / "config" / "bot-start.env")
+    right_code = str((pads_cfg.get("right") or {}).get("pad_code") or "ATP6416I3I1E6KPM")
+    left_code = str((pads_cfg.get("left") or {}).get("pad_code") or "APPSA148R269OR35")
+    right_port = str(bot_env.get("BOT_LISTENER_ADB_PORT") or "58433")
+    left_port = str(bot_env.get("BOT_CLICKER_ADB_PORT") or "52840")
 
     sides = (
-        ("right", right_code, "60478"),
-        ("left", left_code, "52718"),
+        ("right", right_code, right_port),
+        ("left", left_code, left_port),
     )
     ok_ports: list[str] = []
     for side, code, port in sides:

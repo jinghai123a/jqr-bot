@@ -1,0 +1,8 @@
+{
+  "name": "w49-settle-left",
+  "versionName": "1.0.0",
+  "versionCode": 1,
+  "packageName": "com.w49.settle.left",
+  "main": "settle_left.js",
+  "ignore": ["build", "node_modules"]
+}
