@@ -8,3 +8,5 @@ Pillow>=10.4.0
 numpy<2.0
 opencv-contrib-python>=4.4.0.46,<=4.6.0.66
 adbutils>=2.7.0
+uiautomator2>=3.2.0
+PyJWT>=2.8.0
