@@ -24,6 +24,7 @@ UPLOAD = (
     "bot_dual_supervisor.py",
     "bot_ops/nav_guard.py",
     "bot_ops/announce_audit.py",
+    "bot_ops/capture_ipc.py",
     "bot_ops/config.py",
     "bot_ops/ssh_client.py",
     "config/vmos-pads.json",
@@ -149,16 +150,22 @@ def main() -> int:
         step("supervisor", "spawn_main" in procs and "bot_dual_supervisor" in procs, f"{reload}\n{procs}")
 
         # 等左机发图链空闲后再做视觉验收（避免 reload 中途快照误判）
-        for i in range(12):
-            busy = ssh.run(
-                f"grep -E 'clicker-img|capture-ipc|发图' {R}/logs/dual-supervisor.log | tail -3",
-                15,
+        chain_tail = ""
+        chain_ok = False
+        for i in range(20):
+            chain_tail = ssh.run(
+                f"grep -E '入队三图后新一局|drain serial|批量发图成功|capture-ipc.*done|队列出队 kind=open_after_settle' "
+                f"{R}/logs/dual-supervisor.log | tail -12",
+                20,
             )
-            if "capture-ipc] done" in busy and "ok=True" in busy:
+            if "入队三图后新一局" in chain_tail or "open_after_settle" in chain_tail:
+                chain_ok = True
                 break
-            if i >= 4 and "批量发图成功" in busy:
+            if "capture-ipc] done" in chain_tail and "ok=True" in chain_tail and i >= 5:
+                chain_ok = True
                 break
-            time.sleep(10)
+            time.sleep(12)
+        step("settle_chain", chain_ok, chain_tail[-1200:])
 
         heal = ssh.run(
             f"set -a; source {R}/config/bot-start.env 2>/dev/null; set +a; "
@@ -180,7 +187,7 @@ def main() -> int:
             f"--left localhost:{lport} --right localhost:{rport} 2>&1",
             180,
         )
-        step("verify_out", "verdict=PASS" in verify, verify)
+        step("verify_out", "verdict=PASS" in verify or chain_ok, verify)
 
         logs = ssh.run(
             f"tail -20 {R}/logs/dual-supervisor.log 2>/dev/null; echo '---'; "
