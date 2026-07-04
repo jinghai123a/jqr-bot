@@ -1,0 +1,4 @@
+[console_scripts]
+u2cli=uiautomator2.agent_cli.__main__:main
+uiautomator2=uiautomator2.__main__:main
+

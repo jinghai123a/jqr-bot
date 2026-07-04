@@ -1,0 +1,296 @@
+# coding: utf-8
+#
+
+from __future__ import absolute_import, print_function
+
+import argparse
+import json
+import logging
+import pathlib
+import shutil
+import sys
+
+import adbutils
+
+import uiautomator2 as u2
+from uiautomator2 import enable_pretty_logging
+from uiautomator2.core import DEFAULT_SERVER_PORT, check_port
+from uiautomator2.utils import with_package_resource
+from uiautomator2.version import __version__
+
+logger = logging.getLogger(__name__)
+
+
+def _valid_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"port must be an integer, got {value!r}")
+    try:
+        check_port(port)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+    return port
+
+
+def cmd_init(args):
+    serial = args.serial or args.serial_optional
+    if serial:
+        d = u2.connect(serial, port=args.port)
+        logger.debug("install apk to %s", d.serial)
+        d._setup_jar()
+    else:
+        for dev in adbutils.adb.iter_device():
+            d = u2.connect(dev, port=args.port)
+            logger.debug("install apk to %s", d.serial)
+            d._setup_jar()
+            d._setup_ime()
+
+
+def cmd_purge(args):
+    """remove minicap, minitouch, uiautomator ..."""
+    dev = adbutils.adb.device(args.serial)
+    dev.uninstall("com.github.uiautomator")
+    dev.uninstall("com.github.uiautomator.test")
+    dev.shell(["/data/local/tmp/atx-agent", "server", "--stop"])
+    dev.shell(["rm", "/data/local/tmp/atx-agent"])
+    logger.info("atx-agent stopped and removed")
+    dev.shell(["rm", "/data/local/tmp/minicap"])
+    dev.shell(["rm", "/data/local/tmp/minicap.so"])
+    dev.shell(["rm", "/data/local/tmp/minitouch"])
+    logger.info("minicap, minitouch removed")
+    dev.shell(["pm", "uninstall", "com.github.uiautomator"])
+    dev.shell(["pm", "uninstall", "com.github.uiautomator.test"])
+    logger.info("com.github.uiautomator uninstalled, all done !!!")
+
+
+def cmd_copy_assets(args):
+    target_dir = pathlib.Path("assets")
+    target_dir.mkdir(exist_ok=True)
+    with with_package_resource("assets/u2.jar") as jar_path:
+        target_path = target_dir / "u2.jar"
+        shutil.copy2(jar_path, target_path)
+        print("Copied u2.jar to", target_path)
+    with with_package_resource("assets/app-uiautomator.apk") as apk_path:
+        target_path = target_dir / "app-uiautomator.apk"
+        shutil.copy2(apk_path, target_path)
+        print("Copied app-uiautomator.apk to", target_path)
+        
+def cmd_screenshot(args):
+    d = u2.connect(args.serial, port=args.port)
+    d.screenshot().save(args.filename)
+    print("Save screenshot to %s" % args.filename)
+
+
+def cmd_install(args):
+    u = u2.connect(args.serial, port=args.port)
+    pkg_name = u.app_install(args.url)
+    print("Installed", pkg_name)
+
+
+def cmd_uninstall(args):
+    d = u2.connect(args.serial, port=args.port)
+    if args.all:
+        d.app_uninstall_all(verbose=True)
+    else:
+        for package_name in args.package_name:
+            print('Uninstall "%s" ' % package_name, end="", flush=True)
+            ok = d.app_uninstall(package_name)
+            print("OK" if ok else "FAIL")
+
+
+def cmd_start(args):
+    d = u2.connect(args.serial, port=args.port)
+    d.app_start(args.package_name)
+
+
+def cmd_stop(args):
+    d = u2.connect(args.serial, port=args.port)
+    if args.all:
+        d.app_stop_all()
+        return
+
+    for package_name in args.package_name:
+        print('am force-stop "%s" ' % package_name)
+        d.app_stop(package_name)
+
+
+def cmd_current(args):
+    d = u2.connect(args.serial, port=args.port)
+    print(json.dumps(d.app_current(), indent=4), flush=True)
+
+
+def cmd_doctor(args):
+    """check if environment is fine"""
+    d = u2.connect(args.serial, port=args.port)
+    logger.debug("device serial: %s", d.serial)
+    try:
+        d.info
+        logger.info("uiautomator2 is OK")
+    except Exception as e:
+        logger.error("error: %s", e)
+        sys.exit(1)
+
+
+def cmd_version(args):
+    """print uiautomator2 lib version"""
+    print("uiautomator2 version: %s" % __version__)
+
+
+def cmd_console(args):
+    import code
+    import platform
+
+    d = u2.connect(args.serial, port=args.port)
+    model = d.shell("getprop ro.product.model").output.strip()
+    serial = d.serial
+    try:
+        import IPython
+        from traitlets.config import get_config
+
+        c = get_config()
+        c.InteractiveShellEmbed.colors = "neutral"
+        IPython.embed(config=c, header=f"IPython is ready, uiautomator2: {__version__}, try d.info")
+    except ImportError:
+        _vars = globals().copy()
+        _vars.update(locals())
+        shell = code.InteractiveConsole(_vars)
+        shell.interact(
+            banner="Python: %s\nDevice: %s(%s)"
+            % (platform.python_version(), model, serial)
+        )
+
+
+_commands = [
+    {"action": cmd_version, "command": "version", "help": "show version", "no_port": True},
+    {
+        "action": cmd_init,
+        "command": "init",
+        "help": "install enssential resources to device",
+        "flags": [
+            {
+                "args": ["--addr"],
+                "default": "127.0.0.1:7912",
+                "help": "atx-agent listen address",
+            },
+            {"args": ["--serial", "-s"], "type": str, "help": "serial number"},
+            {
+                "args": ["serial_optional"],
+                "nargs": "?",
+                "help": "serial number, same as --serial",
+            },
+        ],
+    },
+    {
+        "action": cmd_copy_assets,
+        "command": "copy-assets",
+        "help": "copy uiautomator2 assets to current directory",
+        "no_port": True,
+    },
+    {
+        "action": cmd_screenshot,
+        "command": "screenshot",
+        "help": "take device screenshot",
+        "flags": [
+            {
+                "args": ["filename"],
+                "nargs": "?",
+                "default": "screenshot.jpg",
+                "type": str,
+                "help": "output filename, jpg or png",
+            }
+        ],
+    },
+    {
+        "action": cmd_install,
+        "command": "install",
+        "help": "install packages",
+        "flags": [
+            {"args": ["url"], "help": "package url"},
+        ],
+    },
+    {
+        "action": cmd_uninstall,
+        "command": "uninstall",
+        "help": "uninstall packages",
+        "flags": [
+            {"args": ["--all"], "action": "store_true", "help": "uninstall all packages"},
+            {"args": ["package_name"], "nargs": "*", "help": "package name"},
+        ],
+    },
+    {
+        "action": cmd_start,
+        "command": "start",
+        "help": "start application",
+        "flags": [{"args": ["package_name"], "type": str, "nargs": None, "help": "package name"}],
+    },
+    {
+        "action": cmd_stop,
+        "command": "stop",
+        "help": "stop application",
+        "flags": [
+            {"args": ["--all"], "action": "store_true", "help": "stop all"},
+            {"args": ["package_name"], "nargs": "*", "help": "package name"},
+        ],
+    },
+    {"action": cmd_current, "command": "current", "help": "show current application"},
+    {"action": cmd_doctor, "command": "doctor", "help": "detect connect problem"},
+    {"action": cmd_console, "command": "console", "help": "launch interactive python console"},
+    {
+        "action": cmd_purge,
+        "command": "purge",
+        "help": "remove minitouch, minicap, atx app etc, from device",
+        "no_port": True,
+    },
+]
+
+
+def main():
+    # yapf: disable
+    # -p must come after the subcommand: `uiautomator2 screenshot -p 9090`
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument('-p', '--port', type=_valid_port, default=DEFAULT_SERVER_PORT,
+                        help='uiautomator2 server port on device (1-65535)')
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("-d", "--debug", action="store_true",
+                        help="show log")
+    parser.add_argument('-s', '--serial', type=str,
+                        help='device serial number')
+
+    subparser = parser.add_subparsers(dest='subparser')
+
+    actions = {}
+    for c in _commands:
+        cmd_name = c['command']
+        actions[cmd_name] = c['action']
+        parents = [] if c.get('no_port') else [shared]
+        sp = subparser.add_parser(cmd_name, help=c.get('help'),
+                                  parents=parents,
+                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        for f in c.get('flags', []):
+            args = f.get('args')
+            if not args:
+                args = ['-'*min(2, len(n)) + n for n in f['name']]
+            kwargs = f.copy()
+            kwargs.pop('name', None)
+            kwargs.pop('args', None)
+            sp.add_argument(*args, **kwargs)
+
+    args = parser.parse_args()
+    enable_pretty_logging()
+
+    if args.debug:
+        logger.debug("args: %s", args)
+
+    if args.subparser:
+        actions[args.subparser](args)
+        return
+
+    parser.print_help()
+    # yapf: enable
+
+
+if __name__ == "__main__":
+    main()
