@@ -1,10 +1,29 @@
 #!/usr/bin/env bash
-# VMOS 官方 ADB 隧道：仅原样执行 padApi/adb 返回的 command + adb（见 OpenAPI 文档）。
-# 禁止在此脚本内追加 -oHostKeyAlgorithms、ServerAlive 等未出现在 command 里的参数。
+# VMOS 官方 ADB 隧道：执行 padApi/adb 返回的 command + adb。
+# 仅当 tunnel-*.env 显式设置非空 TUNNEL_SSH_BIND_IP 时才注入 -b（禁止默认回落到左机 IP）。
 tunnel_connect_official() {
   local side_label="${1:-tunnel}"
   : "${LOCAL_PORT:?}"
   : "${SSH_PASS:?}"
+
+  local adb_server="${TUNNEL_ADB_SERVER_PORT:-}"
+  if [[ -z "${adb_server}" ]]; then
+    if [[ "${side_label}" == *左* ]] || [[ "${side_label}" == *left* ]] || [[ "${side_label}" == *CLICKER* ]]; then
+      adb_server="${BOT_CLICKER_ADB_SERVER_PORT:-5039}"
+    else
+      adb_server="${BOT_LISTENER_ADB_SERVER_PORT:-5038}"
+    fi
+  fi
+
+  probe_adb() {
+    adb -P "${adb_server}" -s "127.0.0.1:${LOCAL_PORT}" shell echo OK >/dev/null 2>&1 \
+      || adb -P "${adb_server}" -s "localhost:${LOCAL_PORT}" shell echo OK >/dev/null 2>&1
+  }
+
+  if probe_adb; then
+    echo "[${side_label}] ADB already OK @ ${LOCAL_PORT} (adb -P ${adb_server}, skip rebuild)"
+    return 0
+  fi
 
   pkill -f "ssh.*${LOCAL_PORT}:" 2>/dev/null || true
   sleep 1
@@ -14,19 +33,25 @@ tunnel_connect_official() {
     return 1
   fi
 
+  local bind_ip="${TUNNEL_SSH_BIND_IP:-}"
+  local ssh_cmd="${VMOS_SSH_COMMAND}"
+  if [[ -n "${bind_ip}" && "${ssh_cmd}" == ssh\ * && "${ssh_cmd}" != *" -b "* ]]; then
+    ssh_cmd="ssh -b ${bind_ip} ${ssh_cmd#ssh }"
+  fi
+
   export SSHPASS="${SSH_PASS}"
-  # 官方教程：ssh ... -Nf + key；自动化仅用 sshpass 注入密码，不改 command
-  sshpass -e bash -c "${VMOS_SSH_COMMAND}"
+  echo "[${side_label}] ssh bind=${bind_ip:-none} port=${LOCAL_PORT}"
+  sshpass -e bash -c "${ssh_cmd}"
   sleep 2
 
   if [[ -n "${VMOS_ADB_COMMAND:-}" ]]; then
     bash -c "${VMOS_ADB_COMMAND}"
   else
-    adb disconnect "127.0.0.1:${LOCAL_PORT}" 2>/dev/null || true
-    adb connect "127.0.0.1:${LOCAL_PORT}"
+    adb -P "${adb_server}" disconnect "127.0.0.1:${LOCAL_PORT}" 2>/dev/null || true
+    adb -P "${adb_server}" connect "127.0.0.1:${LOCAL_PORT}"
   fi
 
-  adb -s "127.0.0.1:${LOCAL_PORT}" wait-for-device 2>/dev/null \
-    || adb -s "localhost:${LOCAL_PORT}" wait-for-device
+  adb -P "${adb_server}" -s "127.0.0.1:${LOCAL_PORT}" wait-for-device 2>/dev/null \
+    || adb -P "${adb_server}" -s "localhost:${LOCAL_PORT}" wait-for-device
   echo "OK ${side_label} ADB @ ${LOCAL_PORT} (VMOS official command)"
 }
