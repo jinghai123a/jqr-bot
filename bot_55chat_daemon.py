@@ -902,12 +902,13 @@ _SETTLE_DISPATCHED: set[int] = set()
 _CAPTURE_SUCCEEDED: set[int] = set()
 _PAYOUT_DONE_ROUNDS: set[int] = set()
 _SETTLE_SEND_ATTEMPT: dict[int, float] = {}
-SETTLE_SEND_RETRY_SEC = max(3.0, float(os.environ.get("BOT_SETTLE_SEND_RETRY_SEC", "5") or 5))
+SETTLE_SEND_RETRY_SEC = max(1.0, float(os.environ.get("BOT_SETTLE_SEND_RETRY_SEC", "2") or 2))
 SETTLE_OPEN_DEFER_MAX_SEC = max(
     60.0,
     float(os.environ.get("BOT_SETTLE_OPEN_DEFER_MAX_SEC", "120") or 120),
 )
 _DRAW_CACHE: tuple[float, dict] | None = None
+_LAST_SEEN_DRAWN_RID: int = 0
 ROUND_BETS_FILE = os.environ.get(
     "BOT_ROUND_BETS_FILE", "/home/bot/55chat-bot/data/round_bets.json",
 )
@@ -956,7 +957,7 @@ SEND_PRIO_TREND = 21
 DRAW_API_URL = os.environ.get(
     "BOT_DRAW_API_URL", "https://28.run/api/lottery/recent/6",
 )
-DRAW_FETCH_INTERVAL = max(0.35, float(os.environ.get("BOT_DRAW_FETCH_SEC", "0.5") or 0.5))
+DRAW_FETCH_INTERVAL = max(0.25, float(os.environ.get("BOT_DRAW_FETCH_SEC", "0.35") or 0.35))
 SETTLE_TRADE_FLOW_TIMEOUT = max(
     0.8,
     float(
@@ -1515,15 +1516,28 @@ def pending_settle_round_id(rid: int, data: dict | None = None) -> int | None:
     return None
 
 
-def open_announce_recovery_needed(group: str, rid: int) -> bool:
-    """open 门闸落后 ≥2 期才强制恢复；仅落后 1 期须等结算三图（§2 顺序）。"""
+def open_announce_recovery_needed(
+    group: str, rid: int, data: dict | None = None,
+) -> bool:
+    """open 门闸落后 ≥2 期且无待结算期时才恢复；禁止抢在三图前发新一局。"""
     announced = int(_ROUND_OPEN_ANNOUNCED.get(group) or 0)
-    return announced > 0 and rid >= announced + 2
+    if announced <= 0 or rid < announced + 2:
+        return False
+    return pending_settle_round_id(rid, data) is None
 
 
 def settle_open_defer_expired(pending: int, data: dict | None = None) -> bool:
-    """结算发图已派发或开奖已过去较久时，允许右机降级发「新的一局」。"""
+    """仅当结算发图已结案（非进行中）且超时，才允许降级发「新的一局」。"""
     if pending <= 0 or pending in _SETTLED_ROUNDS:
+        return False
+    try:
+        from bot_ops.capture_ipc import capture_in_progress_for_rid, capture_terminal_for_rid
+
+        if capture_in_progress_for_rid(pending):
+            return False
+        if not capture_terminal_for_rid(pending):
+            return False
+    except Exception:
         return False
     if pending in _SETTLE_DISPATCHED:
         age = time.time() - _SETTLE_SEND_ATTEMPT.get(pending, 0.0)
@@ -2841,7 +2855,14 @@ def settle_round(
     except Exception:
         pass
     if round_id in _SETTLE_DISPATCHED:
-        return
+        try:
+            from bot_ops.capture_ipc import capture_done_for_rid, capture_in_progress_for_rid
+
+            if capture_in_progress_for_rid(round_id) or capture_done_for_rid(round_id):
+                return
+            _SETTLE_DISPATCHED.discard(round_id)
+        except Exception:
+            return
     now = time.time()
     last_try = _SETTLE_SEND_ATTEMPT.get(round_id, 0.0)
     if now - last_try < SETTLE_SEND_RETRY_SEC:
@@ -3010,7 +3031,6 @@ def settle_round(
                         if capture_terminal_for_rid(round_id):
                             return
                         if has_pending_for_rid(round_id) or has_inflight_for_rid(round_id):
-                            _SETTLE_DISPATCHED.add(round_id)
                             return
                         log.info("结算 IPC 推迟 rid=%s（左机队列忙）", round_id)
                         return
@@ -3093,14 +3113,24 @@ def process_round_settlement(
     users: list[dict],
     input_xy: tuple[int, int] | None,
     send_xy: tuple[int, int] | None,
+    *,
+    data: dict | None = None,
+    force_draw: bool = False,
 ) -> None:
     """28.run 出新结果 → 左机三图 → 右机「新的一局」（固定顺序，禁止 +10s 开局）。"""
+    global _LAST_SEEN_DRAWN_RID
     if not SETTLE_ENABLED or in_maintenance_window():
         return
     if not should_run_settlement(bot, serial):
         return
+    if data is None:
+        data = fetch_28run_recent(force=force_draw)
+        if not force_draw:
+            last = latest_drawn_round_id(data)
+            if last and last != _LAST_SEEN_DRAWN_RID:
+                _LAST_SEEN_DRAWN_RID = last
+                data = fetch_28run_recent(force=True)
     rid, _, _ = active_round_timing(settings)
-    data = fetch_28run_recent(force=False)
     pending = pending_settle_round_id(rid, data)
     if pending:
         draw = find_draw_for_round(pending, data)
@@ -12751,6 +12781,35 @@ def poll_edge_brain_open_dispatch(
         log.info("[edge_brain] 三图后门闸 open rid=%s", open_rid)
 
 
+def drain_capture_ipc_open_jobs(serial: str, bot: dict) -> None:
+    """消费左机 capture-ipc done → 入队「三图后新一局」。须在群检测前调用。"""
+    if EDGE_LEFT_JS:
+        return
+    try:
+        from bot_ops.capture_ipc import dict_to_outbound, poll_capture_done
+
+        items = poll_capture_done()
+        if items:
+            log.info("[capture-ipc] drain serial=%s n=%d", serial, len(items))
+        for done in items:
+            settled_rid = int(done.get("settled_rid") or 0)
+            open_raw = done.get("open_job") or {}
+            if done.get("images_ok") and open_raw:
+                ojob = dict_to_outbound(open_raw, bot, serial)
+                outbound_enqueue(ojob)
+                log.info(
+                    "[capture-ipc] 左机图成功 → 入队三图后新一局 rid=%s (settled=%s)",
+                    ojob.round_id, settled_rid,
+                )
+            elif settled_rid:
+                log.warning(
+                    "[capture-ipc] 左机图未成功 settled_rid=%s，不发新一局（§2 ③）",
+                    settled_rid,
+                )
+    except Exception:
+        log.exception("[capture-ipc] 处理 done 失败")
+
+
 def dispatch_send(
     serial: str,
     bot: dict,
@@ -12965,40 +13024,13 @@ def process_round_open_announce(
     if _ROUND_OPEN_ANNOUNCED.get(group) == rid:
         return
     pending = pending_settle_round_id(rid, data)
-    recovery = open_announce_recovery_needed(group, rid)
-    if pending and not recovery:
-        if pending >= rid - 1:
-            defer_key = (group, rid)
-            now = time.time()
-            if now - _OPEN_DEFER_LOG.get(defer_key, 0) >= 30:
-                _OPEN_DEFER_LOG[defer_key] = now
-                log.info("开局公告延后 rid=%s：期 %s 待三图后新一局", rid, pending)
-            return
-        if not settle_open_defer_expired(pending, data):
-            defer_key = (group, rid)
-            now = time.time()
-            if now - _OPEN_DEFER_LOG.get(defer_key, 0) >= 30:
-                _OPEN_DEFER_LOG[defer_key] = now
-                log.info("开局公告延后 rid=%s：期 %s 待先播报开奖", rid, pending)
-            return
-    elif pending and recovery:
+    if pending:
         defer_key = (group, rid)
         now = time.time()
-        if now - _OPEN_RECOVERY_LOG.get(defer_key, 0) >= 30:
-            _OPEN_RECOVERY_LOG[defer_key] = now
-            log.warning(
-                "开局公告强制恢复 rid=%s：announced=%s pending=%s",
-                rid, _ROUND_OPEN_ANNOUNCED.get(group), pending,
-            )
-    elif pending and settle_open_defer_expired(pending, data):
-        defer_key = (group, rid)
-        now = time.time()
-        if now - _OPEN_RECOVERY_LOG.get(defer_key, 0) >= 30:
-            _OPEN_RECOVERY_LOG[defer_key] = now
-            log.warning(
-                "开局公告恢复 rid=%s：期 %s 发图派发超时，允许发当期",
-                rid, pending,
-            )
+        if now - _OPEN_DEFER_LOG.get(defer_key, 0) >= 30:
+            _OPEN_DEFER_LOG[defer_key] = now
+            log.info("开局公告延后 rid=%s：期 %s 待三图后新一局", rid, pending)
+        return
     tpl = (settings.get("openAnnounceTemplate") or DEFAULT_ROUND_OPEN_ANNOUNCE).strip()
     if not tpl:
         return
@@ -13701,6 +13733,7 @@ class Orchestrator:
         log.info("[%s] 公告线程启动 serial=%s", name, serial)
         while self._running.is_set():
             try:
+                drain_capture_ipc_open_jobs(serial, bot)
                 if is_clicker_bot(bot) or is_clicker_serial(serial, bot) or in_maintenance_window():
                     time.sleep(ANNOUNCE_LOOP_SEC)
                     continue
@@ -13748,28 +13781,13 @@ class Orchestrator:
                             serial, bot, settings, snap.input_xy, send_xy,
                         )
                     else:
-                        from bot_ops.capture_ipc import dict_to_outbound, poll_capture_done
-
-                        for done in poll_capture_done():
-                            settled_rid = int(done.get("settled_rid") or 0)
-                            open_raw = done.get("open_job") or {}
-                            if done.get("images_ok") and open_raw:
-                                ojob = dict_to_outbound(open_raw, bot, serial)
-                                outbound_enqueue(ojob)
-                                log.info(
-                                    "[capture-ipc] 左机图成功 → 入队三图后新一局 rid=%s (settled=%s)",
-                                    ojob.round_id, settled_rid,
-                                )
-                            elif settled_rid:
-                                log.warning(
-                                    "[capture-ipc] 左机图未成功 settled_rid=%s，不发新一局（§2 ③）",
-                                    settled_rid,
-                                )
+                        drain_capture_ipc_open_jobs(serial, bot)
                 except Exception:
                     log.exception("[capture-ipc] 处理 done 失败")
                 process_stale_open_after_capture()
+                draw_data = fetch_28run_recent(force=False)
                 process_round_open_announce(
-                    serial, bot, settings, snap.input_xy, send_xy,
+                    serial, bot, settings, snap.input_xy, send_xy, data=draw_data,
                 )
                 process_round_warn_announce(
                     serial, bot, settings, snap.input_xy, send_xy,
@@ -13786,6 +13804,7 @@ class Orchestrator:
         name = f"sender-{bot.get('id')}"
         log.info("[%s] 发送线程启动 serial=%s (优先级队列)", name, serial)
         while self._running.is_set():
+            drain_capture_ipc_open_jobs(serial, bot)
             job = outbound_for(serial).get(timeout=0.25)
             if not job:
                 continue
@@ -13846,6 +13865,7 @@ class Orchestrator:
                 continue
             if (
                 job.kind in ("warn", "close", "open", "open_after_settle")
+                and job.kind != "open_after_settle"
                 and (_any_clicker_img_flow_busy() or settle_announce_chain_busy(serial))
             ):
                 if _any_clicker_img_flow_busy():
@@ -14269,7 +14289,7 @@ class Orchestrator:
                 if SETTLE_ENABLED and should_run_settlement(bot, serial) and not in_maintenance_window():
                     users, _, _, settings = self.ctx.snapshot()
                     process_round_settlement(
-                        serial, bot, settings, users, None, None,
+                        serial, bot, settings, users, None, None, force_draw=True,
                     )
             except Exception:
                 log.exception("[%s] 结算异常", name)
@@ -14281,6 +14301,7 @@ class Orchestrator:
         log.info("[%s] 监听线程启动 serial=%s", name, serial)
         while self._running.is_set():
             try:
+                drain_capture_ipc_open_jobs(serial, bot)
                 users, products, combo_rules, settings = self.ctx.snapshot()
                 had_work = worker.tick(serial, users, products, combo_rules, settings)
             except RuntimeError as ex:
@@ -14772,6 +14793,8 @@ class Worker:
         combo_rules: list,
         settings: dict[str, str],
     ) -> bool:
+        if is_send_bot(self.bot):
+            drain_capture_ipc_open_jobs(serial, self.bot)
         if self._process_probe_events(serial, users, products, combo_rules, settings):
             self._last_full_tick_at = time.time()
             return True

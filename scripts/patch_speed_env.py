@@ -56,6 +56,13 @@ patch = {
     "BOT_CLICKER_SETTLE": "1",
     "BOT_CLICKER_OPTIONAL": "0",
     "BOT_LOG_WORKERS": "2",
+    "BOT_CONTEXT_REFRESH_SEC": "1",
+    "BOT_DRAW_FETCH_SEC": "0.35",
+    "BOT_SETTLE_LOOP_SEC": "0.15",
+    "BOT_ANNOUNCE_LOOP_SEC": "0.15",
+    "BOT_SETTLE_SEND_RETRY_SEC": "2",
+    "BOT_SETTLE_OPEN_DEFER_MAX_SEC": "180",
+    "BOT_LISTENER_FORCE_SCAN_SEC": "0.25",
 }
 remove_keys = ("BOT_SKIP_BOT_IDS",)
 for k in remove_keys:
