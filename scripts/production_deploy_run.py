@@ -26,6 +26,7 @@ UPLOAD = (
     "bot_ops/announce_audit.py",
     "bot_ops/capture_ipc.py",
     "bot_ops/config.py",
+    "bot_ops/vps_ports.py",
     "bot_ops/ssh_client.py",
     "config/vmos-pads.json",
     "config/tunnel-left.env",
@@ -40,6 +41,11 @@ UPLOAD = (
     "scripts/vmos_visual_monitor.py",
     "scripts/patch_speed_env.py",
     "scripts/edge_brain_start.sh",
+    "scripts/vps_heal_left_tunnel.py",
+    "scripts/vps_openapi_refresh_now.py",
+    "scripts/vps_tunnel_diag.py",
+    "scripts/vps_heal_left_port.py",
+    "scripts/vps_fix_finance_adbhost.py",
     "scripts/_vps_heal_clicker_once.py",
 )
 
