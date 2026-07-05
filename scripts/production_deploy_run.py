@@ -53,6 +53,8 @@ UPLOAD = (
     "scripts/vps_heal_clicker_pause_worker.py",
     "scripts/vps_stack_status_now.py",
     "scripts/vps_audit_secrets_and_0856.py",
+    "scripts/vps_left_gallery_purge_now.py",
+    "bot_ops/ephemeral_burn.py",
     "bot_ops/deploy_secrets.py",
 )
 
@@ -73,6 +75,8 @@ ENV_KV = (
     "BOT_IMG_LOCKED=1",
     "BOT_IMG_PINNED=1",
     "BOT_CLICKER_STAY_IN_CHAT=1",
+    "BOT_CAPTURE_BURN_AFTER_SEND=1",
+    "BOT_CAPTURE_BURN_DELAY_SEC=45",
     "EDGE_BRAIN_JWT_SECRET=w49-edge-aps-jwt-secret",
     "BOT_DRAW_FETCH_SEC=0.35",
     "BOT_SETTLE_LOOP_SEC=0.15",

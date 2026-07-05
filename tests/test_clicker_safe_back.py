@@ -24,6 +24,18 @@ class ClickerSafeBackTests(unittest.TestCase):
             back.assert_not_called()
             kb.assert_called_once()
 
+    def test_uses_system_back_when_gallery_open_in_group(self) -> None:
+        serial = "127.0.0.1:52840"
+        with mock.patch.object(d, "is_clicker_serial", return_value=True), mock.patch.object(
+            d, "is_group_chat_activity", return_value=True,
+        ), mock.patch.object(d, "_verify_gallery_picker_open_serial", return_value=True), mock.patch.object(
+            d, "_verify_attach_menu_open_serial", return_value=False), mock.patch.object(
+            d, "tap_header_back",
+        ) as back, mock.patch.object(d, "_clicker_pop_ui_layer") as pop:
+            d.clicker_safe_back(serial, reason="gallery-send→群聊")
+            back.assert_not_called()
+            pop.assert_called_once()
+
     def test_skips_header_back_for_gallery_reason_when_picker_closed(self) -> None:
         serial = "127.0.0.1:52840"
         with mock.patch.object(d, "is_clicker_serial", return_value=True), mock.patch.object(

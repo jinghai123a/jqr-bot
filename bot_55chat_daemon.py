@@ -5667,6 +5667,21 @@ def _clicker_header_back_allowed_in_group(reason: str) -> bool:
     return any(reason.startswith(p) for p in allowed_prefixes)
 
 
+def _clicker_pop_ui_layer(serial: str, *, reason: str = "") -> None:
+    """群聊内关相册/附件叠层：系统 Back；非群聊 Activity 才点 header 返回（防退出群）。"""
+    if reason:
+        log.info("左机收起叠层：%s", reason)
+    if is_group_chat_activity(serial):
+        try:
+            adb_run(serial, "shell", "input", "keyevent", "4")
+        except Exception:
+            pass
+        w(0.35, 0.12)
+        invalidate_ui_cache(serial)
+        return
+    tap_header_back(serial)
+
+
 def clicker_safe_back(serial: str, *, reason: str = "") -> None:
     """左机返回：群聊内禁止 header 返回（会退出群）；相册/设置页才点箭头。"""
     if is_clicker_serial(serial) and is_group_chat_activity(serial):
@@ -5674,9 +5689,7 @@ def clicker_safe_back(serial: str, *, reason: str = "") -> None:
         attach = _verify_attach_menu_open_serial(serial)
         allow_exit = _clicker_header_back_allowed_in_group(reason)
         if gallery:
-            if reason:
-                log.info("左机 UI 返回：%s", reason)
-            tap_header_back(serial)
+            _clicker_pop_ui_layer(serial, reason=reason or "关闭相册")
             return
         if attach:
             if reason:
@@ -9934,14 +9947,17 @@ def _gallery_coord_bottom_center(
 
 
 def _return_from_gallery_to_chat(serial: str, bot: dict) -> bool:
-    """从相册/预览退回群聊输入栏（最多 2 次返回，防止退出 55M）。"""
+    """从相册/预览退回群聊输入栏（群聊内用系统 Back，禁止 header 退出群）。"""
     for _ in range(2):
         root = ui_hierarchy(serial)
         if in_target_group_chat(root, bot, serial):
             texts = collect_ui_texts(root) if root is not None else []
             if any(t in ("输入消息", "Enter message") for t in texts):
                 return True
-        device_safe_back(serial, reason="相册返回群聊")
+        if is_clicker_serial(serial) and is_group_chat_activity(serial):
+            _clicker_pop_ui_layer(serial, reason="相册返回群聊")
+        else:
+            device_safe_back(serial, reason="相册返回群聊")
         w(0.38, 0.12)
     root = ui_hierarchy(serial)
     if in_target_group_chat(root, bot, serial):
@@ -10505,11 +10521,11 @@ def _send_chat_images_ui_batch(
             return False
         clicker_w(0.22, 0.34) if is_clicker_serial(serial) else w(0.45, 0.15)
         if is_clicker_serial(serial):
-            for _ in range(3):
+            for _ in range(2):
                 if not _verify_gallery_picker_open_serial(serial):
                     break
-                device_safe_back(serial, reason="gallery-send→群聊")
-                clicker_w(0.28, 0.45)
+                _clicker_pop_ui_layer(serial, reason="gallery-send→群聊")
+                clicker_w(0.28, 0.35)
                 invalidate_step_verify_cache(serial)
 
         if IMG_TRUST_CLICK and is_clicker_serial(serial):
@@ -10565,6 +10581,13 @@ def _push_images_to_gallery(serial: str, paths: list[str]) -> bool:
     群聊顺序 = paths：PC28 → 六合 → 流水。
     """
     try:
+        if is_clicker_serial(serial):
+            try:
+                from bot_ops.ephemeral_burn import purge_gallery_if_swollen
+
+                purge_gallery_if_swollen(serial, threshold=80)
+            except Exception:
+                pass
         adb_run(serial, "shell", "mkdir", "-p", "/sdcard/DCIM/Camera")
         base_ts = int(time.time())
         ordered = list(reversed(paths)) if BOT_IMG_NEWEST_AT == "top" else list(paths)
@@ -14302,6 +14325,12 @@ class Orchestrator:
                         ensure_clicker_in_group(serial, bot, reason="watchdog")
                     elif not in_target_group_chat(ui_hierarchy(serial), bot, serial):
                         root = ui_hierarchy(serial)
+                        if is_group_chat_activity(serial) and (
+                            _verify_chat_composer_ready_serial(serial)
+                            or clicker_img_task_surface_ready(serial, root)
+                        ):
+                            time.sleep(CLICKER_STAY_SEC)
+                            continue
                         if clicker_img_task_surface_ready(serial, root):
                             time.sleep(CLICKER_STAY_SEC)
                             continue
