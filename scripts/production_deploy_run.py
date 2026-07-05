@@ -231,7 +231,7 @@ def main() -> int:
             time.sleep(10)
         time.sleep(20)
         ssh.run(
-            "pkill -15 -f 'spawn_main.*pipe_handle=8' 2>/dev/null || true; sleep 3; echo left_worker_paused",
+            "pkill -15 -f spawn_main 2>/dev/null || true; sleep 3; echo workers_paused",
             15,
         )
         ssh.run(
@@ -268,7 +268,7 @@ def main() -> int:
             in_grp = visual.count("state=target_group") >= 1
         step("visual", in_grp, visual)
         if not in_grp:
-            ssh.run(f"bash {R}/scripts/reload-dual-workers.sh 2>&1 | tail -6", 180)
+            ssh.run(f"bash {R}/scripts/reload-dual-workers.sh 2>&1 | tail -6", 240)
 
         verify = ssh.run(
             f"cd {R} && {PY} scripts/verify_group_announce_outgoing.py "
