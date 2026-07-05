@@ -5633,6 +5633,8 @@ def dismiss_clicker_dialogs(serial: str) -> bool:
     root = ui_hierarchy(serial)
     if root is None:
         return False
+    if is_group_settings_page(root):
+        return False
     texts = collect_ui_texts(root)
     blob = " ".join(texts)
     if not any(
@@ -9566,8 +9568,14 @@ def dismiss_clicker_stuck_surface(serial: str) -> None:
     """关闭附件栏/相册/预览，回到群聊 composer（heal/发图失败用）。"""
     if MANUAL_IN_GROUP and not is_clicker_serial(serial):
         return
+    if is_clicker_serial(serial) and dismiss_clicker_group_settings(serial):
+        return
     for i in range(3):
         root = ui_hierarchy(serial)
+        if root is not None and is_group_settings_page(root):
+            dismiss_clicker_group_settings(serial)
+            clicker_w(0.35, 0.12)
+            continue
         if root is not None and _verify_chat_composer_ready_root(root, serial):
             if not _verify_attach_menu_open_serial(serial) and not _verify_gallery_picker_open_serial(serial):
                 return
@@ -12083,6 +12091,7 @@ def send_chat_reply(
         return False
     announce_kind = kind in ("warn", "close", "open", "open_after_settle")
     if clicker_announce_enabled() and announce_kind and (is_clicker_bot(bot) or is_clicker_serial(serial, bot)):
+        dismiss_clicker_group_settings(serial)
         if not group_ok and not ensure_clicker_in_group(serial, bot, reason=f"send-{kind or 'announce'}"):
             log.warning("左机公告发送前未在群 kind=%s", kind or "?")
             return False
@@ -14270,6 +14279,12 @@ class Orchestrator:
                     time.sleep(CLICKER_STAY_SEC)
                     continue
                 if CLICKER_STAY_IN_CHAT:
+                    root_gs = ui_hierarchy(serial)
+                    if root_gs is not None and is_group_settings_page(root_gs):
+                        log.warning("[%s] 左机卡在群设置页，系统返回", name)
+                        dismiss_clicker_group_settings(serial)
+                        time.sleep(CLICKER_STAY_SEC)
+                        continue
                     if _any_clicker_img_flow_busy():
                         time.sleep(CLICKER_STAY_SEC)
                         continue
