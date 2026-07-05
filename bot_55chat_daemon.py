@@ -12732,8 +12732,17 @@ _OUTBOUND_BY_SERIAL: dict[str, OutboundQueue] = {}
 _OUTBOUND_REGISTRY_LOCK = threading.Lock()
 
 
+def _canonical_outbound_serial(serial: str) -> str:
+    """同机 ADB 统一队列键（localhost:PORT 与 127.0.0.1:PORT 不再分裂）。"""
+    port = _adb_port_from_serial(serial)
+    if port and str(port).isdigit():
+        return f"localhost:{port}"
+    return (serial or "").strip()
+
+
 def outbound_for(serial: str) -> OutboundQueue:
     """出站资源 2：按 serial 独立队列，sender/clicker-img 不再踢皮球。"""
+    serial = _canonical_outbound_serial(serial)
     with _OUTBOUND_REGISTRY_LOCK:
         q = _OUTBOUND_BY_SERIAL.get(serial)
         if q is None:
