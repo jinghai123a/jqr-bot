@@ -24,6 +24,9 @@ config/本地-VMOS-开发者凭证.md
 /artifacts/
 /logs/
 
-# One-off diagnostic scripts
+# One-off diagnostic scripts (local sandbox — 已升格见 scripts/vps_*.py)
 /scripts/_*.py
 /scripts/_*.txt
+
+# Personal IDE rules (local only)
+.cursorrules

@@ -4044,7 +4044,9 @@ def describe_screen_context(root: ET.Element | None, bot: dict, serial: str = ""
     title = get_chat_title(root)
     texts = collect_ui_texts(root) if root is not None else []
     in_input = any(t == "输入消息" or t == "Enter message" for t in texts)
-    if is_search_page(root, serial):
+    if is_group_settings_page(root):
+        page = "group_settings"
+    elif is_search_page(root, serial):
         page = "search"
     elif is_target_group_surface(root, bot, serial) or in_target_group_chat(root, bot, serial):
         page = "target_group"
@@ -4054,8 +4056,6 @@ def describe_screen_context(root: ET.Element | None, bot: dict, serial: str = ""
         page = "message_list"
     elif is_in_app_webview(root):
         page = "webview"
-    elif is_group_settings_page(root):
-        page = "group_settings"
     elif in_group_chat(root, bot, serial):
         page = "wrong_chat"
     elif any(label_matches(t, ADD_FRIEND_LABELS) for t in texts) or any(
@@ -5989,15 +5989,44 @@ def clicker_back_to_group(serial: str, bot: dict, *, max_steps: int = 6) -> bool
     return ok
 
 
+def dismiss_clicker_group_settings(serial: str) -> bool:
+    """左机误进群资料/设置页时返回聊天或列表。"""
+    if not is_group_settings_page(ui_hierarchy(serial)):
+        return False
+    log.info("左机退出群资料/设置页")
+    for _ in range(5):
+        root = ui_hierarchy(serial)
+        if not is_group_settings_page(root):
+            invalidate_ui_cache(serial)
+            return True
+        try:
+            adb_run(serial, "shell", "input", "keyevent", "4")
+        except Exception:
+            tap_header_back(serial)
+        wc(0.45, 0.15)
+        invalidate_ui_cache(serial)
+    root2 = ui_hierarchy(serial)
+    if is_group_settings_page(root2):
+        tap_header_back(serial)
+        wc(0.5, 0.2)
+        invalidate_ui_cache(serial)
+    return not is_group_settings_page(ui_hierarchy(serial))
+
+
 def ensure_clicker_in_group(serial: str, bot: dict, *, reason: str = "") -> bool:
     """左机入群/驻群：消息 Tab + 点群名，不走通讯录绕路。"""
     if reason:
         log.info("左机驻群检查 (%s)", reason)
     dismiss_clicker_dialogs(serial)
     dismiss_clicker_popup_overlay(serial)
+    for _ in range(3):
+        if not dismiss_clicker_group_settings(serial):
+            break
+    dismiss_search_page(serial)
     relaunch_clicker_messenger(serial, reason=reason or "ensure-clicker")
     wc(0.8, 0.25)
     dismiss_clicker_contact_compose(serial)
+    dismiss_search_page(serial)
     root = ui_hierarchy(serial)
     if in_target_group_chat(root, bot, serial):
         return True
@@ -6097,6 +6126,8 @@ def ensure_group_chat(serial: str, bot: dict) -> bool:
 
 def is_search_page(root: ET.Element | None, serial: str = "") -> bool:
     if root is None:
+        return False
+    if is_group_settings_page(root):
         return False
     if serial and is_group_chat_activity(serial):
         return False

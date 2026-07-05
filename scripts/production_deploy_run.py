@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bot_ops.config import load_vps_config
+from bot_ops.deploy_secrets import local_secrets_ready, push_runtime_secrets
 from bot_ops.ssh_client import VpsSSH
 
 R = "/home/bot/55chat-bot"
@@ -29,8 +30,6 @@ UPLOAD = (
     "bot_ops/vps_ports.py",
     "bot_ops/ssh_client.py",
     "config/vmos-pads.json",
-    "config/vmos-api.env",
-    "config/tunnel-left.env",
     "scripts/watch-adb-tunnels.sh",
     "scripts/vps_minimal_cron.sh",
     "config/pinned-coords.json",
@@ -47,7 +46,11 @@ UPLOAD = (
     "scripts/vps_tunnel_diag.py",
     "scripts/vps_heal_left_port.py",
     "scripts/vps_fix_finance_adbhost.py",
-    "scripts/_vps_heal_clicker_once.py",
+    "scripts/vps_heal_clicker_once.py",
+    "scripts/vps_diag_announce_left.py",
+    "scripts/vps_hotfix_reload_verify.py",
+    "scripts/vps_recover_clicker_group.py",
+    "bot_ops/deploy_secrets.py",
 )
 
 ENV_KV = (
@@ -92,6 +95,16 @@ def main() -> int:
         if detail.strip():
             print(detail[:2000])
 
+    secrets_ok, secrets_missing = local_secrets_ready(ROOT)
+    if not secrets_ok:
+        step(
+            "local_secrets",
+            False,
+            "部署前请在本地 gitignore 文件填写密钥（勿提交 git）：\n" + "\n".join(secrets_missing),
+        )
+        return 1
+    step("local_secrets", True, "vmos-api + tunnel-left/right SSH_PASS ready")
+
     try:
         subprocess.check_call(
             [sys.executable, "-m", "pytest", "tests/test_nav_guard.py", "tests/test_announce_locked.py", "-q", "--tb=line"],
@@ -111,6 +124,9 @@ def main() -> int:
             f"rm -f {R}/logs/.vmos-refresh.lock; echo stopped",
             20,
         )
+
+        pushed_secrets = push_runtime_secrets(ssh, ROOT, R)
+        step("push_secrets", bool(pushed_secrets), "\n".join(pushed_secrets))
 
         uploaded = []
         for rel in UPLOAD:
@@ -180,15 +196,16 @@ def main() -> int:
         chain_ok = False
         for i in range(20):
             chain_tail = ssh.run(
-                f"grep -E '入队三图后新一局|直接入队新一局|drain serial|批量发图成功|capture-ipc.*done|"
+                f"grep -E '入队三图后新一局|直接入队新一局|drain serial|批量发图成功|capture-ipc.*ok=True|"
                 f"sender-bot-3.*队列出队 kind=open_after_settle|左机公告发送成功' "
-                f"{R}/logs/dual-supervisor.log | tail -15",
+                f"{R}/logs/dual-supervisor.log | tail -12",
                 20,
             )
             if (
-                "入队三图后新一局" in chain_tail
-                or "直接入队新一局" in chain_tail
+                "直接入队新一局" in chain_tail
+                or "capture-ipc] done rid=" in chain_tail and "ok=True" in chain_tail
                 or "sender-bot-3" in chain_tail
+                and "open_after_settle" in chain_tail
                 or "左机公告发送成功" in chain_tail
             ):
                 chain_ok = True
@@ -201,7 +218,7 @@ def main() -> int:
 
         heal = ssh.run(
             f"set -a; source {R}/config/bot-start.env 2>/dev/null; set +a; "
-            f"cd {R} && {PY} {R}/scripts/_vps_heal_clicker_once.py 2>&1",
+            f"cd {R} && {PY} {R}/scripts/vps_heal_clicker_once.py 2>&1",
             150,
         )
         step("clicker_heal", "ensure_ok True" in heal, heal[-800:])
