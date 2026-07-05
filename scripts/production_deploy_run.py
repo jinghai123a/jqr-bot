@@ -180,11 +180,17 @@ def main() -> int:
         chain_ok = False
         for i in range(20):
             chain_tail = ssh.run(
-                f"grep -E '入队三图后新一局|drain serial|批量发图成功|capture-ipc.*done|队列出队 kind=open_after_settle' "
-                f"{R}/logs/dual-supervisor.log | tail -12",
+                f"grep -E '入队三图后新一局|直接入队新一局|drain serial|批量发图成功|capture-ipc.*done|"
+                f"sender-bot-3.*队列出队 kind=open_after_settle|左机公告发送成功' "
+                f"{R}/logs/dual-supervisor.log | tail -15",
                 20,
             )
-            if "入队三图后新一局" in chain_tail or "open_after_settle" in chain_tail:
+            if (
+                "入队三图后新一局" in chain_tail
+                or "直接入队新一局" in chain_tail
+                or "sender-bot-3" in chain_tail
+                or "左机公告发送成功" in chain_tail
+            ):
                 chain_ok = True
                 break
             if "capture-ipc] done" in chain_tail and "ok=True" in chain_tail and i >= 5:
@@ -222,6 +228,19 @@ def main() -> int:
         )
         has_fatal = "Traceback" in logs and "LISTENER 未连接" in logs
         step("logs_clean", not has_fatal, logs[-1500:])
+
+        handoff = ssh.run(
+            f"crontab -l 2>/dev/null | grep -E 'watch-adb|vmos-refresh|maintenance' | head -5; echo '---'; "
+            f"pgrep -af 'bot_dual_supervisor|edge_brain' | grep -v pgrep; echo '---'; "
+            f"grep BOT_CLICKER_SEND_ANNOUNCE {R}/config/bot-start.env",
+            25,
+        )
+        ok_handoff = (
+            "watch-adb" in handoff
+            and "bot_dual_supervisor" in handoff
+            and "BOT_CLICKER_SEND_ANNOUNCE=1" in handoff
+        )
+        step("unattended_handoff", ok_handoff, handoff)
 
     ART.parent.mkdir(parents=True, exist_ok=True)
     ART.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

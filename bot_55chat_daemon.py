@@ -2846,8 +2846,11 @@ def resolve_open_announce_target(settings: dict[str, str] | None = None) -> tupl
         except Exception:
             pass
         if cp:
-            for s in (f"127.0.0.1:{cp}", f"localhost:{cp}"):
-                return s, clicker_bot
+            for host in (f"localhost:{cp}", f"127.0.0.1:{cp}"):
+                resolved = resolve_serial_optional(host, label="clicker-open-announce")
+                if resolved:
+                    return resolved, clicker_bot
+            return f"localhost:{cp}", clicker_bot
         return "", clicker_bot
     return resolve_listener_settle_target(settings)
 
@@ -2868,8 +2871,11 @@ def resolve_listener_settle_target(settings: dict[str, str] | None = None) -> tu
     except Exception:
         pass
     if lp:
-        for s in (f"127.0.0.1:{lp}", f"localhost:{lp}"):
-            return s, listener_bot
+        for host in (f"localhost:{lp}", f"127.0.0.1:{lp}"):
+            resolved = resolve_serial_optional(host, label="listener-open-announce")
+            if resolved:
+                return resolved, listener_bot
+        return f"localhost:{lp}", listener_bot
     return "", listener_bot
 
 
@@ -12024,8 +12030,29 @@ def send_chat_reply(
     *,
     group_ok: bool = False,
     skip_fast: bool = False,
+    kind: str = "",
 ) -> bool:
-    if block_clicker_send(serial, bot, text, where="send"):
+    if block_clicker_send(serial, bot, text, where="send", kind=kind):
+        return False
+    announce_kind = kind in ("warn", "close", "open", "open_after_settle")
+    if clicker_announce_enabled() and announce_kind and (is_clicker_bot(bot) or is_clicker_serial(serial, bot)):
+        if not group_ok and not ensure_clicker_in_group(serial, bot, reason=f"send-{kind or 'announce'}"):
+            log.warning("左机公告发送前未在群 kind=%s", kind or "?")
+            return False
+        snap_ann = ui_snapshot(serial, chat=True, channel="clicker-img")
+        ix = input_xy or snap_ann.input_xy
+        sy = send_xy or snap_ann.inbar_send or snap_ann.keyboard_send
+        if not skip_fast and send_chat_reply_fast_u2(
+            serial, text, snap_ann.texts, snap_ann.draft or "",
+        ):
+            log.info("左机公告发送成功 [fast-u2] kind=%s: %s", kind, message_snip(text)[:40])
+            return True
+        if fill_input_box(serial, ix[0], ix[1], for_adb_send(text))[2]:
+            if sy:
+                adb_tap(serial, sy[0], sy[1])
+                log.info("左机公告发送成功 [tap] kind=%s: %s", kind, message_snip(text)[:40])
+                return True
+        log.warning("左机公告发送失败 kind=%s: %s", kind, message_snip(text)[:40])
         return False
     if not group_ok and not ensure_group_for_send(serial, bot):
         log.warning("不在目标群，取消发送: %s", message_snip(text)[:40])
@@ -12567,6 +12594,8 @@ def _finish_capture_batch_settle(
     *,
     images_ok: bool,
     ipc_open_job: dict | None = None,
+    announce_serial: str = "",
+    announce_bot: dict | None = None,
 ) -> None:
     """结算三图结案：左机内模式 → capture-ipc done 通知右机 open；同进程 → stash。"""
     settle_open_raw: dict | None = None
@@ -12574,9 +12603,23 @@ def _finish_capture_batch_settle(
         settle_open_raw = _CLICKER_SETTLE_OPEN_BY_RID.pop(settled_rid, None)
     open_payload = settle_open_raw or (ipc_open_job if ipc_open_job else None)
     if open_payload:
-        from bot_ops.capture_ipc import mark_capture_done
+        from bot_ops.capture_ipc import mark_capture_done, dict_to_outbound
 
         mark_capture_done(settled_rid, images_ok=images_ok, open_job=open_payload)
+        if images_ok and clicker_announce_enabled():
+            cs = (announce_serial or "").strip()
+            cb = announce_bot
+            if not cs:
+                cs, cb = resolve_open_announce_target()
+            elif not cb:
+                _, cb = resolve_open_announce_target()
+            if cs:
+                ojob = dict_to_outbound(open_payload, cb or {}, cs)
+                outbound_enqueue(ojob)
+                log.info(
+                    "[clicker] 三图成功 → 直接入队新一局 rid=%s serial=%s",
+                    ojob.round_id, cs,
+                )
         return
     flush_open_after_capture(settled_rid, images_ok=images_ok)
 
@@ -12903,7 +12946,7 @@ def dispatch_send(
         return True
     return send_chat_reply(
         serial, bot, text, input_xy, send_xy, settings,
-        group_ok=group_ok, skip_fast=True,
+        group_ok=group_ok, skip_fast=True, kind=kind,
     )
 
 
@@ -13828,15 +13871,7 @@ class Orchestrator:
                 _, _, _, settings = self.ctx.snapshot()
                 if is_clicker_bot(bot):
                     snap = ui_snapshot(serial, chat=False, channel="clicker-img")
-                    root = snap.root
-                    if not in_target_group_chat(root, bot, serial):
-                        if ensure_clicker_in_group(serial, bot, reason="announce"):
-                            snap = ui_snapshot(serial, chat=False, channel="clicker-img")
-                            root = snap.root
-                        if not in_target_group_chat(root, bot, serial):
-                            log.info("[%s] 左机不在群聊，跳过公告", name)
-                            time.sleep(ANNOUNCE_LOOP_SEC)
-                            continue
+                    # 左机发图/选图时 UI 不在群聊页，公告只入队；实际发送由 sender 在发图结束后完成
                     input_xy = snap.input_xy
                     send_xy = snap.inbar_send or snap.keyboard_send
                 else:
@@ -13978,7 +14013,7 @@ class Orchestrator:
                 time.sleep(0.03)
                 continue
             if (
-                job.kind in ("warn", "close", "open")
+                job.kind in ("warn", "close", "open", "open_after_settle")
                 and (_any_clicker_img_flow_busy() or settle_announce_chain_busy(serial))
             ):
                 outbound_enqueue(job)
@@ -14049,6 +14084,7 @@ class Orchestrator:
                         job.settings,
                         group_ok=job.group_ok,
                         skip_fast=not use_fast,
+                        kind=job.kind,
                     )
                 if ok:
                     if job.kind in ("open", "open_after_settle") and job.round_id:
@@ -14260,7 +14296,11 @@ class Orchestrator:
             if job.kind == "capture_batch" and job.round_id:
                 if job.round_id in _CAPTURE_SUCCEEDED:
                     _finish_capture_batch_settle(
-                        job.round_id, images_ok=True, ipc_open_job=ipc_open_job,
+                        job.round_id,
+                        images_ok=True,
+                        ipc_open_job=ipc_open_job,
+                        announce_serial=serial,
+                        announce_bot=bot,
                     )
                     continue
             ok = False
@@ -14284,7 +14324,11 @@ class Orchestrator:
                     log.warning("[%s] 左机不在目标群，跳过发图", name)
                     if job.kind == "capture_batch" and job.round_id:
                         _finish_capture_batch_settle(
-                            job.round_id, images_ok=False, ipc_open_job=ipc_open_job,
+                            job.round_id,
+                            images_ok=False,
+                            ipc_open_job=ipc_open_job,
+                            announce_serial=serial,
+                            announce_bot=bot,
                         )
                     continue
                 if job.kind != "capture_batch" and not (
@@ -14295,7 +14339,11 @@ class Orchestrator:
                     log.warning("[%s] 左机输入栏未就绪，跳过发图", name)
                     if job.kind == "capture_batch" and job.round_id:
                         _finish_capture_batch_settle(
-                            job.round_id, images_ok=False, ipc_open_job=ipc_open_job,
+                            job.round_id,
+                            images_ok=False,
+                            ipc_open_job=ipc_open_job,
+                            announce_serial=serial,
+                            announce_bot=bot,
                         )
                     continue
                 dismiss_clicker_popup_overlay(serial)
@@ -14358,7 +14406,11 @@ class Orchestrator:
                     log.warning("[%s] 左机 UI 发图失败 rid=%s", name, job.round_id)
                 if job.kind == "capture_batch" and job.round_id:
                     _finish_capture_batch_settle(
-                        job.round_id, images_ok=ok, ipc_open_job=ipc_open_job,
+                        job.round_id,
+                        images_ok=ok,
+                        ipc_open_job=ipc_open_job,
+                        announce_serial=serial,
+                        announce_bot=bot,
                     )
                     if ok:
                         _SETTLED_ROUNDS.add(job.round_id)
@@ -14367,7 +14419,11 @@ class Orchestrator:
                 log.exception("[%s] 左机发图异常", name)
                 if job.kind == "capture_batch" and job.round_id:
                     _finish_capture_batch_settle(
-                        job.round_id, images_ok=False, ipc_open_job=ipc_open_job,
+                        job.round_id,
+                        images_ok=False,
+                        ipc_open_job=ipc_open_job,
+                        announce_serial=serial,
+                        announce_bot=bot,
                     )
             finally:
                 clicker_img_flow_end(serial)
