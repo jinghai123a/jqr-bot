@@ -52,6 +52,7 @@ UPLOAD = (
     "scripts/vps_recover_clicker_group.py",
     "scripts/vps_heal_clicker_pause_worker.py",
     "scripts/vps_stack_status_now.py",
+    "scripts/vps_audit_secrets_and_0856.py",
     "bot_ops/deploy_secrets.py",
 )
 

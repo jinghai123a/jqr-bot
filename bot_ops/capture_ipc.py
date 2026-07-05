@@ -176,6 +176,8 @@ def enqueue_capture_ipc(payload: dict[str, Any]) -> bool:
         log.info("[capture-ipc] 跳过重复入队 rid=%s", rid)
         return False
     if clicker_capture_queue_busy():
+        purge_stale_inflight(60.0)
+    if clicker_capture_queue_busy():
         log.info("[capture-ipc] 左机队列忙，推迟入队 rid=%s", rid)
         return False
     payload = {**payload, "ts": time.time(), "pid": os.getpid()}
