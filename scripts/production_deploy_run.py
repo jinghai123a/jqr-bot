@@ -54,6 +54,8 @@ UPLOAD = (
     "scripts/vps_stack_status_now.py",
     "scripts/vps_audit_secrets_and_0856.py",
     "scripts/vps_left_gallery_purge_now.py",
+    "scripts/vps_left_gallery_diag.py",
+    "scripts/vps_captures_cleanup.py",
     "bot_ops/ephemeral_burn.py",
     "bot_ops/deploy_secrets.py",
 )

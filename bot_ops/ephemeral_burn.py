@@ -143,7 +143,7 @@ def purge_gallery_bot_images(serial: str) -> int:
         removed += _purge_mediastore_bot_entries(serial)
         after = _mediastore_image_count(serial)
         if after > 30 and after >= before - 5:
-            removed += _purge_mediastore_all_external(serial, batch=120, max_rounds=200)
+            removed += _mediastore_nuclear_purge(serial)
             after = _mediastore_image_count(serial)
         pruned = max(0, before - after)
         if pruned:
@@ -201,20 +201,73 @@ def _purge_mediastore_shell_batch(serial: str, *, batch: int = 100) -> int:
 
 
 def _purge_mediastore_by_ids(serial: str, ids: list[str]) -> int:
-    n = 0
+    before = _mediastore_image_count(serial)
     for mid in ids:
-        r = _adb_shell(
+        for extra in ((), ("--user", "0")):
+            _adb_shell(
+                serial,
+                "shell",
+                "content",
+                "delete",
+                *extra,
+                "--uri",
+                f"content://media/external/images/media/{mid}",
+                timeout=15,
+            )
+    after = _mediastore_image_count(serial)
+    return max(0, before - after)
+
+
+def _mediastore_nuclear_purge(serial: str) -> int:
+    """VMOS 幽灵索引：停 MediaProvider + 批删直到计数下降。"""
+    before = _mediastore_image_count(serial)
+    if before <= 40:
+        return 0
+    for pkg in (
+        "com.android.providers.media.module",
+        "com.google.android.providers.media.module",
+        "com.android.providers.media",
+    ):
+        _adb_shell(serial, "shell", "am", "force-stop", pkg, timeout=10)
+    _adb_shell(serial, "shell", "rm", "-rf", "/sdcard/DCIM/Camera", timeout=30)
+    _adb_shell(serial, "shell", "mkdir", "-p", "/sdcard/DCIM/Camera", timeout=10)
+    stagnant = 0
+    for rnd in range(60):
+        n = _mediastore_image_count(serial)
+        if n <= 40:
+            break
+        prev = n
+        ids = _mediastore_image_ids(serial, limit=150)
+        if ids:
+            _purge_mediastore_by_ids(serial, ids)
+        else:
+            _purge_mediastore_shell_batch(serial, batch=150)
+        _adb_shell(
             serial,
             "shell",
-            "content",
-            "delete",
-            "--uri",
-            f"content://media/external/images/media/{mid}",
+            "am",
+            "broadcast",
+            "-a",
+            "android.intent.action.MEDIA_MOUNTED",
+            "-d",
+            "file:///sdcard",
             timeout=15,
         )
-        if r.returncode == 0:
-            n += 1
-    return n
+        cur = _mediastore_image_count(serial)
+        if cur >= prev:
+            stagnant += 1
+            if stagnant >= 3:
+                break
+        else:
+            stagnant = 0
+        if rnd % 5 == 4:
+            for pkg in ("com.android.providers.media.module", "com.android.providers.media"):
+                _adb_shell(serial, "shell", "am", "force-stop", pkg, timeout=10)
+    after = _mediastore_image_count(serial)
+    pruned = max(0, before - after)
+    if pruned:
+        log.info("[BURN] nuclear serial=%s %d -> %d (pruned %d)", serial, before, after, pruned)
+    return pruned
 
 
 def _purge_mediastore_all_external(serial: str, *, batch: int = 80, max_rounds: int = 150) -> int:

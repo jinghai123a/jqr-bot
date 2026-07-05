@@ -17,33 +17,11 @@ PY = f"{R}/.venv/bin/python3"
 
 
 def _purge_script(serial: str) -> str:
-    return f"""import os
-from bot_ops.ephemeral_burn import (
-    _mediastore_image_count,
-    _mediastore_image_ids,
-    _purge_mediastore_by_ids,
-    _adb_shell,
-)
+    return f"""from bot_ops.ephemeral_burn import _mediastore_image_count, _mediastore_nuclear_purge
 s = "{serial}"
 b = _mediastore_image_count(s)
 print("before", b, flush=True)
-for rnd in range(30):
-    n = _mediastore_image_count(s)
-    if n <= 40:
-        print("done", n, flush=True)
-        break
-    ids = _mediastore_image_ids(s, limit=200)
-    d = _purge_mediastore_by_ids(s, ids) if ids else 0
-    print("round", rnd, "count", n, "ids", len(ids), "del", d, flush=True)
-    if not ids:
-        _adb_shell(
-            s,
-            "shell",
-            "content query --uri content://media/external/images/media --projection _id | "
-            "grep -oE '_id=[0-9]+' | head -200 | cut -d= -f2 | while read id; do "
-            "content delete --uri content://media/external/images/media/$id; done",
-            timeout=120,
-        )
+p = _mediastore_nuclear_purge(s)
 a = _mediastore_image_count(s)
 print("after", a, "purged", max(0, b - a), flush=True)
 """
