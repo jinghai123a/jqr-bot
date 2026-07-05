@@ -96,7 +96,7 @@ def capture_in_progress_for_rid(rid: int) -> bool:
 def clicker_capture_queue_busy() -> bool:
     """左机发图队列是否已有待处理/进行中任务（禁止并发入队）。"""
     try:
-        purge_stale_inflight(90.0)
+        purge_stale_inflight(60.0)
         return bool(any(_pending_dir().glob("*.json"))) or bool(
             any(_inflight_dir().glob("*.json"))
         )
