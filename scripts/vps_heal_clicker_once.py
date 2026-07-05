@@ -21,12 +21,18 @@ serial = next(
     f"localhost:{clicker_port}",
 )
 from bot_55chat_daemon import (  # noqa: E402
+    _return_from_gallery_to_chat,
+    _verify_gallery_picker_open_serial,
     api,
     clicker_needs_messenger_restart,
+    clicker_return_to_group,
     ensure_clicker_in_group,
+    force_restart_messenger,
+    in_target_group_chat,
     is_55m_foreground,
     is_on_launcher,
     relaunch_clicker_messenger,
+    ui_hierarchy,
     wc,
 )
 
@@ -35,4 +41,17 @@ print("heal_serial", serial, "fg", is_55m_foreground(serial), "launcher", is_on_
 if is_on_launcher(serial) or clicker_needs_messenger_restart(serial) or not is_55m_foreground(serial):
     relaunch_clicker_messenger(serial, reason="deploy-heal")
     wc(1.5, 0.5)
-print("ensure_ok", ensure_clicker_in_group(serial, bot, reason="deploy-heal"))
+if _verify_gallery_picker_open_serial(serial):
+    print("gallery_open", True)
+    _return_from_gallery_to_chat(serial, bot)
+    wc(0.8, 0.3)
+ok = ensure_clicker_in_group(serial, bot, reason="deploy-heal")
+if not ok:
+    clicker_return_to_group(serial, bot, label="deploy-heal-retry")
+    wc(0.6, 0.25)
+    ok = in_target_group_chat(ui_hierarchy(serial), bot, serial)
+if not ok:
+    force_restart_messenger(serial, reason="deploy-heal-hard")
+    wc(2.0, 0.8)
+    ok = ensure_clicker_in_group(serial, bot, reason="deploy-heal-hard")
+print("ensure_ok", ok)

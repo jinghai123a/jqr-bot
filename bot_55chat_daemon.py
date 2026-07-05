@@ -6027,6 +6027,22 @@ def ensure_clicker_in_group(serial: str, bot: dict, *, reason: str = "") -> bool
     wc(0.8, 0.25)
     dismiss_clicker_contact_compose(serial)
     dismiss_search_page(serial)
+    root0 = ui_hierarchy(serial)
+    if root0 is not None:
+        texts0 = collect_ui_texts(root0)
+        if any("群相册" in t for t in texts0):
+            log.info("左机退出群相册页")
+            for _ in range(4):
+                try:
+                    adb_run(serial, "shell", "input", "keyevent", "4")
+                except Exception:
+                    tap_header_back(serial)
+                wc(0.4, 0.15)
+                invalidate_ui_cache(serial)
+                if not any("群相册" in t for t in collect_ui_texts(ui_hierarchy(serial) or root0)):
+                    break
+            tap_bottom_tab(serial, MESSAGES_TAB_LABELS)
+            wc(0.5, 0.15)
     root = ui_hierarchy(serial)
     if in_target_group_chat(root, bot, serial):
         return True

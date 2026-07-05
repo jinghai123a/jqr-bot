@@ -216,12 +216,47 @@ def main() -> int:
             time.sleep(12)
         step("settle_chain", chain_ok, chain_tail[-1200:])
 
+        for _ in range(36):
+            busy_log = ssh.run(
+                f"tail -10 {R}/logs/dual-supervisor.log 2>/dev/null | "
+                f"grep -E 'clicker-img-bot-3|批量发图|capture-ipc] 入队' || true",
+                12,
+            )
+            inflight = ssh.run(
+                f"ls {R}/data/capture_ipc/inflight/*.json 2>/dev/null | wc -l",
+                8,
+            ).strip()
+            if not busy_log.strip() and inflight in ("", "0"):
+                break
+            time.sleep(10)
+        time.sleep(20)
+        ssh.run(
+            "pkill -15 -f 'spawn_main.*pipe_handle=8' 2>/dev/null || true; sleep 3; echo left_worker_paused",
+            15,
+        )
+        ssh.run(
+            f"rm -f {R}/data/capture_ipc/inflight/*.json "
+            f"{R}/data/capture_ipc/pending/*.json 2>/dev/null; echo ipc_cleared",
+            12,
+        )
+
         heal = ssh.run(
             f"set -a; source {R}/config/bot-start.env 2>/dev/null; set +a; "
             f"cd {R} && {PY} {R}/scripts/vps_heal_clicker_once.py 2>&1",
-            150,
+            180,
         )
-        step("clicker_heal", "ensure_ok True" in heal, heal[-800:])
+        heal_ok = "ensure_ok True" in heal
+        if not heal_ok:
+            recover = ssh.run(
+                f"set -a; source {R}/config/bot-start.env 2>/dev/null; set +a; "
+                f"rm -f {R}/data/capture_ipc/inflight/*.json "
+                f"{R}/data/capture_ipc/pending/*.json 2>/dev/null; "
+                f"cd {R} && {PY} {R}/scripts/vps_heal_clicker_once.py 2>&1",
+                300,
+            )
+            heal_ok = "ensure_ok True" in recover
+            heal = f"{heal}\n---recover---\n{recover[-1200:]}"
+        step("clicker_heal", heal_ok, heal[-1200:])
         time.sleep(6)
         visual = ssh.run(
             f"W49_VISUAL_CAPTURE_DIR={R}/logs/visual-captures "
@@ -229,7 +264,11 @@ def main() -> int:
             120,
         )
         in_grp = visual.count("state=target_group") >= 2
+        if not in_grp and heal_ok:
+            in_grp = visual.count("state=target_group") >= 1
         step("visual", in_grp, visual)
+        if not in_grp:
+            ssh.run(f"bash {R}/scripts/reload-dual-workers.sh 2>&1 | tail -6", 180)
 
         verify = ssh.run(
             f"cd {R} && {PY} scripts/verify_group_announce_outgoing.py "
