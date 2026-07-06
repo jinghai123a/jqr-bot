@@ -124,6 +124,27 @@
       "project_paths": ["bot_dual_supervisor.py", "bot_55chat_daemon.py"]
     },
     {
+      "id": "55chat-bot-protocol",
+      "name": "55chat-bot WS 协议文档",
+      "repo": "https://github.com/yee338024/55chat-bot",
+      "commit_pin": "a20b4841a068bed7031c9afef01672f94cd92990",
+      "role": "68助手桌面 WS：msgNew/sendMsg/sendFile/getGroups",
+      "docs": "https://github.com/yee338024/55chat-bot/tree/a20b484/docs",
+      "usage_permanent": [
+        "BOT_55WS_URL=ws://127.0.0.1:5600（本机端口以实测为准）",
+        "握手 Hello → 3s socketLogin 心跳",
+        "收 msgNew(sendUid/groupId) 发 sendMsg/sendFile",
+        "确认 msgListPropertyUpdate readStatus 1",
+        "规格 config/55m-knowledge/desktop-protocol.json"
+      ],
+      "project_paths": [
+        "scripts/desktop_local_announce.py",
+        "scripts/desktop_local_stack.py",
+        "protocol/55ws-client/",
+        "config/55m-knowledge/desktop-protocol.json"
+      ]
+    },
+    {
       "id": "vmos-openapi",
       "name": "VMOS Cloud OpenAPI",
       "repo": "https://cloud.vmoscloud.com/vmoscloud/doc/zh/server/OpenAPI.html",
