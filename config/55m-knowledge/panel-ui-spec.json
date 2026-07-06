@@ -1,0 +1,106 @@
+{
+  "title": "55M 控制面板（核对栏）规格汇总",
+  "collected_at": "2026-07-07",
+  "sources": [
+    {"path": "docs/用户使用.md", "role": "最高标准：公告正文、指令回复、玩法限额"},
+    {"path": "config/55m-knowledge/announce-templates.json", "role": "warn/close/open 发群原文"},
+    {"path": "config/55m-knowledge/chat-commands.json", "role": "群内指令与下注格式"},
+    {"path": "config/55m-knowledge/panel-catalog.json", "role": "products/combo-rules mock"},
+    {"path": "bot_55chat_daemon.py", "role": "DEFAULT_SETTINGS 回复模板 + Panel API 消费端"},
+    {"path": "config/55m-knowledge/control-plane.json", "role": "生产 APS 路径"}
+  ],
+  "production": {
+    "host": "195.114.193.136",
+    "panel_api": "http://195.114.193.136:3000",
+    "bot_root": "/home/bot/55chat-bot",
+    "note": "Panel 为 JSON API 服务；管理 UI 在 VPS bot_root（本机无 SSH 凭证时以知识库+mock 为准）",
+    "vps_sync_script": "scripts/panel_sync_from_vps.py",
+    "vps_sync_status": "blocked_no_vps_ssh_env"
+  },
+  "local_mock": {
+    "url": "http://127.0.0.1:3000",
+    "dashboard": "http://127.0.0.1:3000/",
+    "script": "scripts/edge_mock_panel.py",
+    "state_file": "data/local-panel-state.json"
+  },
+  "architecture": {
+    "summary": "机器人 daemon 通过 HTTP 读 Panel；群聊 OUT 文案来自 settings 模板 + handle_command；余额/下注/流水以 Panel users+bills 为准",
+    "bots": [
+      {"id": "bot-3", "role": "CLICKER", "adb": "左机发图/ADD 点击"},
+      {"id": "bot-4", "role": "LISTENER", "adb": "右机读屏/文字 OUT"}
+    ],
+    "data_flow": [
+      "用户 msgNew → daemon 认 messengerId → GET /api/users",
+      "下注 → POST 校验 products/combo-rules → 扣余额 → POST /api/logs",
+      "上分/下分 → POST topup/withdraw-requests → 群主面板同意 → 群回复模板",
+      "公告 → GET /api/settings warn/close/openAnnounceTemplate → sendMsg"
+    ]
+  },
+  "api_endpoints": [
+    {"method": "GET", "path": "/api/bots", "desc": "双机绑定：associatedGroup、adbHost、status"},
+    {"method": "GET", "path": "/api/settings", "desc": "公告模板、期号锚点 roundAnchor*、roundIntervalSec、各类 replyTemplate"},
+    {"method": "GET", "path": "/api/users", "desc": "客户：username、balance、customerCode、messengerId、botId"},
+    {"method": "POST", "path": "/api/users", "desc": "绑定/新建用户"},
+    {"method": "GET", "path": "/api/products", "desc": "玩法道次 1-5：lane/pc28/mark6 限额赔率"},
+    {"method": "GET", "path": "/api/combo-rules", "desc": "六合组合/波色/大小单双赔率与 groupLimit"},
+    {"method": "GET", "path": "/api/topup-requests?botId=", "desc": "待同意上分队列"},
+    {"method": "GET", "path": "/api/withdraw-requests?botId=", "desc": "待同意下分队列"},
+    {"method": "POST", "path": "/api/topup-requests/{id}/sent", "desc": "上分已通知群"},
+    {"method": "POST", "path": "/api/withdraw-requests/{id}/sent", "desc": "下分已通知群"},
+    {"method": "GET", "path": "/api/draw/boards", "desc": "28.run 走势数据"},
+    {"method": "GET", "path": "/api/trade-flow?period=", "desc": "当期流水（结算第三图）"},
+    {"method": "POST", "path": "/api/logs", "desc": "下注/派彩日志写入"}
+  ],
+  "ui_sections": [
+    {
+      "id": "bots",
+      "label": "机器人实例",
+      "fields": ["id", "status", "platform", "associatedGroup", "adbHost"],
+      "operator_action": "查看双机是否 ACTIVE、群名是否正确"
+    },
+    {
+      "id": "users",
+      "label": "客户核对栏（核心）",
+      "fields": ["username", "customerCode", "messengerId", "balance", "botId"],
+      "operator_action": "绑定 messengerId、改余额、核对编号；群下注以此处为准"
+    },
+    {
+      "id": "products",
+      "label": "玩法/道次",
+      "fields": ["code", "name", "kind", "maxUnit", "oddsSingle", "oddsDxds"],
+      "operator_action": "限额赔率配置（与封盘公告一致）"
+    },
+    {
+      "id": "combo_rules",
+      "label": "六合组合规则",
+      "fields": ["pick", "category", "odds", "minUnit", "maxUnit", "groupLimit"],
+      "operator_action": "组合/波色/合单合双限额"
+    },
+    {
+      "id": "settings",
+      "label": "系统设置与公告模板",
+      "keys": [
+        "warnAnnounceTemplate",
+        "closeAnnounceTemplate",
+        "openAnnounceTemplate",
+        "balanceReplyTemplate",
+        "comboSuccessTemplate",
+        "topupPendingTemplate",
+        "withdrawPendingTemplate",
+        "roundAnchorPeriod",
+        "roundAnchorBeijing",
+        "roundIntervalSec"
+      ],
+      "operator_action": "编辑发群公告与扣1/下注成功/上下分回复模板；期号锚点对齐 28.run"
+    },
+    {
+      "id": "finance_queue",
+      "label": "上下分待办",
+      "fields": ["username", "amount", "status", "botId"],
+      "operator_action": "群主点同意 → 机器人群内通知 + 改 balance"
+    }
+  ],
+  "reply_templates_ref": "bot_55chat_daemon.py DEFAULT_SETTINGS",
+  "announce_ref": "config/55m-knowledge/announce-templates.json",
+  "chat_commands_ref": "config/55m-knowledge/chat-commands.json"
+}

@@ -125,15 +125,55 @@ def _kill_stale_mock_panel() -> None:
     )
 
 
-def _ensure_panel(env: dict[str, str]) -> None:
-    if not _health("http://127.0.0.1:3000/api/bots", 2.0):
-        _spawn([PY, str(ROOT / "scripts" / "edge_mock_panel.py")], env=env, detach=True)
+def _kill_stale_brain() -> None:
+    if sys.platform != "win32":
         return
-    if _health_catalog():
+    subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | "
+            "Where-Object { $_.CommandLine -match '-m edge_brain' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        ],
+        check=False,
+        timeout=10,
+    )
+
+
+def _kill_stale_stack() -> None:
+    """清场：panel/brain/announce 各只留即将启动的一实例。"""
+    _kill_stale_mock_panel()
+    _kill_stale_brain()
+    if sys.platform != "win32":
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | "
+                "Where-Object { $_.CommandLine -match 'desktop_local_announce' } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+            ],
+            check=False,
+            timeout=10,
+        )
+    lock = ROOT / "data" / ".desktop_announce.lock"
+    try:
+        lock.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _ensure_panel(env: dict[str, str]) -> None:
+    if _health("http://127.0.0.1:3000/api/bots", 2.0) and _health_catalog():
         return
     _kill_stale_mock_panel()
     time.sleep(0.6)
     _spawn([PY, str(ROOT / "scripts" / "edge_mock_panel.py")], env=env, detach=True)
+    if not _health("http://127.0.0.1:3000/api/bots", 15.0):
+        print("panel spawn timeout", file=sys.stderr)
 
 
 def main() -> int:
@@ -168,9 +208,14 @@ def main() -> int:
         "PYTHONUNBUFFERED": "1",
     }
 
+    if not args.check:
+        _kill_stale_stack()
+
     _ensure_panel(env)
     if not _health("http://127.0.0.1:8790/health", 2.0):
+        _kill_stale_brain()
         _spawn([PY, "-m", "edge_brain"], env=env, detach=True)
+        _health("http://127.0.0.1:8790/health", 12.0)
 
     if not _health("http://127.0.0.1:3000/api/bots"):
         print("panel FAIL", file=sys.stderr)

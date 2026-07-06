@@ -21,6 +21,8 @@ PORT = int(os.environ.get("EDGE_MOCK_PANEL_PORT", "3000") or 3000)
 STATE_PATH = ROOT / "data" / "local-panel-state.json"
 KNOWLEDGE = ROOT / "config" / "55m-knowledge" / "announce-templates.json"
 CATALOG = ROOT / "config" / "55m-knowledge" / "panel-catalog.json"
+SPEC = ROOT / "config" / "55m-knowledge" / "panel-ui-spec.json"
+COMMANDS = ROOT / "config" / "55m-knowledge" / "chat-commands.json"
 _LOCK = threading.Lock()
 _CATALOG_CACHE: tuple[list[Any], list[Any]] | None = None
 
@@ -125,6 +127,117 @@ def _json(handler: BaseHTTPRequestHandler, code: int, body: Any) -> None:
     handler.wfile.write(raw)
 
 
+def _html(handler: BaseHTTPRequestHandler, code: int, body: str) -> None:
+    raw = body.encode("utf-8")
+    handler.send_response(code)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(raw)))
+    handler.end_headers()
+    handler.wfile.write(raw)
+
+
+def _esc(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _load_announce() -> dict[str, Any]:
+    if not KNOWLEDGE.is_file():
+        return {}
+    try:
+        return json.loads(KNOWLEDGE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _load_commands() -> dict[str, Any]:
+    if not COMMANDS.is_file():
+        return {}
+    try:
+        return json.loads(COMMANDS.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _dashboard_html() -> str:
+    st = _load_state()
+    products, combo_rules = _load_catalog()
+    ann = _load_announce()
+    cmds = _load_commands()
+    tpls = ann.get("templates") or {}
+    warn = str((tpls.get("warn") or {}).get("text") or "")
+    close = str((tpls.get("close") or {}).get("text") or "")
+    open_tpl = str((tpls.get("open") or {}).get("template") or "")
+    users = st.get("users") or []
+    finance = cmds.get("finance") or {}
+    bet = cmds.get("bet_rules") or {}
+    rows_users = "".join(
+        f"<tr><td>{_esc(str(u.get('username','')))}</td>"
+        f"<td>{_esc(str(u.get('customerCode','')))}</td>"
+        f"<td>{_esc(str(u.get('messengerId','')))}</td>"
+        f"<td>{u.get('balance','')}</td></tr>"
+        for u in users
+    )
+    rows_prod = "".join(
+        f"<tr><td>{_esc(str(p.get('code','')))}</td>"
+        f"<td>{_esc(str(p.get('name','')))}</td>"
+        f"<td>{_esc(str(p.get('kind','')))}</td></tr>"
+        for p in products
+    )
+    rows_fin = "".join(
+        f"<tr><td><code>{_esc(k)}</code></td><td>{_esc(str(v))}</td></tr>"
+        for k, v in finance.items()
+    )
+    rows_bet = "".join(
+        f"<tr><td><code>{_esc(str(f.get('pattern','')))}</code></td>"
+        f"<td>{_esc(str(f.get('desc','')))}</td></tr>"
+        for f in (bet.get("formats") or [])
+    )
+    api_links = "".join(
+        f'<li><a href="{p}">{p}</a></li>'
+        for p in (
+            "/api/bots",
+            "/api/settings",
+            "/api/users",
+            "/api/products",
+            "/api/combo-rules",
+            "/api/spec",
+        )
+    )
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<title>55M 控制面板 · 核对栏（本地 mock）</title>
+<style>
+body{{font-family:system-ui,sans-serif;margin:24px;background:#0f1117;color:#e6edf3}}
+h1,h2{{color:#58a6ff}} section{{margin:24px 0;padding:16px;background:#161b22;border-radius:8px}}
+table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #30363d;padding:8px;text-align:left}}
+pre{{white-space:pre-wrap;background:#0d1117;padding:12px;border-radius:6px;font-size:13px;max-height:320px;overflow:auto}}
+code{{color:#79c0ff}} a{{color:#58a6ff}} .tag{{display:inline-block;background:#238636;padding:2px 8px;border-radius:4px;font-size:12px}}
+</style></head><body>
+<h1>55M 控制面板 <span class="tag">本地 mock · 核对栏</span></h1>
+<p>生产 APS <code>195.114.193.136:3000</code> 本机不可达时，以此页 + JSON API 为准。规格源：<code>docs/用户使用.md</code></p>
+<section><h2>① 机器人实例</h2><table><tr><th>ID</th><th>角色</th><th>群</th><th>ADB</th></tr>
+<tr><td>bot-3</td><td>CLICKER 左机</td><td>苍井空测试</td><td>发图/ADD</td></tr>
+<tr><td>bot-4</td><td>LISTENER 右机</td><td>苍井空测试</td><td>读屏/文字 OUT</td></tr></table></section>
+<section><h2>② 客户核对栏（users）</h2><table><tr><th>昵称</th><th>编号</th><th>messengerId</th><th>余额</th></tr>
+{rows_users or '<tr><td colspan="4">（空）</td></tr>'}</table></section>
+<section><h2>③ 玩法 products（{len(products)}）</h2><table><tr><th>道</th><th>名称</th><th>类型</th></tr>{rows_prod}</table>
+<p>combo-rules：{len(combo_rules)} 条 · <a href="/api/combo-rules">/api/combo-rules</a></p></section>
+<section><h2>④ 群内指令</h2><table><tr><th>指令</th><th>说明</th></tr>{rows_fin}</table>
+<table style="margin-top:12px"><tr><th>下注格式</th><th>说明</th></tr>{rows_bet}</table>
+<p>金额后缀只认「各」；封盘后：<code>{_esc(str(bet.get('closed_reply','')))}</code></p></section>
+<section><h2>⑤ 公告正文（发群原文）</h2>
+<h3>warn · 封盘前70s窗</h3><pre>{_esc(warn)}</pre>
+<h3>close · 封盘前15s窗</h3><pre>{_esc(close)}</pre>
+<h3>open · 三图后新一局</h3><pre>{_esc(open_tpl)}</pre></section>
+<section><h2>⑥ API</h2><ul>{api_links}</ul></section>
+</body></html>"""
+
+
 def _read_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     n = int(handler.headers.get("Content-Length", "0") or 0)
     raw = handler.rfile.read(n) if n > 0 else b"{}"
@@ -182,6 +295,15 @@ class Handler(BaseHTTPRequestHandler):
             period = int((qs.get("period") or ["0"])[0] or 0)
             bills = [b for b in st.get("bills") or [] if not period or int(b.get("period") or 0) == period]
             _json(self, 200, {"period": period, "rows": bills[-10:], "mock": False})
+            return
+        if path.path == "/api/spec":
+            if SPEC.is_file():
+                _json(self, 200, json.loads(SPEC.read_text(encoding="utf-8")))
+            else:
+                _json(self, 404, {"error": "panel-ui-spec.json missing"})
+            return
+        if path.path in ("/", "/panel", "/dashboard"):
+            _html(self, 200, _dashboard_html())
             return
         _json(self, 404, {"error": "not found"})
 
