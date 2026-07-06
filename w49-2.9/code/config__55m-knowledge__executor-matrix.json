@@ -13,6 +13,7 @@
       "description": "本机 68助手 WS：指令/公告/结算三图（本地 E2E，非生产双机）",
       "env": "BOT_EXECUTOR=ws BOT_55WS_URL=ws://127.0.0.1:5600 BOT_ANNOUNCE_LOCKED=1",
       "stack": "edge_mock_panel:3000 + edge_brain:8790 + desktop_local_announce.py",
+      "panel_catalog": "config/55m-knowledge/panel-catalog.json",
       "business": "bot_55chat_daemon.handle_command + panel API + w49_core timing",
       "forbidden": ["bot_dual_supervisor.py", "spawn_main LISTENER 同群发字"],
       "not_covered": ["ADD", "绑 ID 点头像", "生产双机 UI 三图点击"]

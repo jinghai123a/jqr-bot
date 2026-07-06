@@ -43,6 +43,7 @@
     "protocol/55ws-client/local_desktop_bot.js",
     "scripts/desktop_local_announce.py",
     "scripts/desktop_local_stack.py",
+    "config/55m-knowledge/panel-catalog.json",
     "docs/本地桌面测试.md"
   ],
   "executor_env": {

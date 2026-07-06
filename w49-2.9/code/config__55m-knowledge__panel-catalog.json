@@ -1,0 +1,26 @@
+{
+  "source": "docs/用户使用.md §3 玩法限额摘要",
+  "note": "mock panel /api/products 与 /api/combo-rules 数据源；生产 panel 以线上为准",
+  "products": [
+    {"id": "lane-1", "botId": "bot-4", "code": "1", "name": "冠军定位胆", "kind": "lane", "maxUnit": 5000, "oddsSingle": 9.63, "oddsDxds": 1.924},
+    {"id": "lane-2", "botId": "bot-4", "code": "2", "name": "亚军定位胆", "kind": "lane", "maxUnit": 5000, "oddsSingle": 9.63, "oddsDxds": 1.924},
+    {"id": "lane-3", "botId": "bot-4", "code": "3", "name": "季军定位胆", "kind": "lane", "maxUnit": 5000, "oddsSingle": 9.63, "oddsDxds": 1.924},
+    {"id": "pc28-4", "botId": "bot-4", "code": "4", "name": "PC28特码", "kind": "pc28", "maxDxds": 20000, "maxCombo": 10000},
+    {"id": "mark6-5", "botId": "bot-4", "code": "5", "name": "六合彩", "kind": "mark6", "maxNumber": 49, "oddsSpecial": 46}
+  ],
+  "combo_rules": [
+    {"pick": "大", "category": "dxds", "odds": 1.84, "minUnit": 20, "maxUnit": 10000, "groupLimit": 500000},
+    {"pick": "小", "category": "dxds", "odds": 1.91, "minUnit": 20, "maxUnit": 10000, "groupLimit": 500000},
+    {"pick": "单", "category": "dxds", "odds": 1.84, "minUnit": 20, "maxUnit": 10000, "groupLimit": 500000},
+    {"pick": "双", "category": "dxds", "odds": 1.91, "minUnit": 20, "maxUnit": 10000, "groupLimit": 500000},
+    {"pick": "大单", "category": "combo", "odds": 3.5, "groupLimit": 250000},
+    {"pick": "大双", "category": "combo", "odds": 3.8, "groupLimit": 250000},
+    {"pick": "小单", "category": "combo", "odds": 3.8, "groupLimit": 250000},
+    {"pick": "小双", "category": "combo", "odds": 3.8, "groupLimit": 250000},
+    {"pick": "合单", "category": "heds", "odds": 1.84, "groupLimit": 500000},
+    {"pick": "合双", "category": "heds", "odds": 1.91, "groupLimit": 500000},
+    {"pick": "红波", "category": "wave", "odds": 2.7, "groupLimit": 200000},
+    {"pick": "蓝波", "category": "wave", "odds": 2.87, "groupLimit": 200000},
+    {"pick": "绿波", "category": "wave", "odds": 2.87, "groupLimit": 200000}
+  ]
+}

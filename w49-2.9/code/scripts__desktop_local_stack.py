@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -74,6 +76,65 @@ def _spawn(cmd: list[str], *, env: dict[str, str] | None = None, detach: bool = 
     return p
 
 
+def _health_ws(url: str, sec: float = 6.0) -> bool:
+    try:
+        import websocket  # type: ignore
+    except ImportError:
+        return False
+    ready = threading.Event()
+
+    def on_message(_ws: object, message: str) -> None:
+        try:
+            if json.loads(message).get("message") == "Hello":
+                ready.set()
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    def run() -> None:
+        ws_app = websocket.WebSocketApp(url, on_message=on_message)
+        ws_app.run_forever(ping_interval=20, ping_timeout=8)
+
+    threading.Thread(target=run, name="ws-health", daemon=True).start()
+    return ready.wait(timeout=sec)
+
+
+def _health_catalog() -> bool:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:3000/api/products", timeout=3) as r:
+            products = json.loads(r.read().decode("utf-8"))
+        return isinstance(products, list) and len(products) > 0
+    except Exception:
+        return False
+
+
+def _kill_stale_mock_panel() -> None:
+    if sys.platform != "win32":
+        return
+    subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | "
+            "Where-Object { $_.CommandLine -match 'edge_mock_panel' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        ],
+        check=False,
+        timeout=10,
+    )
+
+
+def _ensure_panel(env: dict[str, str]) -> None:
+    if not _health("http://127.0.0.1:3000/api/bots", 2.0):
+        _spawn([PY, str(ROOT / "scripts" / "edge_mock_panel.py")], env=env, detach=True)
+        return
+    if _health_catalog():
+        return
+    _kill_stale_mock_panel()
+    time.sleep(0.6)
+    _spawn([PY, str(ROOT / "scripts" / "edge_mock_panel.py")], env=env, detach=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="仅验 panel/brain/WS")
@@ -104,8 +165,7 @@ def main() -> int:
         "PYTHONUNBUFFERED": "1",
     }
 
-    if not _health("http://127.0.0.1:3000/api/bots", 2.0):
-        _spawn([PY, str(ROOT / "scripts" / "edge_mock_panel.py")], env=env, detach=True)
+    _ensure_panel(env)
     if not _health("http://127.0.0.1:8790/health", 2.0):
         _spawn([PY, "-m", "edge_brain"], env=env, detach=True)
 
@@ -123,6 +183,15 @@ def main() -> int:
 
     print("LOCAL_DESKTOP_STACK_OK panel=:3000 brain=:8790 ws=" + env["BOT_55WS_URL"])
     if args.check:
+        ws_ok = _health_ws(env["BOT_55WS_URL"])
+        cat_ok = _health_catalog()
+        print(f"WS_HANDSHAKE={'OK' if ws_ok else 'FAIL'} PANEL_CATALOG={'OK' if cat_ok else 'FAIL'}")
+        if not ws_ok:
+            print("68助手 WS 未就绪 — 请确认已登录且 BOT_55WS_URL 正确", file=sys.stderr)
+            return 2
+        if not cat_ok:
+            print("panel products 为空 — 检查 config/55m-knowledge/panel-catalog.json", file=sys.stderr)
+            return 2
         return 0
 
     lock = ROOT / "data" / ".desktop_announce.lock"
