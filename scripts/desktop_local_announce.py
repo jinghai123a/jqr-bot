@@ -291,13 +291,15 @@ class Ws55:
         if not daemon:
             return
         content = str(d.get("content") or "").strip()
-        if not content or int(d.get("msgType") or 0) not in (0,):
-            return
         nick = (
             d.get("sendMember", {}).get("user", {}).get("nickName")
             or d.get("user", {}).get("nickName")
             or ""
         )
+        msg_type = int(d.get("msgType") or d.get("chatType") or 0)
+        if not content or msg_type not in (0,):
+            return
+        log.info("IN cmd nick=%s content=%s", nick or "?", content[:40])
         uid = str(d.get("sendUid") or d.get("UserID") or "")
         try:
             users = ensure_panel_user(str(nick), uid)
@@ -490,12 +492,13 @@ def main() -> int:
     settings = load_settings()
     bot = load_bot()
     ws.set_context(d, settings, bot)
-    try:
-        gid = require_group_id()
-        ws.send_text(gid, "[bot] 本地桌面栈在线 — 请发 扣1 或 1 测试回复")
-        log.info("OUT ping gid=%s", gid)
-    except Exception as ex:
-        log.warning("startup ping: %s", ex)
+    if os.environ.get("DESKTOP_STARTUP_PING", "").lower() in ("1", "true", "yes"):
+        try:
+            gid = require_group_id()
+            ws.send_text(gid, "[bot] 本地桌面栈在线 — 请发 扣1 或 1 测试回复")
+            log.info("OUT ping gid=%s", gid)
+        except Exception as ex:
+            log.warning("startup ping: %s", ex)
     rid, _, rem = d.active_round_timing(settings)
     group = (bot.get("associatedGroup") or TARGET_GROUP).strip()
     if not d.in_maintenance_window():
@@ -525,6 +528,7 @@ def main() -> int:
             if d.in_maintenance_window():
                 time.sleep(LOOP_SEC)
                 continue
+            try_open(d, ws, bot, settings)
             try_warn(d, ws, bot, settings)
             try_close(d, ws, bot, settings)
             try_settle(d, ws, settings)
