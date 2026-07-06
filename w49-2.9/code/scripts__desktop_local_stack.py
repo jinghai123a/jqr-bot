@@ -20,6 +20,7 @@ PY = os.environ.get("DESKTOP_PYTHON") or str(
     if (ROOT / ".venv" / "Scripts" / "python.exe").is_file()
     else sys.executable
 )
+PY = str(Path(PY).resolve())
 
 
 def _conflicting_adb_executor() -> str | None:
@@ -162,6 +163,8 @@ def main() -> int:
         "DESKTOP_GROUP_ID": os.environ.get("DESKTOP_GROUP_ID", "492316"),
         "EDGE_MOCK_GROUP_LEFT": os.environ.get("BOT_TARGET_GROUP", "苍井空测试"),
         "EDGE_MOCK_GROUP_RIGHT": os.environ.get("BOT_TARGET_GROUP", "苍井空测试"),
+        "DESKTOP_WS_ACK_OPTIONAL": "1",
+        "DESKTOP_PYTHON": PY,
         "PYTHONUNBUFFERED": "1",
     }
 
