@@ -15,16 +15,17 @@ $env:EDGE_BRAIN_JWT_SECRET = "w49-local-desktop-test"
 $env:BOT_55WS_URL = "ws://127.0.0.1:5600"
 $env:DESKTOP_GROUP_ID = "492316"
 $env:PYTHONUNBUFFERED = "1"
+$env:DESKTOP_WS_ACK_OPTIONAL = "1"
 $env:DESKTOP_PYTHON = $Py
 
 Write-Host "[2/2] start stack (panel+brain+announce)"
 Start-Process -FilePath $Py -ArgumentList @("$Root\scripts\desktop_local_stack.py") -WorkingDirectory $Root -WindowStyle Minimized
 
-Start-Sleep -Seconds 15
+Start-Sleep -Seconds 20
 
 Get-CimInstance Win32_Process -Filter "name='python.exe'" -ErrorAction SilentlyContinue |
   Where-Object {
-    $_.CommandLine -match 'desktop_local_announce|desktop_local_stack|edge_mock_panel|-m edge_brain' -and
+    $_.CommandLine -match 'desktop_local_stack\.py' -and
     $_.CommandLine -notlike '*\.venv\Scripts\python*'
   } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

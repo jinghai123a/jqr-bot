@@ -198,6 +198,7 @@ class Ws55:
         self._ack_fail: set[str] = set()
         self._send_retries = max(0, int(os.environ.get("DESKTOP_WS_SEND_RETRIES", "2") or 2))
         self._send_ack_sec = float(os.environ.get("DESKTOP_WS_SEND_ACK_SEC", "2.5") or 2.5)
+        self._ack_optional = os.environ.get("DESKTOP_WS_ACK_OPTIONAL", "1").lower() in ("1", "true", "yes")
 
     def set_context(self, daemon: Any, settings: dict[str, str], bot: dict) -> None:
         with self._ctx_lock:
@@ -310,6 +311,9 @@ class Ws55:
                 log.warning("WS send ack fail id=%s attempt=%s", msg_id, attempt + 1)
             else:
                 self._ack_events.pop(msg_id, None)
+                if self._ack_optional:
+                    log.debug("WS send ack timeout id=%s — optimistic OK (68助手常不回 readStatus)", msg_id)
+                    return
                 last_err = "ack timeout"
                 log.warning("WS send ack timeout id=%s attempt=%s", msg_id, attempt + 1)
         raise RuntimeError(f"WS send failed after {attempts} tries: {last_err}")
