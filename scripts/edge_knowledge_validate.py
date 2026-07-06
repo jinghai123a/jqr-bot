@@ -37,6 +37,10 @@ def main() -> int:
     assert oss.get("locked") and oss.get("stacks"), "oss-stack invalid"
     matrix = json.loads((KB / "executor-matrix.json").read_text(encoding="utf-8"))
     assert "edge_124" in matrix.get("modes", {}) or "dual_supervisor" in matrix.get("modes", {}), "executor-matrix invalid"
+    assert "desktop_ws" in matrix.get("modes", {}), "executor-matrix missing desktop_ws"
+    dp = KB / "desktop-protocol.json"
+    if dp.is_file():
+        json.loads(dp.read_text(encoding="utf-8"))
     print(f"KNOWLEDGE_OK {len(REQUIRED)} files")
     return 0
 

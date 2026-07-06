@@ -20,6 +20,32 @@ PY = os.environ.get("DESKTOP_PYTHON") or str(
 )
 
 
+def _conflicting_adb_executor() -> str | None:
+    """BOT_EXECUTOR=ws 时禁止 dual_supervisor / 单进程 daemon 同群 OUT。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | "
+                "Where-Object { $_.CommandLine -match 'bot_dual_supervisor|bot_55chat_daemon' } | "
+                "Select-Object -ExpandProperty CommandLine",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    return lines[0][:200]
+
+
 def _health(url: str, sec: float = 20.0) -> bool:
     deadline = time.time() + sec
     while time.time() < deadline:
@@ -53,7 +79,18 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="仅验 panel/brain/WS")
     args = ap.parse_args()
 
+    clash = _conflicting_adb_executor()
+    if clash:
+        print(
+            "CONFLICT: BOT_EXECUTOR=ws 与 ADB daemon 不能并行。\n"
+            f"  检测到: {clash}\n"
+            "  请先停止 bot_dual_supervisor / bot_55chat_daemon 再启动桌面栈。",
+            file=sys.stderr,
+        )
+        return 3
+
     env = {
+        "BOT_EXECUTOR": "ws",
         "EDGE_BRAIN_JWT_SECRET": "w49-local-desktop-test",
         "EDGE_BRAIN_HOST": "0.0.0.0",
         "EDGE_BRAIN_PORT": "8790",

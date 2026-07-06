@@ -35,6 +35,12 @@
     ],
     "project": "mock_gateway.py"
   },
+  "desktop_protocol": {
+    "spec": "config/55m-knowledge/desktop-protocol.json",
+    "upstream_doc": "https://github.com/yee338024/55chat-bot/tree/a20b4841a068bed7031c9afef01672f94cd92990",
+    "local_test": "docs/本地桌面测试.md",
+    "default_ws_env": "BOT_55WS_URL=ws://127.0.0.1:5600"
+  },
   "draw_28run": {
     "url": "https://28.run/api/lottery/recent/6",
     "referer": "https://28.run/",

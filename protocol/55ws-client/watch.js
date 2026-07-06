@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * 连接 55M 电脑版本地 WebSocket 服务 ws://127.0.0.1:5599
+ * 连接 55M 电脑版本地 WebSocket（文档默认 5599；68助手 v1.6.8 实测 5600）
  * 协议: https://github.com/yee338024/55chat-bot
  */
 import WebSocket from "ws";
 import fs from "fs";
 import path from "path";
 
-const WS_URL = process.env.BOT_55WS_URL || "ws://127.0.0.1:5599";
+const WS_URL = process.env.BOT_55WS_URL || "ws://127.0.0.1:5600";
 const LOG_DIR = process.env.BOT_55WS_LOG_DIR || "/opt/55chat/logs";
 const ONCE = process.argv.includes("--once");
 const RETRY_MS = Number(process.env.BOT_55WS_RETRY_MS || 3000);
