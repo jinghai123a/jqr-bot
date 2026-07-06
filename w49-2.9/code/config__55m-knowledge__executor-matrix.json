@@ -1,0 +1,43 @@
+{
+  "policy": "124.txt 开源拼装：云机 HTTP/WS 热路径，隧道仅运维",
+  "mutual_exclusion": {
+    "rule": "同一 bot 角色、同一 OUT 事件只允许一种执行器",
+    "env": "BOT_EXECUTOR=ws|adb",
+    "forbidden_parallel": [
+      "desktop_local_announce.py + bot_dual_supervisor spawn LISTENER 同群 OUT",
+      "desktop_local_announce.py + bot_55chat_daemon 单进程同群 OUT"
+    ]
+  },
+  "modes": {
+    "desktop_ws": {
+      "description": "本机 68助手 WS：指令/公告/结算三图（本地 E2E，非生产双机）",
+      "env": "BOT_EXECUTOR=ws BOT_55WS_URL=ws://127.0.0.1:5600 BOT_ANNOUNCE_LOCKED=1",
+      "stack": "edge_mock_panel:3000 + edge_brain:8790 + desktop_local_announce.py",
+      "business": "bot_55chat_daemon.handle_command + panel API + w49_core timing",
+      "forbidden": ["bot_dual_supervisor.py", "spawn_main LISTENER 同群发字"],
+      "not_covered": ["ADD", "绑 ID 点头像", "生产双机 UI 三图点击"]
+    },
+    "edge_124": {
+      "description": "124 整合生产（推荐）",
+      "env": "BOT_EDGE_MODE=124 BOT_EDGE_LEFT_JS=1 BOT_EDGE_AUTOJS6=1 BOT_CLICKER_SEND_IMAGES=0",
+      "left": "AutoJs6 settle_left.js → GET settle-bundle → tap 发图 → POST settle-done",
+      "right": "bot_55chat_daemon LISTENER b64+ADB Keyboard（probe-android 待 Phase2）",
+      "brain": "edge_brain FastAPI + /ws pubsub",
+      "tunnel_use": "仅 adb reverse 8790 + 右机发字；禁止左机 VPS 轮询 dump",
+      "forbidden": ["edge_adb_agent", "vmos-dual-watchdog", "左机 clicker-img ADB"]
+    },
+    "dual_supervisor": {
+      "description": "旧全 ADB 模式（隧道拥堵，已降级）",
+      "env": "BOT_EDGE_LEFT_JS=0 BOT_CLICKER_SEND_IMAGES=1",
+      "left_images": "bot_55chat_daemon clicker-img",
+      "forbidden": []
+    }
+  },
+  "component_map": [
+    {"fn": "左机发图", "oss": "AutoJs6 + settle_left.js", "glue": "edge_android/settle-left"},
+    {"fn": "左机拉 bundle", "oss": "edge_brain /settle-bundle", "glue": "w49_render/png_bundle"},
+    {"fn": "右机灌字", "oss": "ADB Keyboard", "glue": "listener_prepare_b64_outgoing"},
+    {"fn": "时序门闩", "oss": "FastAPI edge_brain", "glue": "poll_edge_brain_open_dispatch"},
+    {"fn": "本地坐标辅助", "oss": "UI-TARS-desktop", "glue": "vendor/UI-TARS-desktop 仅本机 VMOS 窗口"}
+  ]
+}

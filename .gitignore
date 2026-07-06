@@ -12,6 +12,7 @@ config/tunnel-left.env
 config/tunnel-right.env
 config/vps-ssh.env
 config/vmos-api.env
+config/vmos-proxy.env
 config/tunnel-creds.local.env
 config/本地-VMOS-开发者凭证.md
 
@@ -21,6 +22,9 @@ config/本地-VMOS-开发者凭证.md
 
 # Runtime state (local lab)
 data/edge_brain/state.json
+data/captures/
+data/local-panel-state.json
+data/.desktop_announce.lock
 edge_android/listener-right/edge_config.json
 edge_android/settle-left/edge_config.json
 
@@ -37,3 +41,7 @@ edge_android/settle-left/edge_config.json
 
 # Personal IDE rules (local only)
 .cursorrules
+
+# Node deps (55ws-client — use npm ci locally)
+protocol/55ws-client/node_modules/
+protocol/55chat-bot/

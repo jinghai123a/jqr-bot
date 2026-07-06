@@ -1,0 +1,63 @@
+{
+  "edge_brain": {
+    "base": "http://127.0.0.1:8790",
+    "auth": "Authorization: Bearer <JWT from EDGE_BRAIN_JWT>",
+    "error_envelope": {"success": false, "error": "human-readable message"},
+    "success_shapes": {
+      "health": {"ok": "true", "service": "edge_brain"},
+      "settle_done": {"ok": true},
+      "edge_event": {"ok": true}
+    },
+    "endpoints": [
+      {"method": "GET", "path": "/health", "auth": false, "desc": "存活探针"},
+      {"method": "GET", "path": "/edge/timeline", "auth": true, "desc": "期号 rid、210s 窗 warn/close/open_earliest、gates"},
+      {"method": "GET", "path": "/settle-bundle?period={rid}", "auth": true, "desc": "开奖+三图 base64；404=期未出"},
+      {"method": "POST", "path": "/settle-done", "auth": true, "body": {"period": "int", "images_ok": "bool", "device": "str"}, "desc": "左机发图完成→gates.open"},
+      {"method": "GET", "path": "/edge/open-job", "auth": true, "desc": "右机轮询 gates.open / open_rid"},
+      {"method": "POST", "path": "/edge/event", "auth": true, "desc": "云机事件上报 WS 广播"},
+      {"method": "WS", "path": "/ws?token=<JWT>", "desc": "timeline / settle_done / open_gate 推送"}
+    ]
+  },
+  "panel": {
+    "base": "http://127.0.0.1:3000",
+    "endpoints": [
+      {"method": "GET", "path": "/api/bots", "desc": "bot-3/bot-4 associatedGroup adbHost"},
+      {"method": "GET", "path": "/api/trade-flow?period={rid}&botIds=bot-3,bot-4", "desc": "流水图数据"},
+      {"method": "POST", "path": "/api/vmos/callback", "desc": "VMOS 开发者回调"}
+    ],
+    "mock_lab": "scripts/edge_mock_panel.py"
+  },
+  "gateway": {
+    "base": "http://127.0.0.1:8765",
+    "endpoints": [
+      {"method": "POST", "path": "/api/chat/message", "desc": "username→user_id 认人缓存"},
+      {"method": "POST", "path": "/api/chat/update_id", "desc": "更新 messengerId"}
+    ],
+    "project": "mock_gateway.py"
+  },
+  "desktop_protocol": {
+    "spec": "config/55m-knowledge/desktop-protocol.json",
+    "upstream_doc": "https://github.com/yee338024/55chat-bot/tree/a20b4841a068bed7031c9afef01672f94cd92990",
+    "local_test": "docs/本地桌面测试.md",
+    "default_ws_env": "BOT_55WS_URL=ws://127.0.0.1:5600"
+  },
+  "draw_28run": {
+    "url": "https://28.run/api/lottery/recent/6",
+    "referer": "https://28.run/",
+    "project": "w49_core/draw.py",
+    "fields": ["expect", "number1-3", "final_result", "opentime"]
+  },
+  "vmos": {
+    "doc": "https://cloud.vmoscloud.com/vmoscloud/doc/zh/server/OpenAPI.html",
+    "config": "config/vmos-api.env",
+    "refresh_vps": "python scripts/vmos-refresh-tunnels.py --reconnect",
+    "refresh_local": "python scripts/local_vmos_refresh_now.py",
+    "keepalive_local": "python scripts/local_tunnel_keepalive.py --hold",
+    "openapi_tunnel": [
+      {"method": "POST", "path": "/vcpcloud/api/padApi/openOnlineAdb", "body": {"padCodes": ["padCode"]}, "desc": "异步开 ADB，taskStatus=3 后再 get adb"},
+      {"method": "POST", "path": "/vcpcloud/api/padApi/adb", "body": {"padCode": "str", "enable": true, "expireMinutes": "1440~10080"}, "returns": {"command": "ssh -L …", "key": "SSH_PASS", "expireTime": "…"}, "desc": "隧道续期，无单独「自动刷新链接」"},
+      {"method": "POST", "path": "/vcpcloud/api/padApi/asyncCmd", "desc": "不占隧道的云机 shell"}
+    ],
+    "maintenance_cron": "vmos-maintenance-tunnel-cycle.sh @ 19:00 Asia/Shanghai"
+  }
+}
