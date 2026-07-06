@@ -16,8 +16,10 @@
 | [control-plane.json](./control-plane.json) | 端口、进程、VM 专区、APS 路径 |
 | [ui-pages.json](./ui-pages.json) | 55Messenger 页面地图 |
 | [edge-events.json](./edge-events.json) | 事件门控与 API 调用序 |
-| [desktop-protocol.json](./desktop-protocol.json) | **68助手 WS 协议**（55chat-bot@a20b484 熟通摘要） |
-| [vendor/55chat-bot-a20b484/README.md](./vendor/55chat-bot-a20b484/README.md) | 上游协议文档索引与差异说明 |
+| [68chat-protocol.json](./68chat-protocol.json) | **68 官方四页全量**（guide/ws/http/msg） |
+| [desktop-protocol.json](./desktop-protocol.json) | 项目 WS 执行绑定 |
+| [vendor/68chat-bot/README.md](./vendor/68chat-bot/README.md) | 四页索引 + 端口/铁律 |
+| [vendor/55chat-bot-a20b484/README.md](./vendor/55chat-bot-a20b484/README.md) | 55 仓库快照索引 |
 | [executor-matrix.json](./executor-matrix.json) | 执行器模式 desktop_ws / edge_124 / dual_supervisor |
 | [panel-catalog.json](./panel-catalog.json) | mock panel products/combo-rules（对齐用户使用 §3） |
 | [panel-bundle.json](./panel-bundle.json) | **控制面板完整包**（bots/users/products/settings，mock 主数据源） |

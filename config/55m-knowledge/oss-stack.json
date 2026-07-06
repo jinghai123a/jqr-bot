@@ -124,6 +124,22 @@
       "project_paths": ["bot_dual_supervisor.py", "bot_55chat_daemon.py"]
     },
     {
+      "id": "68chat-bot-protocol",
+      "name": "68chat-bot 官方 WS 协议",
+      "docs": "https://yee338024.github.io/68chat-bot/websocket.html",
+      "role": "68助手桌面 WS：msgNew/sendMsg/sendFile/getGroups/custom_msg_id",
+      "usage_permanent": [
+        "BOT_55WS_URL=ws://127.0.0.1:5600",
+        "sendMsg data.custom_msg_id + sendFile 顶层 custom_msg_id（11位非0开头）",
+        "ack 匹配 msgListPropertyUpdate.list[].customMsgId",
+        "规格 config/55m-knowledge/desktop-protocol.json"
+      ],
+      "project_paths": [
+        "scripts/desktop_local_announce.py",
+        "protocol/55ws-client/local_desktop_bot.js"
+      ]
+    },
+    {
       "id": "55chat-bot-protocol",
       "name": "55chat-bot WS 协议文档",
       "repo": "https://github.com/yee338024/55chat-bot",

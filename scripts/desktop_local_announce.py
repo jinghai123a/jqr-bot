@@ -7,6 +7,7 @@ import json
 import logging
 import msvcrt
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,24 @@ TARGET_GROUP = os.environ.get("BOT_TARGET_GROUP", "苍井空测试").strip() or 
 GROUP_NAME_FALLBACK = "苍井空测试"
 LOOP_SEC = float(os.environ.get("DESKTOP_ANNOUNCE_LOOP_SEC", "0.25") or 0.25)
 _SINGLETON_FP = None
+
+
+def _gen_custom_msg_id() -> str:
+    """68 协议：11 位数字，不以 0 开头，用于 sendMsg/sendFile ack 匹配。"""
+    return str(random.randint(1, 9)) + "".join(str(random.randint(0, 9)) for _ in range(10))
+
+
+def _custom_ids_from_payload(payload: dict) -> list[str]:
+    ids: list[str] = []
+    top = payload.get("custom_msg_id")
+    if top:
+        ids.append(str(top))
+    data = payload.get("data")
+    if isinstance(data, dict) and data.get("custom_msg_id"):
+        ids.append(str(data["custom_msg_id"]))
+    if payload.get("id"):
+        ids.append(str(payload["id"]))
+    return ids
 
 
 def _acquire_singleton() -> None:
@@ -256,20 +275,28 @@ class Ws55:
         mid = str(msg.get("id") or data.get("id") or "")
         status = data.get("readStatus")
         lst = data.get("list") if isinstance(data.get("list"), list) else []
+        custom_ids: list[str] = []
         if lst:
             upd = lst[0].get("updated") if isinstance(lst[0], dict) else {}
             rs = upd.get("readStatus") if isinstance(upd, dict) else None
             if rs is not None:
                 status = rs
-        if status in (1, "1", 2, "2") and self._send_ok_ev:
-            self._send_ok_ev.set()
-        if not mid or mid not in self._ack_events:
-            return
-        if status in (0, "0"):
-            self._ack_fail.add(mid)
-        elif status in (1, "1", 2, "2"):
-            pass
-        self._ack_events[mid].set()
+            for item in lst:
+                if isinstance(item, dict) and item.get("customMsgId"):
+                    custom_ids.append(str(item["customMsgId"]))
+        keys = custom_ids or ([mid] if mid else [])
+        ok = status in (1, "1", 2, "2")
+        fail = status in (0, "0")
+        for key in keys:
+            if not key:
+                continue
+            if ok and self._send_ok_ev:
+                self._send_ok_ev.set()
+            if key not in self._ack_events:
+                continue
+            if fail:
+                self._ack_fail.add(key)
+            self._ack_events[key].set()
 
     def _run(self) -> None:
         global _group_id
@@ -281,6 +308,8 @@ class Ws55:
             except json.JSONDecodeError:
                 return
             self._handle_send_ack(msg)
+            if msg.get("operator") in ("recall_msg", "groupUpdate"):
+                return
             op = msg.get("operator") or msg.get("type") or msg.get("message")
             if op not in ("network", "socketLogin") and op != "Hello":
                 log.debug("WS recv %s", json.dumps(msg, ensure_ascii=False)[:200])
@@ -333,28 +362,42 @@ class Ws55:
         for attempt in range(attempts):
             msg_id = str(payload.get("id") or uuid4())
             payload = {**payload, "id": msg_id}
+            if payload.get("type") == "sendFile" and not payload.get("custom_msg_id"):
+                payload["custom_msg_id"] = _gen_custom_msg_id()
+            data = payload.get("data")
+            if (
+                payload.get("type") == "sendMsg"
+                and isinstance(data, dict)
+                and not data.get("custom_msg_id")
+            ):
+                payload = {**payload, "data": {**data, "custom_msg_id": _gen_custom_msg_id()}}
             ev = threading.Event()
-            self._ack_events[msg_id] = ev
-            self._ack_fail.discard(msg_id)
+            for key in _custom_ids_from_payload(payload):
+                self._ack_events[key] = ev
+                self._ack_fail.discard(key)
             try:
                 self._send(payload)
             except Exception as ex:
-                self._ack_events.pop(msg_id, None)
+                for key in _custom_ids_from_payload(payload):
+                    self._ack_events.pop(key, None)
                 last_err = str(ex)
                 log.warning("WS send err id=%s attempt=%s: %s", msg_id, attempt + 1, ex)
                 continue
             if ev.wait(timeout=self._send_ack_sec):
-                failed = msg_id in self._ack_fail
-                self._ack_events.pop(msg_id, None)
-                self._ack_fail.discard(msg_id)
+                keys = _custom_ids_from_payload(payload)
+                failed = any(k in self._ack_fail for k in keys)
+                for key in keys:
+                    self._ack_events.pop(key, None)
+                    self._ack_fail.discard(key)
                 if not failed:
                     return
                 last_err = "readStatus=0"
                 log.warning("WS send ack fail id=%s attempt=%s", msg_id, attempt + 1)
             else:
-                self._ack_events.pop(msg_id, None)
+                for key in _custom_ids_from_payload(payload):
+                    self._ack_events.pop(key, None)
                 if self._ack_optional:
-                    log.debug("WS send ack timeout id=%s — optimistic OK (68助手常不回 readStatus)", msg_id)
+                    log.debug("WS send ack timeout id=%s — optimistic OK", msg_id)
                     return
                 last_err = "ack timeout"
                 log.warning("WS send ack timeout id=%s attempt=%s", msg_id, attempt + 1)

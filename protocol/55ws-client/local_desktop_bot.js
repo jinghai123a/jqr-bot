@@ -19,11 +19,18 @@ function send(type, data, id = randomUUID()) {
   return id;
 }
 
+function genCustomMsgId() {
+  let s = String(1 + Math.floor(Math.random() * 9));
+  for (let i = 0; i < 10; i++) s += String(Math.floor(Math.random() * 10));
+  return s;
+}
+
 function replyKou1(nick) {
   const text = `用户：${nick || "测试"}\n积分：10000\n冻结：0\n余额：10000\n编号：LOCAL-TEST`;
   send("sendMsg", {
     id: groupId,
     type: "group",
+    custom_msg_id: genCustomMsgId(),
     list: [{ type: "text", values: { chatType: 0, content: text } }],
     quoteInfo: null,
   });

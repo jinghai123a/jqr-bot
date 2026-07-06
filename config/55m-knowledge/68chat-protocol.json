@@ -1,0 +1,152 @@
+{
+  "title": "68chat-bot 官方协议全量规格",
+  "source": "https://yee338024.github.io/68chat-bot/",
+  "pages": {
+    "guide": "https://yee338024.github.io/68chat-bot/guide.html",
+    "websocket": "https://yee338024.github.io/68chat-bot/websocket.html",
+    "http": "https://yee338024.github.io/68chat-bot/http.html",
+    "msg": "https://yee338024.github.io/68chat-bot/msg.html",
+    "group": "https://yee338024.github.io/68chat-bot/group.html"
+  },
+  "guide": {
+    "activation": "设置中激活卡密后可用",
+    "pricing": [
+      {"service": "收取消息", "month": "60 U", "quarter": "150 U", "year": "450 U"},
+      {"service": "收/发消息", "month": "120 U", "quarter": "300 U", "year": "900 U"}
+    ],
+    "ws_connect": {
+      "url_doc": "ws://127.0.0.1:5599",
+      "handshake": {"message": "Hello"},
+      "format": "全部 JSON"
+    },
+    "inbound_callbacks": {
+      "friend_msgNew": ["sendUid", "receiveUid", "content", "customMsgId", "isSelf", "type=friend"],
+      "group_msgNew": ["sendUid", "groupId", "content", "customMsgId", "isSelf", "groupName", "type=group"],
+      "groupUpdate": "群名变更 values.name",
+      "groupShutupAll": "operatorType + bfShutup + chatType=50",
+      "operatorReadCancel": "阅后即焚开关通知 chatType=50"
+    }
+  },
+  "ports": {
+    "ws_doc": 5599,
+    "ws_local_v168": 5600,
+    "http_api_doc": 5598,
+    "http_settings_local_note": 5500,
+    "note": "文档 HTTP API 为 5598；本机助手设置页可能 5500，以实测为准"
+  },
+  "transport_ws": {
+    "heartbeat_sec": 3,
+    "heartbeat": {"operator": "network", "data": {"networkStatusType": "socketLogin"}},
+    "disconnect": {"operator": "network", "data": {"networkStatusType": "socketLoginout"}},
+    "reconnect": "自动重连"
+  },
+  "custom_msg_id": {
+    "rules": "11位数字；全局不重复；不能以0开头",
+    "ws_sendMsg": "data.custom_msg_id（好友/群均需）",
+    "ws_sendFile": "顶层 custom_msg_id",
+    "http_sendMsg": "body.custom_msg_id",
+    "http_sendFile": "body.custom_msg_id",
+    "ack_field": "msgListPropertyUpdate.list[].customMsgId"
+  },
+  "ws_outbound": {
+    "sendMsg": {
+      "type": "sendMsg",
+      "data": {
+        "id": "groupId|friendUid",
+        "type": "group|friend",
+        "custom_msg_id": "必填",
+        "list": [{"type": "text", "values": {"chatType": 0, "content": "..."}}],
+        "quoteInfo": null
+      },
+      "chatType_variants": {
+        "0": "普通文本",
+        "8": "群通知 bfAll",
+        "50": "禁言通知 bfShutup"
+      }
+    },
+    "sendFile": {
+      "type": "sendFile",
+      "custom_msg_id": "顶层必填",
+      "data": {"file": "Windows绝对路径", "type": "group|friend", "id": "目标id"}
+    },
+    "getGroups": {"type": "getGroups", "response_type": "getGroups"},
+    "getApiUrl": {"type": "getApiUrl"},
+    "restart68": {"type": "restart68"},
+    "request": {
+      "type": "request",
+      "data": {"type": "API类型", "url": "webbiz URL", "data": {}},
+      "types": [
+        "UserInfo", "ContactsList", "ContactsDetail", "ContactsApplyList",
+        "GroupMemberList", "GroupDetail", "GroupMemberOnLineStatusList",
+        "GroupUpdate", "GroupMemberShutup", "GroupReqList"
+      ]
+    }
+  },
+  "http_outbound": {
+    "base": "http://127.0.0.1:5598",
+    "endpoints": [
+      {"method": "POST", "path": "/request", "body": {"type": "...", "url": "...", "data": {}}, "desc": "代理 webbiz API"},
+      {"method": "POST", "path": "/getGroups", "body": null, "desc": "群列表数组"},
+      {"method": "POST", "path": "/sendMsg", "body": {"id": 0, "type": "group|friend", "custom_msg_id": "...", "list": []}, "response": {"data": "success"}},
+      {"method": "POST", "path": "/sendFile", "body": {"file": "path", "type": "group", "custom_msg_id": "...", "id": 0}, "response": {"data": "success"}},
+      {"method": "POST", "path": "/deleteMsg", "body": {"id": 0, "type": "group", "customMsgId": "...", "msgId": 0, "isRemoteDeletion": true}, "response": {"data": "ok"}},
+      {"method": "POST", "path": "/getApiUrl", "response": {"data": "https://webbiz..."}},
+      {"method": "POST", "path": "/restart68", "response": {"data": "restarting"}}
+    ],
+    "deleteMsg": {
+      "isRemoteDeletion_true": "双向删除（远程）",
+      "isRemoteDeletion_false": "仅本地删除",
+      "ws_equivalent": "operator recall_msg 回调"
+    }
+  },
+  "msg_types": {
+    "0": {"name": "文本", "const": "MESSAGE_TYPE_TEXT"},
+    "1": {"name": "图片", "const": "MESSAGE_TYPE_IMAGE"},
+    "2": {"name": "语音", "const": "MESSAGE_TYPE_VOICE"},
+    "3": {"name": "视频", "const": "MESSAGE_TYPE_VIDEO"},
+    "4": {"name": "位置", "const": "MESSAGE_TYPE_LOCATION"},
+    "5": {"name": "名片", "const": "MESSAGE_TYPE_NAMECARD"},
+    "6": {"name": "系统消息", "const": "MESSAGE_TYPE_SYSTEM"},
+    "7": {"name": "文件", "const": "MESSAGE_TYPE_FILE", "project": "结算 sendFile 后发 msgType=7"},
+    "8": {"name": "通知", "const": "MESSAGE_TYPE_NOTICE"},
+    "9": {"name": "动画表情", "const": "MESSAGE_TYPE_DYNAMIC_IMAGE"},
+    "10": {"name": "红包", "const": "MESSAGE_TYPE_REDPACKET"},
+    "12": {"name": "骰子", "const": "MESSAGE_TYPE_SETIMAGE", "content": "点数||随机数"},
+    "18": {"name": "扑克牌", "const": "MESSAGE_TYPE_ANIMATED_GAME"},
+    "50": {"name": "群系统通知", "note": "禁言/阅后即焚等"},
+    "201": "撤回成功", "202": "错误提示", "203": "撤回消息",
+    "-1": "未知", "-2": "未解密"
+  },
+  "send_ack": {
+    "operator": "msgListPropertyUpdate",
+    "fail": {"readStatus": 0},
+    "success": {"readStatus": 1, "updated": ["MsgID", "time", "sendTime"]}
+  },
+  "inbound_operators": {
+    "msgNew": "收消息/系统通知",
+    "groupUpdate": "群信息变更",
+    "msgListPropertyUpdate": "发消息 ack",
+    "recall_msg": "双向删除 recallOneToOneMessages",
+    "network": "心跳"
+  },
+  "project_rules": {
+    "inbound_process": "msgType=0 且 isSelf=false 且 type=group → 业务指令",
+    "ignore": ["msgType=50 系统通知", "recall_msg", "groupUpdate"],
+    "outbound_text": "sendMsg group + custom_msg_id + chatType 0",
+    "outbound_settle": "sendFile×3 + custom_msg_id",
+    "identity": "sendUid → messengerId（非 identify）",
+    "executor": "BOT_EXECUTOR=ws；HTTP 5598 为备选未接主链"
+  },
+  "project_env": {
+    "BOT_55WS_URL": "ws://127.0.0.1:5600",
+    "BOT_68HTTP_URL": "http://127.0.0.1:5598",
+    "DESKTOP_GROUP_ID": "492316",
+    "BOT_TARGET_GROUP": "苍井空测试",
+    "DESKTOP_WS_ACK_OPTIONAL": "1"
+  },
+  "project_impl": [
+    "scripts/desktop_local_announce.py",
+    "protocol/55ws-client/local_desktop_bot.js",
+    "config/55m-knowledge/desktop-protocol.json"
+  ]
+}

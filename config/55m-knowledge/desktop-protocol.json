@@ -1,25 +1,33 @@
 {
-  "upstream": {
+  "upstream_primary": {
+    "name": "68chat-bot 官方文档站",
+    "docs_base": "https://yee338024.github.io/68chat-bot/",
+    "guide": "https://yee338024.github.io/68chat-bot/guide.html",
+    "websocket": "https://yee338024.github.io/68chat-bot/websocket.html",
+    "http": "https://yee338024.github.io/68chat-bot/http.html",
+    "msg": "https://yee338024.github.io/68chat-bot/msg.html",
+    "full_spec": "config/55m-knowledge/68chat-protocol.json",
+    "vendor_snapshot": "config/55m-knowledge/vendor/68chat-bot/"
+  },
+  "upstream_legacy": {
     "repo": "https://github.com/yee338024/55chat-bot",
     "commit": "a20b4841a068bed7031c9afef01672f94cd92990",
-    "commit_url": "https://github.com/yee338024/55chat-bot/commit/a20b4841a068bed7031c9afef01672f94cd92990",
-    "docs_tree": "docs/{guide,msg,websocket,group}.md + readme.md",
+    "note": "与 68 协议同源；68 站为当前生产助手文档",
     "vendor_snapshot": "config/55m-knowledge/vendor/55chat-bot-a20b484/"
   },
-  "helper": "68助手 / 55助手 / 66助手（桌面 WS 协议同一套）",
+  "helper": "68助手（本机桌面 WS 执行器）",
   "activation": "使用前须在助手「设置」中激活卡密",
-  "pricing_a20b484": {
-    "service": "收/发消息",
-    "month": "120 U",
-    "quarter_8off": "300 U",
-    "year_6off": "900 U",
-    "note": "a20b484 起仅保留收/发一档，删除原「仅收取消息 80U」"
+  "pricing_68_official": {
+    "receive_only": {"month": "60 U", "quarter_8off": "150 U", "year_6off": "450 U"},
+    "send_receive": {"month": "120 U", "quarter_8off": "300 U", "year_6off": "900 U"}
   },
   "endpoints": {
     "ws_doc_default": "ws://127.0.0.1:5599",
     "ws_local_v168": "ws://127.0.0.1:5600",
-    "http_settings": "http://127.0.0.1:5500",
-    "env": "BOT_55WS_URL 覆盖文档端口"
+    "http_api_doc": "http://127.0.0.1:5598",
+    "http_settings_local": "http://127.0.0.1:5500",
+    "full_spec": "config/55m-knowledge/68chat-protocol.json",
+    "env": "BOT_55WS_URL / BOT_68HTTP_URL"
   },
   "transport": {
     "format": "JSON",
@@ -29,21 +37,31 @@
     "disconnect": {"operator": "network", "data": {"networkStatusType": "socketLoginout"}},
     "reconnect": "客户端自动重连直至成功"
   },
+  "custom_msg_id": {
+    "required_68": true,
+    "rules": "11位数字；不能重复；不能以0开头",
+    "sendMsg_group": "data.custom_msg_id",
+    "sendFile": "顶层 custom_msg_id（与 id 并列）",
+    "ack_match": "msgListPropertyUpdate.list[].customMsgId",
+    "project_impl": "scripts/desktop_local_announce.py _gen_custom_msg_id"
+  },
   "outbound": {
     "sendMsg": {
       "type": "sendMsg",
       "group": {
         "id": "numeric groupId",
         "data_type": "group",
+        "custom_msg_id": "11位，放 data 内",
         "text": {"list": [{"type": "text", "values": {"chatType": 0, "content": "..."}}]}
       },
-      "friend": {"id": "numeric uid", "data_type": "friend"},
+      "friend": {"id": "numeric uid", "data_type": "friend", "custom_msg_id": "必填（68 websocket 示例）"},
       "multiline": "content 内 \\n",
       "notice": "chatType 8 + bfAll",
       "shutup_notify": "chatType 50 + bfShutup"
     },
     "sendFile": {
       "type": "sendFile",
+      "custom_msg_id": "顶层必填（68）",
       "data": {"file": "Windows绝对路径", "type": "group|friend", "id": "groupId|friendId"},
       "project_use": "结算三图 PC28→六合→流水"
     },
@@ -53,66 +71,54 @@
       "project_use": "解析 DESKTOP_GROUP_ID / 群名匹配"
     },
     "getApiUrl": {"type": "getApiUrl"},
-    "restartApp": {"type": "restartApp"},
+    "restart68": {"type": "restart68", "note": "55 旧文档为 restartApp"},
     "request_proxy": {
       "type": "request",
-      "examples": ["UserInfo", "ContactsList", "GroupMemberList", "GroupDetail", "GroupUpdate"]
+      "examples": ["UserInfo", "ContactsList", "GroupMemberList", "GroupDetail", "GroupUpdate", "GroupMemberShutup"]
     }
   },
   "inbound_operators": {
     "msgNew": "新消息（好友/群/系统通知）",
     "groupUpdate": "群名等变更",
-    "msgListPropertyUpdate": "发送结果 readStatus",
+    "msgListPropertyUpdate": "发送结果 readStatus + customMsgId",
+    "recall_msg": "双向删除撤回（68 新增）",
     "network": "心跳/断线"
   },
   "inbound_msgNew": {
     "group_key_fields": ["sendUid", "groupId", "content", "msgType", "isSelf", "groupName", "customMsgId"],
     "friend_key_fields": ["sendUid", "receiveUid", "content", "isSelf"],
-    "messengerId_map": "sendUid（数字 uid）→ panel.users[].messengerId；identify 常为 -- 不可靠",
+    "messengerId_map": "sendUid → panel.users[].messengerId；identify 常为 --",
     "ignore_inbound": "isSelf=false 且 msgType=0 为真实用户指令",
-    "echo_outbound": "isSelf=true 可用于回显检测（desktop_local_announce）",
+    "echo_outbound": "isSelf=true + content 匹配用于 OUT 检测",
     "notification_types": ["groupShutupAll", "operatorReadCancel"]
   },
   "msg_types": {
-    "0": "文本 MESSAGE_TYPE_TEXT",
-    "1": "图片",
-    "7": "文件",
-    "8": "通知",
-    "12": "骰子",
-    "50": "群系统通知（禁言/阅后即焚等）"
+    "0": "文本", "1": "图片", "7": "文件", "8": "通知", "12": "骰子", "50": "群系统通知"
   },
   "send_ack": {
     "operator": "msgListPropertyUpdate",
-    "success": "readStatus=1（含 MsgID/time）",
+    "success": "readStatus=1",
     "fail": "readStatus=0",
-    "env_optional": "DESKTOP_WS_ACK_OPTIONAL=1 超时仍发"
-  },
-  "group_ops": {
-    "SHUTUP": 11,
-    "NOTICE": 12,
-    "doc": "group.md 枚举；更新群公告后须再 sendMsg chatType=8"
+    "match_key": "list[].customMsgId 优先于顶层 id",
+    "env_optional": "DESKTOP_WS_ACK_OPTIONAL=1"
   },
   "project_mapping": {
-    "扣1_下注": "msgNew → handle_command → sendMsg",
-    "公告_warn_close_open": "sendMsg 长文",
-    "结算三图": "sendFile×3",
-    "ADD_绑ID": "协议无；走 ADB UI",
-    "认人": "sendUid 非 identify"
+    "扣1_下注": "msgNew → Panel/handle_command → sendMsg+custom_msg_id",
+    "公告": "sendMsg 长文",
+    "结算三图": "sendFile×3 + custom_msg_id",
+    "ADD_绑ID": "ADB UI，协议无"
   },
-  "not_in_protocol": ["ADD好友点头像", "ADB 三图 UI 点击链", "Panel 账务"],
   "executor_env": {
-    "BOT_EXECUTOR": "ws | adb（互斥）",
+    "BOT_EXECUTOR": "ws",
     "BOT_55WS_URL": "ws://127.0.0.1:5600",
+    "BOT_68HTTP_URL": "http://127.0.0.1:5598",
     "DESKTOP_GROUP_ID": "492316",
     "BOT_TARGET_GROUP": "苍井空测试",
     "DESKTOP_WS_ACK_OPTIONAL": "1"
   },
   "project_paths": [
-    "protocol/55ws-client/watch.js",
-    "protocol/55ws-client/local_desktop_bot.js",
     "scripts/desktop_local_announce.py",
-    "scripts/desktop_local_stack.py",
-    "scripts/desktop_ws_verify.py",
-    "scripts/desktop_ws_sniff.py"
+    "protocol/55ws-client/local_desktop_bot.js",
+    "config/55m-knowledge/desktop-protocol.json"
   ]
 }
