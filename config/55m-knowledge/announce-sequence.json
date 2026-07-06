@@ -1,0 +1,69 @@
+{
+  "source": "docs/用户使用.md §1 §5 + announce-templates.json",
+  "cycle_sec": 210,
+  "anchor": "28.run expect + roundAnchorPeriod/roundAnchorBeijing",
+  "per_round_timeline": [
+    {
+      "order": 1,
+      "kind": "settle_images",
+      "trigger": "28.run 公布当期开奖后第一时间",
+      "type": "image",
+      "images": [
+        {"id": "pc28", "title": "PC28开奖走势图", "renderer": "w49_render/board_capture"},
+        {"id": "mark6", "title": "六合彩走势图", "renderer": "w49_render/board_capture"},
+        {"id": "flow", "title": "最新交易流水", "renderer": "w49_render/trade_flow", "data": "/api/trade-flow?period={rid}"}
+      ],
+      "send": "连发3张，左机 sendFile×3 或 desktop WS sendFile"
+    },
+    {
+      "order": 2,
+      "kind": "round_open",
+      "trigger": "三图发完后约 open_after_settle_ms",
+      "type": "text",
+      "template_id": "DEFAULT_ROUND_OPEN_ANNOUNCE",
+      "text_template": "【{round_id}期】 新的一局开始\n----------------------------\n群内指令:\n上1000 / 下1000  上分下分\n扣反水  群内反水\n扣1 查余额编号 | 扣2 本期下注 | 扣查 流水 | 扣历史 走势图\n扣取消 取消下注\n----------------------------\n下注格式:\n1/12345/100  冠军定位胆\n4/1.2.3/100  第4道PC特码（点分隔）\n5/鼠牛虎100  六合彩（5开头）\n开奖结果以28.run为准\n（{round_time}）"
+    },
+    {
+      "order": 3,
+      "kind": "betting_period",
+      "trigger": "新一局后 ~ 封盘前",
+      "type": "user_commands",
+      "note": "接受合法下注，毫秒级回复"
+    },
+    {
+      "order": 4,
+      "kind": "warn",
+      "trigger": "封盘前 warn_before_close_sec（70秒）时间窗",
+      "type": "text",
+      "template_id": "DEFAULT_WARN_ANNOUNCE",
+      "text": "[钱]距离封盘还有60秒[抱拳]\n-----------------\n【定位胆 1-3道】单点9.63 · 大小单双1.924\n01234为小，56789为大（无视1314）\n\n【第4道 PC28】大小单双1.99（1314→1.6）\n小单/大双4.58（1314退本）小双/大单4.18\n特码点杀见封盘公告表\n\n【六合彩赔率】\n特码1-49：46倍（单注5-1500）\n大小单双：大/单1.84 小/双1.91\n组合：大单3.5 大双/小单/小双3.8\n合单1.84 合双1.91\n生肖：马9.2 其他11.5\n波色：红2.7 蓝/绿2.87\n头：0头5.1 1-4头4.6\n尾：0尾11.5 1-9尾9.2\n五行：金木4.6 水5.1 火3.8 土5.7\n保本：5-0或0-0退本不算流水\n开奖以28.run为准"
+    },
+    {
+      "order": 5,
+      "kind": "close",
+      "trigger": "封盘前 close_before_draw_sec（15秒）时间窗",
+      "type": "text",
+      "template_id": "DEFAULT_CLOSE_ANNOUNCE",
+      "text": "[禁]已封盘停止下注[禁]\n-----------------------\n线上有效 线下无效'一切以机器人核对栏为准。\n未经核对，一律无效。\n-----------------------\n以PC28为开奖结果的定位胆玩法\n第一道冠军\n第二道亚军\n第三道季军\n下注格式如下：\n比如下冠军买12345各100如:1/12345/100\n前面123即冠亚季军/后面为下注内容，下注内容后/为金额\n定位胆玩法01234为小，56789为大\n第四道PC28特码需以空格键隔开，如下：\n4/1 2 3/100=4道P C特码123号各100\n第123道定位胆玩法单个数字限额5000\n第4道PC28玩法，大小单双限额2万，组合限额10000\n当期个人总注限额100000，单期最高派彩500000\n\n--------------------------------------------------------------六合彩玩法:特码赔率46倍\n冠军:代表特码头01234头 5=0头 6=1头\n7=2头 8=3头 9=4头\n亚军代表尾0-9\n遇到5-0或者0-0保本，不输不赢退回本金。不算流水\n\n下注格式\n特码例如，5/1.2.3.4.5.6.7.8.9.10各100\n\n生肖：例如5/鼠牛虎100=鼠100 牛100 虎100\n五行：例如5/金木土100=金100 木100 土100\n波段：例如5/红波100= 红波100\n大小单双：例如5/大100 =大100\n大单小单大双小双：例如5/大单100=大单100\n合单合双：例如5/合单100\n头尾：例如5/0头100 =0头100  5/1尾100=1尾100\n------------------------\n如遇官网已开奖，群机器人卡顿尚未封盘，进行下注的玩家不予赔偿，只吃不赔！\n------------------------\n温馨提示：每天18：56-19：32时间段停机维护时间！！！\n------------------------\n开奖网：\n28.run\npc28.am"
+    },
+    {
+      "order": 6,
+      "kind": "closed_gate",
+      "trigger": "封盘公告后 ~ 下一局 open 前",
+      "type": "reject_bets",
+      "reply": "已封盘，下单无效"
+    }
+  ],
+  "timing": {
+    "interval_sec": 210,
+    "warn_before_close_sec": 70,
+    "close_before_draw_sec": 15,
+    "open_after_settle_ms": 2000,
+    "maintenance_beijing": "18:56-19:32"
+  },
+  "settle_text_optional": {
+    "template_id": "DEFAULT_SETTLE_ANNOUNCE",
+    "note": "部分栈发三图前/后附文字开奖表，非用户使用主路径",
+    "template": "[第{round_id}期]\n================\n--开奖号码为--\n{number1} + {number2} + {number3} = {final_result} {pc28_combo}\n================\n{mark6_block}"
+  }
+}

@@ -19,7 +19,12 @@
 | [desktop-protocol.json](./desktop-protocol.json) | 68助手 WS 协议（55chat-bot 文档 + 本机扩展） |
 | [executor-matrix.json](./executor-matrix.json) | 执行器模式 desktop_ws / edge_124 / dual_supervisor |
 | [panel-catalog.json](./panel-catalog.json) | mock panel products/combo-rules（对齐用户使用 §3） |
-| [panel-ui-spec.json](./panel-ui-spec.json) | 控制面板 API/核对栏结构 + 生产路径；本地 dashboard `http://127.0.0.1:3000/` |
+| [panel-bundle.json](./panel-bundle.json) | **控制面板完整包**（bots/users/products/settings，mock 主数据源） |
+| [user-commands-replies.json](./user-commands-replies.json) | 用户指令 ↔ 群聊回复纯文本模板 |
+| [announce-sequence.json](./announce-sequence.json) | 文本/图片公告内容与每期顺序 |
+| [game-rules.json](./game-rules.json) | 玩法规则、赔率、限额、下注格式 |
+| [finance-algorithms.json](./finance-algorithms.json) | 上下分/下注/派彩/取消财务算法 |
+| [panel-ui-spec.json](./panel-ui-spec.json) | 控制面板 API/核对栏结构；Dashboard `http://127.0.0.1:3000/` |
 
 ## 宿主机 → VM
 

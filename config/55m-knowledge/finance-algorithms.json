@@ -1,0 +1,102 @@
+{
+  "source": "bot_55chat_daemon.py 账务逻辑 + docs/用户使用.md §2 §4",
+  "panel_authority": "余额、编号、流水、账单以控制面板 users/bills 为准",
+  "identity": "认人 messengerId；群昵称仅显示",
+  "operations": {
+    "topup": {
+      "trigger": "用户发 上{金额}",
+      "flow": [
+        "1. POST /api/topup-requests {botId, username, amount, messengerId}",
+        "2. 群回复 topupPendingTemplate",
+        "3. 群主面板同意 → balance += amount",
+        "4. 群回复 topupSuccessTemplate + POST .../sent"
+      ],
+      "formula": "new_balance = old_balance + amount"
+    },
+    "withdraw": {
+      "trigger": "用户发 下{金额}",
+      "flow": [
+        "1. 校验 balance >= amount，否则余额不足",
+        "2. POST /api/withdraw-requests",
+        "3. 群回复 withdrawPendingTemplate",
+        "4. 群主面板同意 → balance -= amount",
+        "5. 群回复 withdrawSuccessTemplate + POST .../sent"
+      ],
+      "formula": "new_balance = old_balance - amount"
+    },
+    "bet_place": {
+      "trigger": "合法下注指令 1-5/.../金额",
+      "cost_formula": "total_cost = sum(unit_stake for each pick in order)",
+      "pre_check": [
+        "用户已登记 Panel",
+        "非封盘窗、非维护窗",
+        "balance >= total_cost",
+        "单注/当期个人/群类别限额通过"
+      ],
+      "debit": "balance -= total_cost",
+      "credit_on_cancel": "balance += return_amount（扣取消成功）",
+      "log": "POST /api/logs + 本地 round_bets"
+    },
+    "bet_payout": {
+      "trigger": "28.run 开奖后结算",
+      "functions": {
+        "lane": "calc_lane_payout(code, picks, unit, draw) — 单点×9.63 或 大小单双×1.924",
+        "pc28": "calc_pc28_payout(picks, unit, final_result) — 点杀表/大小单双/组合；1314特殊赔率",
+        "mark6": "calc_mark6_payout(picks, unit, draw) — 特码/头尾/生肖/波色/五行/组合"
+      },
+      "credit": "balance += payout（按注逐笔 calc_bet_payout 汇总）",
+      "push_principal": "mark6 5-0/0-0 → payout = unit × len(picks) 退本",
+      "pc28_1314_combo": "小单/大双 1314 → 退本(unit)；大小单双 → 1.6倍"
+    },
+    "cancel": {
+      "trigger": "扣取消 / 取消",
+      "rule": "封盘前可取消当期待结算注单",
+      "formula": "return_amount = 该注 total_cost；balance += return_amount"
+    },
+    "rebate": {
+      "trigger": "扣反水",
+      "rule": "仅提交申请文案；实际发放由群主核实流水后手动/面板操作",
+      "auto_credit": false
+    },
+    "balance_query": {
+      "trigger": "扣1/1/查",
+      "fields": {
+        "积分": "int(balance)",
+        "冻结": 0,
+        "余额": "int(balance)",
+        "编号": "customerCode（无 UID- 前缀）"
+      }
+    }
+  },
+  "payout_formulas": {
+    "lane_single_hit": "unit × 9.63",
+    "lane_dxds_hit": "unit × 1.924",
+    "pc28_point_hit": "unit × PC28_POINT_ODDS[final_result]",
+    "pc28_dxds_hit": "unit × (1.6 if 1314 else 1.99)",
+    "pc28_combo_a": "小单/大双: unit × (1 if 1314 else 4.58)",
+    "pc28_combo_b": "小双/大单: unit × 4.18",
+    "mark6_special_hit": "unit × 46",
+    "mark6_push": "unit × pick_count（5-0/0-0保本）"
+  },
+  "validation_order": [
+    "messengerId → Panel user",
+    "封盘/维护门闸",
+    "指令格式 parse",
+    "号码范围 1-49 / 0-27",
+    "单注限额",
+    "当期个人总注 LIMIT_ROUND_USER",
+    "群类别总注 mark6_group_stake_check",
+    "余额 >= total_cost"
+  ],
+  "settle_accounting": {
+    "trigger": "28.run 公布 expect",
+    "steps": [
+      "拉 draw {n1,n2,n3,final_result}",
+      "对 round_bets 逐笔 calc_bet_payout",
+      "balance += 派彩合计",
+      "写 bills/流水",
+      "发三图 + 新一局"
+    ],
+    "max_payout_guard": "单期派彩合计不超过 LIMIT_ROUND_PAYOUT"
+  }
+}

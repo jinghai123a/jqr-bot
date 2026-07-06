@@ -1,0 +1,108 @@
+{
+  "source": "docs/用户使用.md §2 + bot_55chat_daemon.py DEFAULT_SETTINGS",
+  "note": "群聊 OUT 竖列格式；下注类首行含期号",
+  "commands": [
+    {
+      "id": "balance",
+      "user_sends": ["扣1", "1", "查", "查余额", "余额查询"],
+      "reply_template": "用户：[{username}]\n积分：{balance_int}\n冻结：0\n余额：{balance_int}\n编号：{customer_code}",
+      "panel_key": "balanceReplyTemplate"
+    },
+    {
+      "id": "round_bets",
+      "user_sends": ["扣2"],
+      "reply_has_bets": "用户：[{username}]\n本期下注明细\n{bet_lines}\n合计：{total}",
+      "reply_no_bets": "用户：[{username}]\n{round_id}期暂无下注"
+    },
+    {
+      "id": "flow",
+      "user_sends": ["扣查"],
+      "reply_has_flow": "用户：[{username}]\n近期流水\n{flow_lines}",
+      "reply_no_flow": "用户：[{username}]\n暂无流水",
+      "max_lines": 10
+    },
+    {
+      "id": "history",
+      "user_sends": ["扣历史"],
+      "reply_template": "用户：[{username}]\n28.run\npc28.am"
+    },
+    {
+      "id": "cancel",
+      "user_sends": ["扣取消", "取消"],
+      "reply_success": "{round_id}期\n用户：[{username}]\n取消成功\n返回积分：{return_amount}",
+      "reply_fail": "{round_id}期\n用户：[{username}]\n取消失败\n暂无待取消订单",
+      "panel_key": "cancelSuccessTemplate"
+    },
+    {
+      "id": "rebate",
+      "user_sends": ["扣反水"],
+      "reply_template": "用户：[{username}]\n反水申请已提交\n请联系群主核实流水后发放"
+    },
+    {
+      "id": "topup",
+      "user_sends_pattern": "^(?:上(?:分)?|如上)(\\d+(?:\\.\\d+)?)$",
+      "examples": ["上1000", "上分1000", "如上1000"],
+      "reply_pending": "用户：[{username}]\n上分:{amount}\n等待操作",
+      "reply_approved": "用户：[{username}]\n已同意总上分:{amount}\n余额:{new_balance}\n编号:{customer_code}",
+      "panel_keys": ["topupPendingTemplate", "topupSuccessTemplate"]
+    },
+    {
+      "id": "withdraw",
+      "user_sends_pattern": "^(?:下(?:分)?|如下)(\\d+(?:\\.\\d+)?)$",
+      "examples": ["下1000", "下分1000", "如下1000"],
+      "reply_pending": "用户：[{username}]\n下分:{amount}\n等待操作",
+      "reply_approved": "用户：[{username}]\n已同意下分:{amount}\n余额:{new_balance}\n编号:{customer_code}",
+      "panel_keys": ["withdrawPendingTemplate", "withdrawSuccessTemplate"]
+    },
+    {
+      "id": "add_friend",
+      "user_sends": ["添加", "（添加）"],
+      "reply_ok": "用户：[{username}]\n已发送请求，刷新后请同意",
+      "reply_already": "用户：[{username}]\n您已是好友，无需重复添加",
+      "reply_fail": "用户：[{username}]\n添加失败请检查是否开启允许添加功能，或联系群主关闭群内禁止添加好友功能"
+    },
+    {
+      "id": "bind",
+      "user_sends_pattern": "^绑定(?:UID[- ]?)?(\\d+)$",
+      "examples": ["绑定123456"],
+      "reply_success": "用户：[{username}]\n绑定成功\n编号：{customer_code}\nID：{messenger_id}\n余额：{balance}",
+      "reply_fail_no_code": "用户：[{username}]\n绑定失败\n编号 {code} 不存在",
+      "reply_fail_no_id": "用户：[{username}]\n绑定失败\n无法读取 55M ID\n请确保已是好友并在控制面板填写 ID"
+    },
+    {
+      "id": "unregistered",
+      "trigger": "下注/账户类指令但 Panel 无用户",
+      "reply_template": "用户：[{username}]\n未登记，请联系群主添加账号，或发送 添加"
+    },
+    {
+      "id": "bet_success",
+      "user_sends_pattern": "^([1-5])/(.+?)(\\d+(?:\\.\\d+)?)$",
+      "reply_template": "{round_id}期\n用户：[{username}]\n下单成功\n{package_display}\n下注总额：{total_cost}\n余额：{new_balance}",
+      "panel_key": "comboSuccessTemplate"
+    },
+    {
+      "id": "bet_closed",
+      "trigger": "封盘公告后至下一局前",
+      "reply_template": "{round_id}期\n用户：[{username}]\n已封盘，下单无效"
+    },
+    {
+      "id": "bet_maintenance",
+      "trigger": "18:56-19:32 维护窗",
+      "reply_template": "用户：[{username}]\n停机维护中..."
+    },
+    {
+      "id": "bet_format_error",
+      "reply_template": "{round_id}期\n用户：[{username}]\n指令格式错误，请检查后重试"
+    },
+    {
+      "id": "bet_insufficient",
+      "reply_template": "{round_id}期\n用户：[{username}]\n{cmd}\n(无效,余额不足)\n当前余额：{balance}",
+      "panel_key": "slashBetFailTemplate"
+    }
+  ],
+  "bet_accept_window": {
+    "accept": "新一局开始之后 ~ 封盘公告发出之前",
+    "reject": "封盘公告发出后 ~ 下一局「新的一局」之前",
+    "maintenance": "18:56-19:32 不接下注"
+  }
+}

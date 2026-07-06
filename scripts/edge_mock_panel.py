@@ -21,15 +21,23 @@ PORT = int(os.environ.get("EDGE_MOCK_PANEL_PORT", "3000") or 3000)
 STATE_PATH = ROOT / "data" / "local-panel-state.json"
 KNOWLEDGE = ROOT / "config" / "55m-knowledge" / "announce-templates.json"
 CATALOG = ROOT / "config" / "55m-knowledge" / "panel-catalog.json"
+BUNDLE = ROOT / "config" / "55m-knowledge" / "panel-bundle.json"
 SPEC = ROOT / "config" / "55m-knowledge" / "panel-ui-spec.json"
 COMMANDS = ROOT / "config" / "55m-knowledge" / "chat-commands.json"
+USER_REPLIES = ROOT / "config" / "55m-knowledge" / "user-commands-replies.json"
+ANNOUNCE_SEQ = ROOT / "config" / "55m-knowledge" / "announce-sequence.json"
+GAME_RULES = ROOT / "config" / "55m-knowledge" / "game-rules.json"
+FINANCE = ROOT / "config" / "55m-knowledge" / "finance-algorithms.json"
 _LOCK = threading.Lock()
 _CATALOG_CACHE: tuple[list[Any], list[Any]] | None = None
 
 
 def _default_state() -> dict[str, Any]:
+    bundle = _load_bundle()
+    users = (bundle or {}).get("users") if isinstance((bundle or {}).get("users"), list) else []
+    fq = (bundle or {}).get("finance_queues") or {}
     return {
-        "users": [
+        "users": users or [
             {
                 "botId": "bot-4",
                 "username": "测试用户",
@@ -38,9 +46,9 @@ def _default_state() -> dict[str, Any]:
                 "messengerId": "",
             }
         ],
-        "topup_requests": [],
-        "withdraw_requests": [],
-        "bills": [],
+        "topup_requests": fq.get("topup_requests") or [],
+        "withdraw_requests": fq.get("withdraw_requests") or [],
+        "bills": fq.get("bills") or [],
     }
 
 
@@ -63,9 +71,25 @@ def _save_state(st: dict[str, Any]) -> None:
     tmp.replace(STATE_PATH)
 
 
+def _load_bundle() -> dict[str, Any] | None:
+    if not BUNDLE.is_file():
+        return None
+    try:
+        data = json.loads(BUNDLE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def _load_catalog() -> tuple[list[Any], list[Any]]:
     global _CATALOG_CACHE
     if _CATALOG_CACHE is not None:
+        return _CATALOG_CACHE
+    bundle = _load_bundle()
+    if bundle and isinstance(bundle.get("products"), list):
+        products = bundle["products"]
+        combo_rules = bundle.get("combo_rules") if isinstance(bundle.get("combo_rules"), list) else []
+        _CATALOG_CACHE = (products, combo_rules)
         return _CATALOG_CACHE
     if not CATALOG.is_file():
         _CATALOG_CACHE = ([], [])
@@ -84,6 +108,14 @@ def _load_catalog() -> tuple[list[Any], list[Any]]:
 def _load_settings() -> dict[str, str]:
     from w49_core.timing import sync_anchor_from_28run
 
+    bundle = _load_bundle()
+    if bundle and isinstance(bundle.get("settings"), dict):
+        out = {str(k): str(v) for k, v in bundle["settings"].items()}
+        anchor = sync_anchor_from_28run()
+        for k in ("roundAnchorPeriod", "roundAnchorBeijing", "draw28_latest_rid", "draw28_next_rid"):
+            if k in anchor:
+                out[k] = str(anchor[k])
+        return out
     out = sync_anchor_from_28run()
     if KNOWLEDGE.is_file():
         data = json.loads(KNOWLEDGE.read_text(encoding="utf-8"))
@@ -100,22 +132,26 @@ def _load_settings() -> dict[str, str]:
     return out
 
 
-BOTS = [
-    {
-        "id": "bot-3",
-        "status": "ACTIVE",
-        "platform": "55Messenger",
-        "associatedGroup": os.environ.get("EDGE_MOCK_GROUP_LEFT", "苍井空测试"),
-        "adbHost": f"127.0.0.1:{os.environ.get('BOT_CLICKER_ADB_PORT', '55612')}",
-    },
-    {
-        "id": "bot-4",
-        "status": "ACTIVE",
-        "platform": "55Messenger",
-        "associatedGroup": os.environ.get("EDGE_MOCK_GROUP_RIGHT", "苍井空测试"),
-        "adbHost": f"127.0.0.1:{os.environ.get('BOT_LISTENER_ADB_PORT', '58433')}",
-    },
-]
+def _get_bots() -> list[dict[str, Any]]:
+    bundle = _load_bundle()
+    if bundle and isinstance(bundle.get("bots"), list):
+        return bundle["bots"]
+    return [
+        {
+            "id": "bot-3",
+            "status": "ACTIVE",
+            "platform": "55Messenger",
+            "associatedGroup": os.environ.get("EDGE_MOCK_GROUP_LEFT", "苍井空测试"),
+            "adbHost": f"127.0.0.1:{os.environ.get('BOT_CLICKER_ADB_PORT', '55612')}",
+        },
+        {
+            "id": "bot-4",
+            "status": "ACTIVE",
+            "platform": "55Messenger",
+            "associatedGroup": os.environ.get("EDGE_MOCK_GROUP_RIGHT", "苍井空测试"),
+            "adbHost": f"127.0.0.1:{os.environ.get('BOT_LISTENER_ADB_PORT', '58433')}",
+        },
+    ]
 
 
 def _json(handler: BaseHTTPRequestHandler, code: int, body: Any) -> None:
@@ -256,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path)
         st = _load_state()
         if path.path == "/api/bots":
-            _json(self, 200, BOTS)
+            _json(self, 200, _get_bots())
             return
         if path.path == "/api/settings":
             _json(self, 200, _load_settings())
@@ -302,6 +338,22 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 _json(self, 404, {"error": "panel-ui-spec.json missing"})
             return
+        if path.path == "/api/bundle":
+            bundle = _load_bundle()
+            if bundle:
+                _json(self, 200, bundle)
+            else:
+                _json(self, 404, {"error": "panel-bundle.json missing"})
+            return
+        for spec_path, spec_file in (
+            ("/api/knowledge/commands", USER_REPLIES),
+            ("/api/knowledge/announce", ANNOUNCE_SEQ),
+            ("/api/knowledge/rules", GAME_RULES),
+            ("/api/knowledge/finance", FINANCE),
+        ):
+            if path.path == spec_path and spec_file.is_file():
+                _json(self, 200, json.loads(spec_file.read_text(encoding="utf-8")))
+                return
         if path.path in ("/", "/panel", "/dashboard"):
             _html(self, 200, _dashboard_html())
             return
