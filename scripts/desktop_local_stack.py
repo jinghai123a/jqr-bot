@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROCS: list[subprocess.Popen] = []
+DETACHED: list[subprocess.Popen] = []
 PY = os.environ.get("DESKTOP_PYTHON") or str(
     ROOT / ".venv" / "Scripts" / "python.exe"
     if (ROOT / ".venv" / "Scripts" / "python.exe").is_file()
@@ -31,10 +32,19 @@ def _health(url: str, sec: float = 20.0) -> bool:
     return False
 
 
-def _spawn(cmd: list[str], *, env: dict[str, str] | None = None) -> subprocess.Popen:
+def _spawn(cmd: list[str], *, env: dict[str, str] | None = None, detach: bool = False) -> subprocess.Popen:
     merged = {**os.environ, **(env or {})}
-    p = subprocess.Popen(cmd, cwd=str(ROOT), env=merged)
-    PROCS.append(p)
+    kwargs: dict = {"cwd": str(ROOT), "env": merged}
+    if detach and sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        kwargs["stdin"] = subprocess.DEVNULL
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    p = subprocess.Popen(cmd, **kwargs)
+    if detach:
+        DETACHED.append(p)
+    else:
+        PROCS.append(p)
     return p
 
 
@@ -54,12 +64,13 @@ def main() -> int:
         "DESKTOP_GROUP_ID": os.environ.get("DESKTOP_GROUP_ID", "492316"),
         "EDGE_MOCK_GROUP_LEFT": os.environ.get("BOT_TARGET_GROUP", "苍井空测试"),
         "EDGE_MOCK_GROUP_RIGHT": os.environ.get("BOT_TARGET_GROUP", "苍井空测试"),
+        "PYTHONUNBUFFERED": "1",
     }
 
     if not _health("http://127.0.0.1:3000/api/bots", 2.0):
-        _spawn([PY, str(ROOT / "scripts" / "edge_mock_panel.py")], env=env)
+        _spawn([PY, str(ROOT / "scripts" / "edge_mock_panel.py")], env=env, detach=True)
     if not _health("http://127.0.0.1:8790/health", 2.0):
-        _spawn([PY, "-m", "edge_brain"], env=env)
+        _spawn([PY, "-m", "edge_brain"], env=env, detach=True)
 
     if not _health("http://127.0.0.1:3000/api/bots"):
         print("panel FAIL", file=sys.stderr)
