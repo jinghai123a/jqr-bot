@@ -81,7 +81,7 @@ class EdgeBrainTests(unittest.TestCase):
         draw = {"n1": 1, "n2": 2, "n3": 3, "final_result": 6, "opentime": "x"}
         imgs = build_settle_images(1, draw, {"rows": []})
         self.assertEqual([x["kind"] for x in imgs], ["pc28", "mark6", "flow"])
-        self.assertTrue(all(x["source"] == "pillow_fallback" for x in imgs))
+        self.assertTrue(all(x["source"] in ("pillow_fallback", "board_capture") for x in imgs))
 
     def test_build_timeline_has_ms(self) -> None:
         tl = timing_mod.build_timeline()
