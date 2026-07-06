@@ -111,9 +111,16 @@ def brain_post(path: str, body: dict) -> dict:
 
 
 def panel_get(path: str) -> Any:
-    req = urllib.request.Request(f"{PANEL}{path}", headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last: Exception | None = None
+    for attempt in range(8):
+        try:
+            req = urllib.request.Request(f"{PANEL}{path}", headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as ex:
+            last = ex
+            time.sleep(min(1.0 + attempt * 0.5, 4.0))
+    raise last or RuntimeError(f"panel GET {path} failed")
 
 
 def panel_post(path: str, body: dict) -> Any:
@@ -199,6 +206,9 @@ class Ws55:
         self._send_retries = max(0, int(os.environ.get("DESKTOP_WS_SEND_RETRIES", "2") or 2))
         self._send_ack_sec = float(os.environ.get("DESKTOP_WS_SEND_ACK_SEC", "2.5") or 2.5)
         self._ack_optional = os.environ.get("DESKTOP_WS_ACK_OPTIONAL", "1").lower() in ("1", "true", "yes")
+        self._echo_wait: dict[str, threading.Event] = {}
+        self._echo_lock = threading.Lock()
+        self._send_ok_ev: threading.Event | None = None
 
     def set_context(self, daemon: Any, settings: dict[str, str], bot: dict) -> None:
         with self._ctx_lock:
@@ -223,16 +233,42 @@ class Ws55:
                 if _group_id:
                     log.info("getGroups 群 ID=%s name=%s", _group_id, gname)
 
+    def _note_group_echo(self, content: str) -> None:
+        key = (content or "").strip()
+        if not key:
+            return
+        with self._echo_lock:
+            ev = self._echo_wait.get(key)
+            if not ev:
+                for k, e in list(self._echo_wait.items()):
+                    if k in key or key in k:
+                        ev = e
+                        break
+            else:
+                self._echo_wait.pop(key, None)
+        if ev:
+            ev.set()
+
     def _handle_send_ack(self, msg: dict) -> None:
         if msg.get("operator") != "msgListPropertyUpdate":
             return
         data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
         mid = str(msg.get("id") or data.get("id") or "")
+        status = data.get("readStatus")
+        lst = data.get("list") if isinstance(data.get("list"), list) else []
+        if lst:
+            upd = lst[0].get("updated") if isinstance(lst[0], dict) else {}
+            rs = upd.get("readStatus") if isinstance(upd, dict) else None
+            if rs is not None:
+                status = rs
+        if status in (1, "1", 2, "2") and self._send_ok_ev:
+            self._send_ok_ev.set()
         if not mid or mid not in self._ack_events:
             return
-        status = data.get("readStatus")
         if status in (0, "0"):
             self._ack_fail.add(mid)
+        elif status in (1, "1", 2, "2"):
+            pass
         self._ack_events[mid].set()
 
     def _run(self) -> None:
@@ -245,6 +281,9 @@ class Ws55:
             except json.JSONDecodeError:
                 return
             self._handle_send_ack(msg)
+            op = msg.get("operator") or msg.get("type") or msg.get("message")
+            if op not in ("network", "socketLogin") and op != "Hello":
+                log.debug("WS recv %s", json.dumps(msg, ensure_ascii=False)[:200])
             if msg.get("message") == "Hello":
                 self._ready.set()
                 try:
@@ -257,6 +296,9 @@ class Ws55:
                 return
             if msg.get("operator") == "msgNew" and msg.get("data", {}).get("type") == "group":
                 d = msg["data"]
+                content = str(d.get("content") or "").strip()
+                if d.get("isSelf") and content:
+                    self._note_group_echo(content)
                 if _is_target_group(d) and _group_id is None:
                     _group_id = int(d.get("groupId") or d.get("id") or 0) or None
                     if _group_id:
@@ -338,15 +380,42 @@ class Ws55:
         return _group_id is not None
 
     def send_text(self, gid: int, text: str) -> None:
-        self._send_with_ack({
-            "type": "sendMsg",
-            "data": {
-                "id": gid,
-                "type": "group",
-                "list": [{"type": "text", "values": {"chatType": 0, "content": text}}],
-                "quoteInfo": None,
-            },
-        })
+        echo_ev = threading.Event()
+        send_ok = threading.Event()
+        key = text.strip()
+        with self._echo_lock:
+            self._echo_wait[key] = echo_ev
+        self._send_ok_ev = send_ok
+        try:
+            self._send_with_ack({
+                "type": "sendMsg",
+                "data": {
+                    "id": gid,
+                    "type": "group",
+                    "list": [{"type": "text", "values": {"chatType": 0, "content": text}}],
+                    "quoteInfo": None,
+                },
+            })
+        except Exception as ex:
+            with self._echo_lock:
+                self._echo_wait.pop(key, None)
+            self._send_ok_ev = None
+            raise
+        timeout = float(os.environ.get("DESKTOP_GROUP_ECHO_SEC", "8") or 8)
+        deadline = time.time() + timeout
+        ok = False
+        while time.time() < deadline:
+            if echo_ev.is_set() or send_ok.is_set():
+                ok = True
+                break
+            time.sleep(0.05)
+        with self._echo_lock:
+            self._echo_wait.pop(key, None)
+        self._send_ok_ev = None
+        if ok:
+            log.info("GROUP_OUT_OK gid=%s lines=%s", gid, text.split("\n")[0][:60])
+        else:
+            log.warning("GROUP_OUT_UNCONFIRMED gid=%s (已发送，待手机验收)", gid)
 
     def send_file(self, gid: int, path: str) -> None:
         win_path = str(Path(path).resolve()).replace("/", "\\")
@@ -371,9 +440,11 @@ class Ws55:
             or ""
         )
         msg_type = int(d.get("msgType") or d.get("chatType") or 0)
-        if not content or msg_type not in (0,):
+        log.info("WS IN gid=%s nick=%s type=%s content=%s", d.get("groupId") or d.get("id"), nick or "?", msg_type, content[:40])
+        if not content:
             return
-        log.info("IN cmd nick=%s content=%s", nick or "?", content[:40])
+        if msg_type not in (0, 1):
+            return
         uid = str(d.get("sendUid") or d.get("UserID") or "")
         try:
             users = ensure_panel_user(str(nick), uid)
@@ -543,6 +614,26 @@ def _loop_interval(d: object, settings: dict[str, str]) -> float:
     return LOOP_SEC
 
 
+def _wait_deps(timeout: float = 45.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ok_p = ok_b = False
+        try:
+            with urllib.request.urlopen(f"{PANEL}/api/bots", timeout=2) as r:
+                ok_p = r.status == 200
+        except Exception:
+            pass
+        try:
+            with urllib.request.urlopen(f"{BRAIN}/health", timeout=2) as r:
+                ok_b = r.status == 200
+        except Exception:
+            pass
+        if ok_p and ok_b:
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"panel/brain 未就绪 panel={PANEL} brain={BRAIN}")
+
+
 def main() -> int:
     _acquire_singleton()
     os.environ.setdefault("EDGE_BRAIN_JWT_SECRET", "w49-local-desktop-test")
@@ -571,6 +662,7 @@ def main() -> int:
         if line.startswith("EDGE_BRAIN_JWT="):
             os.environ["EDGE_BRAIN_JWT"] = line.split("=", 1)[1].strip()
 
+    _wait_deps()
     ws = Ws55()
     ws.start()
     ws.probe_groups(timeout=8.0)
@@ -579,6 +671,15 @@ def main() -> int:
     settings = load_settings()
     bot = load_bot()
     ws.set_context(d, settings, bot)
+    try:
+        from datetime import datetime
+
+        gid = require_group_id()
+        stamp = datetime.now().strftime("%H:%M:%S")
+        ws.send_text(gid, f"【w49闭环】机器人已上线 {stamp}\n请发 扣1 或 1 测试")
+        log.info("OUT boot ping gid=%s", gid)
+    except Exception as ex:
+        log.warning("boot ping: %s", ex)
     if os.environ.get("DESKTOP_STARTUP_PING", "").lower() in ("1", "true", "yes"):
         try:
             gid = require_group_id()

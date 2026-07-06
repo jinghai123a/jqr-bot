@@ -219,6 +219,10 @@ def main() -> int:
     )
     PROCS.append(ann)
     print("公告编排已启动 — 68助手保持登录，群=苍井空测试", flush=True)
+    time.sleep(12)
+    if ann.poll() is not None:
+        print(f"announce 已退出 code={ann.returncode} — 见上方 stderr", file=sys.stderr)
+        return 1
     try:
         ann.wait()
     except KeyboardInterrupt:
