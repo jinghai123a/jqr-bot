@@ -126,12 +126,13 @@
     {
       "id": "68chat-bot-protocol",
       "name": "68chat-bot 官方 WS 协议",
-      "docs": "https://yee338024.github.io/68chat-bot/websocket.html",
+      "docs": "https://yee338024.github.io/68chat-bot/（五页 on_this_page 见 68chat-protocol.json）",
       "role": "68助手桌面 WS：msgNew/sendMsg/sendFile/getGroups/custom_msg_id",
       "usage_permanent": [
         "BOT_55WS_URL=ws://127.0.0.1:5600",
         "sendMsg data.custom_msg_id + sendFile 顶层 custom_msg_id（11位非0开头）",
         "ack 匹配 msgListPropertyUpdate.list[].customMsgId",
+        "规格 config/55m-knowledge/68chat-protocol.json（on_this_page + group_update_ops）",
         "规格 config/55m-knowledge/desktop-protocol.json"
       ],
       "project_paths": [

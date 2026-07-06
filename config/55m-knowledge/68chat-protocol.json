@@ -2,11 +2,114 @@
   "title": "68chat-bot 官方协议全量规格",
   "source": "https://yee338024.github.io/68chat-bot/",
   "pages": {
+    "index": "https://yee338024.github.io/68chat-bot/",
     "guide": "https://yee338024.github.io/68chat-bot/guide.html",
     "websocket": "https://yee338024.github.io/68chat-bot/websocket.html",
     "http": "https://yee338024.github.io/68chat-bot/http.html",
     "msg": "https://yee338024.github.io/68chat-bot/msg.html",
     "group": "https://yee338024.github.io/68chat-bot/group.html"
+  },
+  "on_this_page": {
+    "guide": [
+      {"id": "激活软件", "note": "设置页激活卡密后可用"},
+      {"id": "价格表", "tiers": ["收取消息 60/150/450 U", "收/发消息 120/300/900 U"]},
+      {"id": "联系客服购买卡密", "channel": "Telegram"},
+      {"id": "连接websocket", "url": "ws://127.0.0.1:5599", "handshake": {"message": "Hello"}, "format": "JSON"},
+      {"id": "68消息回调", "children": [
+        {"id": "好友消息", "operator": "msgNew", "type": "friend", "keys": ["sendUid", "receiveUid", "content", "customMsgId", "isSelf"]},
+        {"id": "群聊消息", "operator": "msgNew", "type": "group", "keys": ["sendUid", "groupId", "content", "sendMember", "customMsgId"]},
+        {"id": "群组信息更新", "operator": "groupUpdate", "values": ["name"]},
+        {"id": "开启/关闭群禁言", "operator": "msgNew", "operatorType": "groupShutupAll", "chatType": 50, "bfShutup": "true|false"},
+        {"id": "开启阅后即焚", "operator": "msgNew", "operatorType": "operatorReadCancel", "chatType": 50},
+        {"id": "关闭阅后即焚", "operator": "msgNew", "operatorType": "operatorReadCancel", "chatType": 50}
+      ]}
+    ],
+    "websocket": [
+      {"id": "获取个人资料", "type": "request", "api": "UserInfo"},
+      {"id": "获取联系人列表", "type": "request", "api": "ContactsList"},
+      {"id": "报错测试", "type": "request", "api": "GroupReqList", "error_shape": {"errorCode": 300}},
+      {"id": "获取群组列表", "type": "getGroups"},
+      {"id": "发送好友信息", "type": "sendMsg", "target": "friend", "custom_msg_id": "必填"},
+      {"id": "发送群组信息", "type": "sendMsg", "target": "group", "custom_msg_id": "必填"},
+      {"id": "获取群组成员", "type": "request", "api": "GroupMemberList", "protoType": "group"},
+      {"id": "获取联系人资料", "type": "request", "api": "ContactsDetail"},
+      {"id": "获取好友请求列表", "type": "request", "api": "ContactsApplyList"},
+      {"id": "获取群成员在线状态", "type": "request", "api": "GroupMemberOnLineStatusList"},
+      {"id": "获取群组信息", "type": "request", "api": "GroupDetail"},
+      {"id": "发送文件", "type": "sendFile", "note": "Windows绝对路径"},
+      {"id": "获取 apiUrl", "type": "getApiUrl"},
+      {"id": "发送多行文本", "type": "sendMsg", "content": "\\n 转义换行"},
+      {"id": "更新群简介", "type": "request", "api": "GroupUpdate", "op": 12, "bfAll": true},
+      {"id": "发送群简介变更通知", "type": "sendMsg", "chatType": 8, "bfAll": true, "note": "API改公告后须手动发此条"},
+      {"id": "群禁言", "type": "request", "api": "GroupUpdate", "op": 11, "shutup": true},
+      {"id": "发送群禁言消息", "type": "sendMsg", "chatType": 50, "bfShutup": true},
+      {"id": "群成员禁言", "type": "request", "api": "GroupMemberShutup", "shutupTime_sec": 3600},
+      {"id": "重启68", "type": "restart68"}
+    ],
+    "http": [
+      {"id": "获取个人资料", "path": "/request", "api": "UserInfo"},
+      {"id": "获取联系人列表", "path": "/request", "api": "ContactsList"},
+      {"id": "报错测试", "path": "/request", "api": "GroupReqList"},
+      {"id": "获取群组列表", "path": "/getGroups", "body": null},
+      {"id": "获取群组成员", "path": "/request", "api": "GroupMemberList"},
+      {"id": "发送消息", "path": "/sendMsg", "response": {"data": "success"}},
+      {"id": "发送文件", "path": "/sendFile", "response": {"data": "success"}},
+      {"id": "获取联系人资料", "path": "/request", "api": "ContactsDetail"},
+      {"id": "获取好友请求列表", "path": "/request", "api": "ContactsApplyList"},
+      {"id": "获取群成员在线状态", "path": "/request", "api": "GroupMemberOnLineStatusList"},
+      {"id": "获取群组信息", "path": "/request", "api": "GroupDetail"},
+      {"id": "更新群简介", "path": "/request", "api": "GroupUpdate", "op": 12},
+      {"id": "群禁言", "path": "/request", "api": "GroupUpdate", "op": 11},
+      {"id": "删除消息", "path": "/deleteMsg", "isRemoteDeletion": "true=双向删"},
+      {"id": "群成员禁言", "path": "/request", "api": "GroupMemberShutup"},
+      {"id": "获取 apiUrl", "path": "/getApiUrl"},
+      {"id": "重启68", "path": "/restart68"}
+    ],
+    "msg": [
+      {"id": "消息类型对照表", "ref": "msg_types"},
+      {"id": "发送消息", "children": [
+        {"id": "检测消息是否发送成功", "operator": "msgListPropertyUpdate", "fail": "readStatus=0", "ok": "readStatus=1+MsgID"},
+        {"id": "发送消息给好友", "type": "sendMsg", "target": "friend"},
+        {"id": "发送消息到群组", "type": "sendMsg", "target": "group", "custom_msg_id": "data内必填"},
+        {"id": "发送文件", "type": "sendFile", "custom_msg_id": "顶层必填"}
+      ]},
+      {"id": "收取消息", "children": [
+        {"id": "新的文字消息", "msgType": 0, "operator": "msgNew"},
+        {"id": "新的图片消息", "msgType": 1, "content": "url||thumb||size||0", "fileKey": "有"},
+        {"id": "消息双向删除", "operator": "recall_msg", "field": "recallOneToOneMessages"},
+        {"id": "新的文件消息", "msgType": 7, "content": "url||fileName||size", "fileKey/fileName/fileSize": "有"},
+        {"id": "骰子消息", "msgType": 12, "content": "点数||随机数", "msgId": "常等于随机数"}
+      ]}
+    ],
+    "group": [
+      {"id": "群组更新操作枚举", "ref": "group_update_ops"},
+      {"id": "更新群简介", "steps": [
+        "1. WS request GroupUpdate op=12 bfAll=true",
+        "2. 须再 sendMsg chatType=8 bfAll=true（API alone 不推群通知）"
+      ]}
+    ]
+  },
+  "group_update_ops": {
+    "0": "ADD 创建群组",
+    "1": "DEL 删除群组",
+    "2": "TOP 群组置顶",
+    "3": "STAR 星标/收藏",
+    "4": "DISTURB 免打扰",
+    "5": "ADDRESS 地址/定位",
+    "6": "JOIN_CHECK 入群验证",
+    "7": "UPDATE_GROUP_NAME 改群名",
+    "8": "UPDATE_NICK_NAME 改群内昵称",
+    "9": "UPDATE_GROUP_PIC 改群头像",
+    "10": "JOIN_FRIEND 加好友入群",
+    "11": "SHUTUP 群禁言",
+    "12": "NOTICE 设群公告",
+    "13": "CLEAR_NOTICE 清群公告",
+    "14": "ADD_ADMIN 加管理员",
+    "15": "EDIT_ADMIN 编/撤管理员",
+    "16": "GROUP_READ_CANCEL_OP 取消群已读",
+    "17": "GROUP_READ_CANCEL_TIME_OP 按时间取消已读",
+    "18": "UPDATE_REMARK 改群备注",
+    "-1": "UNRECOGNIZED"
   },
   "guide": {
     "activation": "设置中激活卡密后可用",
@@ -101,18 +204,28 @@
   },
   "msg_types": {
     "0": {"name": "文本", "const": "MESSAGE_TYPE_TEXT"},
-    "1": {"name": "图片", "const": "MESSAGE_TYPE_IMAGE"},
+    "1": {"name": "图片", "const": "MESSAGE_TYPE_IMAGE", "content_format": "url||thumbUrl||bytes||0"},
     "2": {"name": "语音", "const": "MESSAGE_TYPE_VOICE"},
     "3": {"name": "视频", "const": "MESSAGE_TYPE_VIDEO"},
     "4": {"name": "位置", "const": "MESSAGE_TYPE_LOCATION"},
     "5": {"name": "名片", "const": "MESSAGE_TYPE_NAMECARD"},
     "6": {"name": "系统消息", "const": "MESSAGE_TYPE_SYSTEM"},
-    "7": {"name": "文件", "const": "MESSAGE_TYPE_FILE", "project": "结算 sendFile 后发 msgType=7"},
+    "7": {"name": "文件", "const": "MESSAGE_TYPE_FILE", "content_format": "url||fileName||size", "project": "结算 sendFile 后发 msgType=7"},
     "8": {"name": "通知", "const": "MESSAGE_TYPE_NOTICE"},
     "9": {"name": "动画表情", "const": "MESSAGE_TYPE_DYNAMIC_IMAGE"},
     "10": {"name": "红包", "const": "MESSAGE_TYPE_REDPACKET"},
+    "11": {"name": "HTML", "const": "MESSAGE_TYPE_HTML"},
     "12": {"name": "骰子", "const": "MESSAGE_TYPE_SETIMAGE", "content": "点数||随机数"},
+    "13": {"name": "转账(未支持)", "const": "MESSAGE_TYPE_CHAT_TRANSFER"},
+    "14": {"name": "转账结果", "const": "MESSAGE_TYPE_CHAT_TRANSFER_RESULT"},
+    "15": {"name": "红包结果", "const": "MESSAGE_TYPE_REDPACKET_RESULT"},
+    "16": {"name": "HTML2", "const": "MESSAGE_TYPE_HTML2"},
+    "17": {"name": "图片列表", "const": "MESSAGE_TYPE_IMAGE_LIST"},
     "18": {"name": "扑克牌", "const": "MESSAGE_TYPE_ANIMATED_GAME"},
+    "19": {"name": "红包变化", "const": "MESSAGE_TYPE_REDPACKET_CHANGE"},
+    "20": {"name": "红包事件", "const": "MESSAGE_TYPE_REDPACKET_EVENT"},
+    "100": {"name": "流媒体", "const": "MESSAGE_TYPE_STREAM"},
+    "101-104": {"name": "系统/群提示", "const": "MESSAGE_TYPE_SYSTEM_TIP|GROUP_TIP"},
     "50": {"name": "群系统通知", "note": "禁言/阅后即焚等"},
     "201": "撤回成功", "202": "错误提示", "203": "撤回消息",
     "-1": "未知", "-2": "未解密"
