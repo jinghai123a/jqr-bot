@@ -20,6 +20,7 @@ REQUIRED = [
     "ui-pages.json",
     "edge-events.json",
     "executor-matrix.json",
+    "panel-catalog.json",
 ]
 
 
@@ -41,6 +42,11 @@ def main() -> int:
     dp = KB / "desktop-protocol.json"
     if dp.is_file():
         json.loads(dp.read_text(encoding="utf-8"))
+    catalog = KB / "panel-catalog.json"
+    if catalog.is_file():
+        cat = json.loads(catalog.read_text(encoding="utf-8"))
+        assert isinstance(cat.get("products"), list) and cat["products"], "panel-catalog products empty"
+        assert isinstance(cat.get("combo_rules"), list) and cat["combo_rules"], "panel-catalog combo_rules empty"
     print(f"KNOWLEDGE_OK {len(REQUIRED)} files")
     return 0
 

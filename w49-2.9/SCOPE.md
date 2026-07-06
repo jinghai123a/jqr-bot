@@ -5,6 +5,7 @@
 ```
 w49-2.9/**
 config/55m-knowledge/desktop-protocol.json
+config/55m-knowledge/panel-catalog.json
 config/55m-knowledge/executor-matrix.json   # desktop_ws 段
 config/55m-knowledge/apis.json              # desktop_protocol 段
 config/55m-knowledge/INDEX.md

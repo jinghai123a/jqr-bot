@@ -31,12 +31,11 @@ $env:DESKTOP_GROUP_ID = '492316'
 .\.venv\Scripts\python.exe scripts\desktop_local_stack.py
 ```
 
-健康检查：`scripts\desktop_local_stack.py --check`
-
-## 验收（群聊 OUT）
+健康检查：`scripts\desktop_local_stack.py --check`（含 WS Hello + panel products）
 
 | 项 | 期望 |
 |----|------|
+| `--check` | `WS_HANDSHAKE=OK` `PANEL_CATALOG=OK` |
 | 扣1 | §2.1 模板 |
 | 封盘 70s/15s | §5.1 / §5.2 |
 | 结算 | 三图 + 新一局 |

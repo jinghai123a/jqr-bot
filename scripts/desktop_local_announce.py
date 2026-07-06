@@ -194,6 +194,10 @@ class Ws55:
         self._ctx_lock = threading.Lock()
         self._settings: dict[str, str] = {}
         self._bot: dict = {}
+        self._ack_events: dict[str, threading.Event] = {}
+        self._ack_fail: set[str] = set()
+        self._send_retries = max(0, int(os.environ.get("DESKTOP_WS_SEND_RETRIES", "2") or 2))
+        self._send_ack_sec = float(os.environ.get("DESKTOP_WS_SEND_ACK_SEC", "2.5") or 2.5)
 
     def set_context(self, daemon: Any, settings: dict[str, str], bot: dict) -> None:
         with self._ctx_lock:
@@ -207,6 +211,29 @@ class Ws55:
         if not self._ready.wait(timeout=15):
             raise RuntimeError(f"WS 连接超时: {WS_URL}")
 
+    def _resolve_group_from_list(self, groups: list) -> None:
+        global _group_id
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            gname = str(g.get("name") or "")
+            if (TARGET_GROUP in gname or GROUP_NAME_FALLBACK in gname) and not _group_id:
+                _group_id = int(g.get("id") or 0) or None
+                if _group_id:
+                    log.info("getGroups 群 ID=%s name=%s", _group_id, gname)
+
+    def _handle_send_ack(self, msg: dict) -> None:
+        if msg.get("operator") != "msgListPropertyUpdate":
+            return
+        data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+        mid = str(msg.get("id") or data.get("id") or "")
+        if not mid or mid not in self._ack_events:
+            return
+        status = data.get("readStatus")
+        if status in (0, "0"):
+            self._ack_fail.add(mid)
+        self._ack_events[mid].set()
+
     def _run(self) -> None:
         global _group_id
 
@@ -216,6 +243,7 @@ class Ws55:
                 msg = json.loads(message)
             except json.JSONDecodeError:
                 return
+            self._handle_send_ack(msg)
             if msg.get("message") == "Hello":
                 self._ready.set()
                 try:
@@ -224,12 +252,7 @@ class Ws55:
                     pass
                 return
             if msg.get("type") == "getGroups" and isinstance(msg.get("data"), list):
-                for g in msg["data"]:
-                    gname = str(g.get("name") or "")
-                    if (TARGET_GROUP in gname or GROUP_NAME_FALLBACK in gname) and not _group_id:
-                        _group_id = int(g.get("id") or 0) or None
-                        if _group_id:
-                            log.info("getGroups 群 ID=%s name=%s", _group_id, gname)
+                self._resolve_group_from_list(msg["data"])
                 return
             if msg.get("operator") == "msgNew" and msg.get("data", {}).get("type") == "group":
                 d = msg["data"]
@@ -261,9 +284,57 @@ class Ws55:
                 raise RuntimeError("WS 未连接")
             self._ws.send(json.dumps(payload, ensure_ascii=False))
 
+    def _send_with_ack(self, payload: dict) -> None:
+        attempts = self._send_retries + 1
+        last_err = "no ack"
+        for attempt in range(attempts):
+            msg_id = str(payload.get("id") or uuid4())
+            payload = {**payload, "id": msg_id}
+            ev = threading.Event()
+            self._ack_events[msg_id] = ev
+            self._ack_fail.discard(msg_id)
+            try:
+                self._send(payload)
+            except Exception as ex:
+                self._ack_events.pop(msg_id, None)
+                last_err = str(ex)
+                log.warning("WS send err id=%s attempt=%s: %s", msg_id, attempt + 1, ex)
+                continue
+            if ev.wait(timeout=self._send_ack_sec):
+                failed = msg_id in self._ack_fail
+                self._ack_events.pop(msg_id, None)
+                self._ack_fail.discard(msg_id)
+                if not failed:
+                    return
+                last_err = "readStatus=0"
+                log.warning("WS send ack fail id=%s attempt=%s", msg_id, attempt + 1)
+            else:
+                self._ack_events.pop(msg_id, None)
+                last_err = "ack timeout"
+                log.warning("WS send ack timeout id=%s attempt=%s", msg_id, attempt + 1)
+        raise RuntimeError(f"WS send failed after {attempts} tries: {last_err}")
+
+    def probe_groups(self, timeout: float = 5.0) -> bool:
+        """启动探针：Hello 后 getGroups 解析目标群 ID。"""
+        global _group_id
+        if _group_id:
+            return True
+        if os.environ.get("DESKTOP_GROUP_ID"):
+            _group_id = int(os.environ["DESKTOP_GROUP_ID"])
+            return True
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if _group_id:
+                return True
+            try:
+                self._send({"id": "probe-groups", "type": "getGroups"})
+            except Exception:
+                pass
+            time.sleep(0.3)
+        return _group_id is not None
+
     def send_text(self, gid: int, text: str) -> None:
-        self._send({
-            "id": str(uuid4()),
+        self._send_with_ack({
             "type": "sendMsg",
             "data": {
                 "id": gid,
@@ -275,8 +346,7 @@ class Ws55:
 
     def send_file(self, gid: int, path: str) -> None:
         win_path = str(Path(path).resolve()).replace("/", "\\")
-        self._send({
-            "id": str(uuid4()),
+        self._send_with_ack({
             "type": "sendFile",
             "data": {"file": win_path, "type": "group", "id": gid},
         })
@@ -457,6 +527,18 @@ def try_open_after_settle(d: object, ws: Ws55, bot: dict, settings: dict[str, st
     log.info("OUT open-after-settle rid=%s", open_rid)
 
 
+def _loop_interval(d: object, settings: dict[str, str]) -> float:
+    """封盘窗内加速轮询，对齐用户使用毫秒级公告目标。"""
+    fast = float(os.environ.get("DESKTOP_ANNOUNCE_FAST_SEC", "0.1") or 0.1)
+    try:
+        _, _, remaining = d.active_round_timing(settings)
+        if remaining <= d.WARN_ANNOUNCE_BEFORE_SEC + 2:
+            return min(LOOP_SEC, fast)
+    except Exception:
+        pass
+    return LOOP_SEC
+
+
 def main() -> int:
     _acquire_singleton()
     os.environ.setdefault("EDGE_BRAIN_JWT_SECRET", "w49-local-desktop-test")
@@ -487,7 +569,8 @@ def main() -> int:
 
     ws = Ws55()
     ws.start()
-    log.info("WS OK %s panel=%s brain=%s group=%s", WS_URL, PANEL, BRAIN, TARGET_GROUP)
+    ws.probe_groups(timeout=8.0)
+    log.info("WS OK %s panel=%s brain=%s group=%s gid=%s", WS_URL, PANEL, BRAIN, TARGET_GROUP, _group_id)
 
     settings = load_settings()
     bot = load_bot()
@@ -535,7 +618,7 @@ def main() -> int:
             try_open_after_settle(d, ws, bot, settings)
         except Exception as ex:
             log.warning("loop: %s", ex)
-        time.sleep(LOOP_SEC)
+        time.sleep(_loop_interval(d, settings))
 
 
 if __name__ == "__main__":

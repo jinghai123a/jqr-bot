@@ -20,7 +20,9 @@ HOST = os.environ.get("EDGE_MOCK_PANEL_HOST", "127.0.0.1")
 PORT = int(os.environ.get("EDGE_MOCK_PANEL_PORT", "3000") or 3000)
 STATE_PATH = ROOT / "data" / "local-panel-state.json"
 KNOWLEDGE = ROOT / "config" / "55m-knowledge" / "announce-templates.json"
+CATALOG = ROOT / "config" / "55m-knowledge" / "panel-catalog.json"
 _LOCK = threading.Lock()
+_CATALOG_CACHE: tuple[list[Any], list[Any]] | None = None
 
 
 def _default_state() -> dict[str, Any]:
@@ -57,6 +59,24 @@ def _save_state(st: dict[str, Any]) -> None:
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(STATE_PATH)
+
+
+def _load_catalog() -> tuple[list[Any], list[Any]]:
+    global _CATALOG_CACHE
+    if _CATALOG_CACHE is not None:
+        return _CATALOG_CACHE
+    if not CATALOG.is_file():
+        _CATALOG_CACHE = ([], [])
+        return _CATALOG_CACHE
+    try:
+        data = json.loads(CATALOG.read_text(encoding="utf-8"))
+        products = data.get("products") if isinstance(data.get("products"), list) else []
+        combo_rules = data.get("combo_rules") if isinstance(data.get("combo_rules"), list) else []
+        _CATALOG_CACHE = (products, combo_rules)
+        return _CATALOG_CACHE
+    except (json.JSONDecodeError, OSError):
+        _CATALOG_CACHE = ([], [])
+        return _CATALOG_CACHE
 
 
 def _load_settings() -> dict[str, str]:
@@ -132,10 +152,12 @@ class Handler(BaseHTTPRequestHandler):
             _json(self, 200, st.get("users") or [])
             return
         if path.path == "/api/products":
-            _json(self, 200, [])
+            products, _ = _load_catalog()
+            _json(self, 200, products)
             return
         if path.path == "/api/combo-rules":
-            _json(self, 200, [])
+            _, combo_rules = _load_catalog()
+            _json(self, 200, combo_rules)
             return
         if path.path.startswith("/api/topup-requests"):
             qs = parse_qs(path.query)

@@ -26,5 +26,5 @@ $env:DESKTOP_GROUP_ID = '492316'
 
 ## 版本
 
-- **w49-2.9** — desktop_ws 模式 + BOT_EXECUTOR 互斥 + desktop-protocol 知识库
-- 母仓库 commit 基线：`9de4e03` + 本包剩余 2 文件
+- **w49-2.9** — desktop_ws 模式 + BOT_EXECUTOR 互斥 + desktop-protocol 知识库 + panel-catalog mock
+- 母仓库 commit 基线：`9de4e03` + panel-catalog / ack 重试 / getGroups 探针

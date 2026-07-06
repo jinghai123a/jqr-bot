@@ -13,9 +13,10 @@
 **分层混合 + 执行器互斥 + 诚实验收边界**
 
 - P0 ✅ 知识库 + `BOT_EXECUTOR=ws` + stack 冲突检测
+- P0.5 ✅ panel-catalog + mock panel products/combo-rules
 - P1 群聊 E2E（扣1/封盘/三图）— **OUT 时间戳验收**
-- P1.5 mock panel 导入真实 products/combo-rules
-- P2 getGroups 探针 + readStatus 重试
+- P1.5 ✅ mock panel 导入真实 products/combo-rules（`panel-catalog.json`）
+- P2 ✅ getGroups 探针 + readStatus 重试（`desktop_local_announce.py`）
 - P3 生产 VPS 68助手 PoC（未 PoC 禁止切流）
 
 ## 明确不测（P1）
