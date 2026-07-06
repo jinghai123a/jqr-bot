@@ -29,7 +29,12 @@ UPLOAD = (
     "bot_ops/config.py",
     "bot_ops/vps_ports.py",
     "bot_ops/ssh_client.py",
+    "bot_tunnel/env_io.py",
+    "bot_tunnel/refresh.py",
     "config/vmos-pads.json",
+    "config/vmos-console-snapshot.json",
+    "scripts/apply_vmos_console_snapshot.py",
+    "config/55m-knowledge/control-plane.json",
     "scripts/watch-adb-tunnels.sh",
     "scripts/vps_minimal_cron.sh",
     "config/pinned-coords.json",
@@ -51,13 +56,17 @@ UPLOAD = (
     "scripts/vps_hotfix_reload_verify.py",
     "scripts/vps_recover_clicker_group.py",
     "scripts/vps_heal_clicker_pause_worker.py",
+    "scripts/vps_restart_left_only.py",
+    "scripts/vps_force_left_out_now.py",
     "scripts/vps_stack_status_now.py",
     "scripts/vps_audit_secrets_and_0856.py",
     "scripts/vps_left_gallery_purge_now.py",
     "scripts/vps_left_gallery_diag.py",
     "scripts/vps_captures_cleanup.py",
     "bot_ops/ephemeral_burn.py",
-    "bot_ops/deploy_secrets.py",
+    "bot_tunnel/daemon.py",
+    "scripts/vmos_adb_daemon.py",
+    "scripts/vmos_adb_daemon_start.sh",
 )
 
 ENV_KV = (
@@ -68,6 +77,7 @@ ENV_KV = (
     "BOT_CLICKER_SEND_IMAGES=1",
     "BOT_CLICKER_SETTLE=1",
     "BOT_CLICKER_SEND_ANNOUNCE=1",
+    "BOT_LISTENER_OPTIONAL=1",
     "BOT_LISTENER_ZERO_NAV=1",
     "BOT_LISTENER_ADB_PORT=58433",
     "BOT_CLICKER_ADB_PORT=55612",
@@ -195,10 +205,22 @@ def main() -> int:
         health = ssh.run("curl -sf http://127.0.0.1:8790/health; echo", 10)
         step("edge_brain", '"ok"' in health, health)
 
-        reload = ssh.run(f"bash {R}/scripts/reload-dual-workers.sh 2>&1 | tail -15", 300)
-        time.sleep(12)
+        left_only = ssh.run(f"cd {R} && {PY} scripts/vps_restart_left_only.py 2>&1", 360)
+        time.sleep(8)
         procs = ssh.run("pgrep -af 'edge_brain|bot_dual_supervisor|spawn_main' | grep -v pgrep", 20)
-        step("supervisor", "spawn_main" in procs and "bot_dual_supervisor" in procs, f"{reload}\n{procs}")
+        sup_ok = (
+            "bot_dual_supervisor" in procs
+            and "spawn_main" in procs
+            and ("ensure_ok True" in left_only or "announce-bot-3" in left_only)
+        )
+        step("supervisor", sup_ok, f"{left_only[-2000:]}\n{procs}")
+
+        smoke = ssh.run(
+            f"set -a; source {R}/config/bot-start.env; set +a; "
+            f"cd {R} && {PY} scripts/vps_force_left_out_now.py 2>&1",
+            120,
+        )
+        step("left_smoke_announce", "OK:" in smoke or "announce visible" in smoke, smoke[-1500:])
 
         # 等左机发图链空闲后再做视觉验收（避免 reload 中途快照误判）
         chain_tail = ""

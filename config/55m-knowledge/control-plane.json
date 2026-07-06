@@ -11,9 +11,9 @@
     "edge_brain_jwt_env": "EDGE_BRAIN_JWT"
   },
   "aps_production": {
-    "host": "46.183.27.174",
+    "host": "195.114.193.136",
     "bot_root": "/home/bot/55chat-bot",
-    "panel_bind": "46.183.27.174:3000",
+    "panel_bind": "195.114.193.136:3000",
     "tunnel_bind_right": "195.114.193.237",
     "tunnel_bind_left": "195.114.193.136"
   },

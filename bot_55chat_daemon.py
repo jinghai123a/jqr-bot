@@ -71,6 +71,7 @@ CLICKER_BOT_IDS = {
     if x.strip()
 }
 CLICKER_OPTIONAL = os.environ.get("BOT_CLICKER_OPTIONAL", "0").lower() in ("1", "true", "yes")
+LISTENER_OPTIONAL = os.environ.get("BOT_LISTENER_OPTIONAL", "0").lower() in ("1", "true", "yes")
 # 左机仅负责 UI 发图（+→图片→勾选→发送）
 CLICKER_SEND_IMAGES = os.environ.get("BOT_CLICKER_SEND_IMAGES", "0").lower() in ("1", "true", "yes")
 # 左机 CLICKER 负责 warn/close/open 文字公告；右机 LISTENER 仅热路径用户回复
@@ -13486,6 +13487,12 @@ def register_deploy_serial_roles(active: list[dict]) -> None:
         serial = resolve_serial_optional(host, label=f"{bot.get('id')}({role})")
         if not serial:
             if role == "LISTENER":
+                if LISTENER_OPTIONAL:
+                    log.warning(
+                        "右机 LISTENER 暂离线 BOT_LISTENER_OPTIONAL=1 — 左机独立发图/公告: %s",
+                        host,
+                    )
+                    continue
                 raise RuntimeError(f"右机 LISTENER 不可用: {host}")
             log.warning("左机 CLICKER 暂不可用，认人/添加将跳过: %s", host)
             continue
@@ -14704,6 +14711,13 @@ class Orchestrator:
             serial = resolve_serial_optional(host, label=f"{bot.get('id')}({role})")
             if not serial:
                 if role == "LISTENER":
+                    if LISTENER_OPTIONAL:
+                        log.warning(
+                            "跳过离线 LISTENER bot=%s host=%s（左机独立模式）",
+                            bot.get("id"),
+                            host,
+                        )
+                        continue
                     raise RuntimeError(f"右机 LISTENER 不可用: {host}")
                 log.warning("跳过不可用 CLICKER bot=%s host=%s", bot.get("id"), host)
                 continue

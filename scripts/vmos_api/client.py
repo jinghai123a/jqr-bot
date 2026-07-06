@@ -27,12 +27,20 @@ class VmosApiClient:
     ALGORITHM = VmosSigner.ALGORITHM
     CONTENT_TYPE = VmosSigner.CONTENT_TYPE
 
-    def __init__(self, access_key: str, secret_key: str, timeout: int = 60) -> None:
+    def __init__(
+        self,
+        access_key: str,
+        secret_key: str,
+        timeout: int = 60,
+        *,
+        proxy: str | None = None,
+    ) -> None:
         self.access_key = access_key.strip()
         self.secret_key = secret_key.strip()
         self.timeout = timeout
+        self.proxy = proxy
         signer = VmosSigner(self.access_key, self.secret_key)
-        self._transport = VmosTransport(signer, timeout=timeout)
+        self._transport = VmosTransport(signer, timeout=timeout, proxy=proxy)
 
     def post(self, path: str, payload: dict[str, Any] | None = None, retries: int = 3) -> dict[str, Any]:
         return self._transport.post(path, payload, retries=retries)

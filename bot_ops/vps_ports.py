@@ -38,7 +38,8 @@ def dual_adb_ports(root: Path | None = None) -> tuple[str, str]:
 
 def port_device_online(out: str, port: str) -> bool:
     for line in out.splitlines():
-        if port in line and "\tdevice" in line:
+        parts = line.split()
+        if len(parts) >= 2 and port in parts[0] and parts[1] == "device":
             return True
     return False
 

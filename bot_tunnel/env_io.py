@@ -23,7 +23,7 @@ def shell_env_line(key: str, value: str) -> str:
     """Write KEY=value for tunnel env; command/adb fields must be quoted."""
     if not value:
         return f"{key}="
-    if key in ("VMOS_SSH_COMMAND", "VMOS_ADB_COMMAND") or re.search(r"[\s#'\"\\]", value):
+    if key in ("VMOS_SSH_COMMAND", "VMOS_ADB_COMMAND", "SSH_PASS") or re.search(r"[\s#'\"\\]", value):
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'{key}="{escaped}"'
     return f"{key}={value}"

@@ -1,6 +1,6 @@
 {
   "_comment": "与 VMOS 控制台勾选一致；2026-07-03 控制台截图归档",
-  "_console_snapshot": "2026-07-03 23:11 双机均显示 V03",
+  "_console_snapshot": "2026-07-06T12:58:00+08:00",
   "right": {
     "pad_code": "ATP6416I3I1E6KPM",
     "pad_code_console_ocr": "ATP641613I1E6KPM",
@@ -9,7 +9,10 @@
     "match_android": 13,
     "match_egress_ip": "195.114.193.237",
     "local_port": 58433,
-    "adb_server_port": 5038
+    "adb_server_port": 5038,
+    "console_export_ip": "98.98.124.137",
+    "console_ssh_host": "129.227.134.130",
+    "console_adb_port": 59065
   },
   "left": {
     "pad_code": "APP5AU4BB269OR35",
@@ -20,6 +23,9 @@
     "match_egress_ip": "195.114.193.136",
     "local_port": 55612,
     "adb_server_port": 5039,
-    "expect_model": "Pixel XL"
+    "expect_model": "Pixel XL",
+    "console_export_ip": "45.43.32.133",
+    "console_ssh_host": "98.98.37.2",
+    "console_adb_port": 64914
   }
 }

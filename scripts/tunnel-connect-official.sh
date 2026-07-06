@@ -39,13 +39,24 @@ tunnel_connect_official() {
     ssh_cmd="ssh -b ${bind_ip} ${ssh_cmd#ssh }"
   fi
 
-  export SSHPASS="${SSH_PASS}"
+  local pass_file
+  pass_file="$(mktemp)"
+  chmod 600 "${pass_file}"
+  printf '%s' "${SSH_PASS}" >"${pass_file}"
   echo "[${side_label}] ssh bind=${bind_ip:-none} port=${LOCAL_PORT}"
-  sshpass -e bash -c "${ssh_cmd}"
+  sshpass -f "${pass_file}" bash -c "${ssh_cmd}" || {
+    rm -f "${pass_file}"
+    return 1
+  }
+  rm -f "${pass_file}"
   sleep 2
 
   if [[ -n "${VMOS_ADB_COMMAND:-}" ]]; then
-    bash -c "${VMOS_ADB_COMMAND}"
+    local adb_cmd="${VMOS_ADB_COMMAND}"
+    if [[ "${adb_cmd}" == adb\ * && "${adb_cmd}" != *" -P "* ]]; then
+      adb_cmd="adb -P ${adb_server} ${adb_cmd#adb }"
+    fi
+    bash -c "${adb_cmd}"
   else
     adb -P "${adb_server}" disconnect "127.0.0.1:${LOCAL_PORT}" 2>/dev/null || true
     adb -P "${adb_server}" connect "127.0.0.1:${LOCAL_PORT}"

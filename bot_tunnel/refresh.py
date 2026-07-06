@@ -73,6 +73,7 @@ def refresh_side_credentials(
     *,
     sleep_fn: SleepFn = time.sleep,
     probe_port: Callable[[str], bool] = adb_probe_port,
+    max_attempts: int = 12,
 ) -> tuple[bool, str | None]:
     """
     Fetch adb for one side and write tunnel env.
@@ -84,18 +85,27 @@ def refresh_side_credentials(
 
     last_exc: Exception | None = None
     adb: dict = {}
-    for attempt in range(12):
+    for attempt in range(max(1, max_attempts)):
         try:
             if attempt:
-                sleep_fn(min(90, 8 * attempt))
+                sleep_fn(min(90, 15 * (attempt + 1)))
+            adb = {}
             try:
-                tasks = client.open_adb([code])
-                client.wait_open_adb_tasks(tasks)
+                adb = client.get_adb(code, enable=True, expire_minutes=_adb_expire_minutes(), retries=2)
             except RuntimeError as exc:
-                print(f"[warn] openOnlineAdb {side}: {exc}")
-            adb = client.get_adb(code, enable=True, expire_minutes=_adb_expire_minutes(), retries=3)
+                last_exc = exc
+                print(f"[{side}] get_adb attempt {attempt + 1}: {exc}")
             command = str(adb.get("command") or "")
             ssh_pass = str(adb.get("key") or "")
+            if not command or not ssh_pass:
+                try:
+                    tasks = client.open_adb([code])
+                    client.wait_open_adb_tasks(tasks, timeout=90, poll_interval=2)
+                except RuntimeError as exc:
+                    print(f"[warn] openOnlineAdb {side}: {exc}")
+                adb = client.get_adb(code, enable=True, expire_minutes=_adb_expire_minutes(), retries=2)
+                command = str(adb.get("command") or "")
+                ssh_pass = str(adb.get("key") or "")
             if not command or not ssh_pass:
                 raise RuntimeError("adb 接口未返回完整 command/key，需先 openOnlineAdb")
             break
