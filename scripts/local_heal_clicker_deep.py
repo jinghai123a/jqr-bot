@@ -39,7 +39,11 @@ from bot_55chat_daemon import (
 )
 
 rt = load_bot_runtime()
-serial = f"127.0.0.1:{{rt.clicker_adb_port}}"
+_out = __import__("subprocess").check_output(["adb", "devices", "-l"], text=True)
+serial = next(
+    (ln.split()[0] for ln in _out.splitlines() if f":{rt.clicker_adb_port}" in ln and " device" in ln),
+    f"localhost:{rt.clicker_adb_port}",
+)
 bot = next((b for b in (api("GET", "/api/bots") or []) if str(b.get("id")) == "bot-3"), {{}})
 print("serial", serial, "fg", is_55m_foreground(serial), "launcher", is_on_launcher(serial))
 dismiss_clicker_stuck_surface(serial)

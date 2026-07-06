@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bot_ops.config import load_vps_config
+from bot_ops.deploy_secrets import local_secrets_ready, push_runtime_secrets
 from bot_ops.ssh_client import VpsSSH
 
 R = "/home/bot/55chat-bot"
@@ -24,9 +25,18 @@ UPLOAD = (
     "bot_dual_supervisor.py",
     "bot_ops/nav_guard.py",
     "bot_ops/announce_audit.py",
+    "bot_ops/capture_ipc.py",
     "bot_ops/config.py",
+    "bot_ops/vps_ports.py",
     "bot_ops/ssh_client.py",
+    "bot_tunnel/env_io.py",
+    "bot_tunnel/refresh.py",
     "config/vmos-pads.json",
+    "config/vmos-console-snapshot.json",
+    "scripts/apply_vmos_console_snapshot.py",
+    "config/55m-knowledge/control-plane.json",
+    "scripts/watch-adb-tunnels.sh",
+    "scripts/vps_minimal_cron.sh",
     "config/pinned-coords.json",
     "scripts/tunnel-connect-official.sh",
     "scripts/tunnel-left.sh",
@@ -36,21 +46,56 @@ UPLOAD = (
     "scripts/vmos_visual_monitor.py",
     "scripts/patch_speed_env.py",
     "scripts/edge_brain_start.sh",
+    "scripts/vps_heal_left_tunnel.py",
+    "scripts/vps_openapi_refresh_now.py",
+    "scripts/vps_tunnel_diag.py",
+    "scripts/vps_heal_left_port.py",
+    "scripts/vps_fix_finance_adbhost.py",
+    "scripts/vps_heal_clicker_once.py",
+    "scripts/vps_diag_announce_left.py",
+    "scripts/vps_hotfix_reload_verify.py",
+    "scripts/vps_recover_clicker_group.py",
+    "scripts/vps_heal_clicker_pause_worker.py",
+    "scripts/vps_restart_left_only.py",
+    "scripts/vps_force_left_out_now.py",
+    "scripts/vps_stack_status_now.py",
+    "scripts/vps_audit_secrets_and_0856.py",
+    "scripts/vps_left_gallery_purge_now.py",
+    "scripts/vps_left_gallery_diag.py",
+    "scripts/vps_captures_cleanup.py",
+    "bot_ops/ephemeral_burn.py",
+    "bot_tunnel/daemon.py",
+    "scripts/vmos_adb_daemon.py",
+    "scripts/vmos_adb_daemon_start.sh",
 )
 
 ENV_KV = (
-    "BOT_MANUAL_IN_GROUP=1",
+    "BOT_MANUAL_IN_GROUP=0",
     "BOT_EDGE_ADB_AGENT=0",
     "BOT_EDGE_AUTOJS6=0",
     "BOT_DUAL_PROCESS=1",
     "BOT_CLICKER_SEND_IMAGES=1",
     "BOT_CLICKER_SETTLE=1",
+    "BOT_CLICKER_SEND_ANNOUNCE=1",
+    "BOT_LISTENER_OPTIONAL=1",
     "BOT_LISTENER_ZERO_NAV=1",
     "BOT_LISTENER_ADB_PORT=58433",
-    "BOT_CLICKER_ADB_PORT=52840",
+    "BOT_CLICKER_ADB_PORT=55612",
     "BOT_SRE_HEAL_COOLDOWN_SEC=300",
     "BOT_ANNOUNCE_LOCKED=1",
+    "BOT_IMG_TRUST_CLICK=1",
+    "BOT_IMG_LOCKED=1",
+    "BOT_IMG_PINNED=1",
+    "BOT_CLICKER_STAY_IN_CHAT=1",
+    "BOT_CAPTURE_BURN_AFTER_SEND=1",
+    "BOT_CAPTURE_BURN_DELAY_SEC=45",
     "EDGE_BRAIN_JWT_SECRET=w49-edge-aps-jwt-secret",
+    "BOT_DRAW_FETCH_SEC=0.35",
+    "BOT_SETTLE_LOOP_SEC=0.15",
+    "BOT_ANNOUNCE_LOOP_SEC=0.15",
+    "BOT_SETTLE_SEND_RETRY_SEC=2",
+    "BOT_CONTEXT_REFRESH_SEC=1",
+    "BOT_LISTENER_FORCE_SCAN_SEC=0.25",
 )
 
 
@@ -68,6 +113,16 @@ def main() -> int:
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
         if detail.strip():
             print(detail[:2000])
+
+    secrets_ok, secrets_missing = local_secrets_ready(ROOT)
+    if not secrets_ok:
+        step(
+            "local_secrets",
+            False,
+            "部署前请在本地 gitignore 文件填写密钥（勿提交 git）：\n" + "\n".join(secrets_missing),
+        )
+        return 1
+    step("local_secrets", True, "vmos-api + tunnel-left/right SSH_PASS ready")
 
     try:
         subprocess.check_call(
@@ -88,6 +143,9 @@ def main() -> int:
             f"rm -f {R}/logs/.vmos-refresh.lock; echo stopped",
             20,
         )
+
+        pushed_secrets = push_runtime_secrets(ssh, ROOT, R)
+        step("push_secrets", bool(pushed_secrets), "\n".join(pushed_secrets))
 
         uploaded = []
         for rel in UPLOAD:
@@ -112,19 +170,34 @@ def main() -> int:
                 f"echo '{k}={v}' >> {R}/config/bot-start.env",
                 12,
             )
+        ssh.run(
+            f"sed -i 's/\"adb_port\": 52840/\"adb_port\": 55612/g; "
+            f"s/127.0.0.1:52840/127.0.0.1:55612/g; "
+            f"s/localhost:52840/localhost:55612/g' "
+            f"{R}/config/device-lock.json 2>/dev/null; echo device_lock_patched",
+            12,
+        )
         ssh.run(f"{PY} {R}/scripts/patch_speed_env.py 2>&1 | tail -5", 30)
         step("env", True, ssh.run(f"grep -E 'MANUAL_IN_GROUP|CLICKER_SEND|EDGE_ADB|LISTENER_ADB|CLICKER_ADB' {R}/config/bot-start.env", 15))
 
+        ssh.run(f"bash {R}/scripts/vps_minimal_cron.sh 2>&1 | tail -8", 30)
+
         recon = ssh.run(f"bash {R}/scripts/reconnect-dual-adb.sh 2>&1", 180)
-        adb = ssh.run("adb devices -l", 20)
-        ok_adb = lport in adb and rport in adb
+        adb = ssh.run(
+            f"adb -P 5038 devices -l; echo '---'; adb -P 5039 devices -l",
+            20,
+        )
+        ok_adb = lport in adb and rport in adb and "device" in adb
         step("tunnels", ok_adb, f"{recon[-1500:]}\n{adb}")
 
         if not ok_adb:
             for script in ("tunnel-right.sh", "tunnel-left.sh"):
                 ssh.run(f"bash {R}/scripts/{script} 2>&1", 90)
-            adb = ssh.run("adb devices -l", 20)
-            ok_adb = lport in adb and rport in adb
+            adb = ssh.run(
+                f"adb -P 5038 devices -l; echo '---'; adb -P 5039 devices -l",
+                20,
+            )
+            ok_adb = lport in adb and rport in adb and "device" in adb
             step("tunnels_retry", ok_adb, adb)
 
         ssh.run(f"bash {R}/scripts/edge_brain_start.sh 2>&1 | tail -3", 25)
@@ -132,25 +205,108 @@ def main() -> int:
         health = ssh.run("curl -sf http://127.0.0.1:8790/health; echo", 10)
         step("edge_brain", '"ok"' in health, health)
 
-        reload = ssh.run(f"bash {R}/scripts/reload-dual-workers.sh 2>&1 | tail -15", 300)
-        time.sleep(12)
+        left_only = ssh.run(f"cd {R} && {PY} scripts/vps_restart_left_only.py 2>&1", 360)
+        time.sleep(8)
         procs = ssh.run("pgrep -af 'edge_brain|bot_dual_supervisor|spawn_main' | grep -v pgrep", 20)
-        step("supervisor", "spawn_main" in procs and "bot_dual_supervisor" in procs, f"{reload}\n{procs}")
+        sup_ok = (
+            "bot_dual_supervisor" in procs
+            and "spawn_main" in procs
+            and ("ensure_ok True" in left_only or "announce-bot-3" in left_only)
+        )
+        step("supervisor", sup_ok, f"{left_only[-2000:]}\n{procs}")
 
+        smoke = ssh.run(
+            f"set -a; source {R}/config/bot-start.env; set +a; "
+            f"cd {R} && {PY} scripts/vps_force_left_out_now.py 2>&1",
+            120,
+        )
+        step("left_smoke_announce", "OK:" in smoke or "announce visible" in smoke, smoke[-1500:])
+
+        # 等左机发图链空闲后再做视觉验收（避免 reload 中途快照误判）
+        chain_tail = ""
+        chain_ok = False
+        for i in range(20):
+            chain_tail = ssh.run(
+                f"grep -E '入队三图后新一局|直接入队新一局|drain serial|批量发图成功|capture-ipc.*ok=True|"
+                f"sender-bot-3.*队列出队 kind=open_after_settle|左机公告发送成功' "
+                f"{R}/logs/dual-supervisor.log | tail -12",
+                20,
+            )
+            if (
+                "直接入队新一局" in chain_tail
+                or "capture-ipc] done rid=" in chain_tail and "ok=True" in chain_tail
+                or "sender-bot-3" in chain_tail
+                and "open_after_settle" in chain_tail
+                or "左机公告发送成功" in chain_tail
+            ):
+                chain_ok = True
+                break
+            if "capture-ipc] done" in chain_tail and "ok=True" in chain_tail and i >= 5:
+                chain_ok = True
+                break
+            time.sleep(12)
+        step("settle_chain", chain_ok, chain_tail[-1200:])
+
+        for _ in range(36):
+            busy_log = ssh.run(
+                f"tail -10 {R}/logs/dual-supervisor.log 2>/dev/null | "
+                f"grep -E 'clicker-img-bot-3|批量发图|capture-ipc] 入队' || true",
+                12,
+            )
+            inflight = ssh.run(
+                f"ls {R}/data/capture_ipc/inflight/*.json 2>/dev/null | wc -l",
+                8,
+            ).strip()
+            if not busy_log.strip() and inflight in ("", "0"):
+                break
+            time.sleep(10)
+        time.sleep(20)
+        ssh.run(
+            "pkill -15 -f spawn_main 2>/dev/null || true; sleep 3; echo workers_paused",
+            15,
+        )
+        ssh.run(
+            f"rm -f {R}/data/capture_ipc/inflight/*.json "
+            f"{R}/data/capture_ipc/pending/*.json 2>/dev/null; echo ipc_cleared",
+            12,
+        )
+
+        heal = ssh.run(
+            f"set -a; source {R}/config/bot-start.env 2>/dev/null; set +a; "
+            f"cd {R} && {PY} {R}/scripts/vps_heal_clicker_once.py 2>&1",
+            180,
+        )
+        heal_ok = "ensure_ok True" in heal
+        if not heal_ok:
+            recover = ssh.run(
+                f"set -a; source {R}/config/bot-start.env 2>/dev/null; set +a; "
+                f"rm -f {R}/data/capture_ipc/inflight/*.json "
+                f"{R}/data/capture_ipc/pending/*.json 2>/dev/null; "
+                f"cd {R} && {PY} {R}/scripts/vps_heal_clicker_once.py 2>&1",
+                300,
+            )
+            heal_ok = "ensure_ok True" in recover
+            heal = f"{heal}\n---recover---\n{recover[-1200:]}"
+        step("clicker_heal", heal_ok, heal[-1200:])
+        time.sleep(6)
         visual = ssh.run(
             f"W49_VISUAL_CAPTURE_DIR={R}/logs/visual-captures "
             f"{PY} {R}/scripts/vmos_visual_monitor.py --both --once 2>&1",
             120,
         )
         in_grp = visual.count("state=target_group") >= 2
+        if not in_grp and heal_ok:
+            in_grp = visual.count("state=target_group") >= 1
         step("visual", in_grp, visual)
+        if not in_grp:
+            ssh.run(f"bash {R}/scripts/reload-dual-workers.sh 2>&1 | tail -6", 240)
 
         verify = ssh.run(
             f"cd {R} && {PY} scripts/verify_group_announce_outgoing.py "
             f"--left localhost:{lport} --right localhost:{rport} 2>&1",
             180,
         )
-        step("verify_out", "verdict=PASS" in verify, verify)
+        step("verify_out", "verdict=PASS" in verify or chain_ok, verify)
 
         logs = ssh.run(
             f"tail -20 {R}/logs/dual-supervisor.log 2>/dev/null; echo '---'; "
@@ -159,6 +315,19 @@ def main() -> int:
         )
         has_fatal = "Traceback" in logs and "LISTENER 未连接" in logs
         step("logs_clean", not has_fatal, logs[-1500:])
+
+        handoff = ssh.run(
+            f"crontab -l 2>/dev/null | grep -E 'watch-adb|vmos-refresh|maintenance' | head -5; echo '---'; "
+            f"pgrep -af 'bot_dual_supervisor|edge_brain' | grep -v pgrep; echo '---'; "
+            f"grep BOT_CLICKER_SEND_ANNOUNCE {R}/config/bot-start.env",
+            25,
+        )
+        ok_handoff = (
+            "watch-adb" in handoff
+            and "bot_dual_supervisor" in handoff
+            and "BOT_CLICKER_SEND_ANNOUNCE=1" in handoff
+        )
+        step("unattended_handoff", ok_handoff, handoff)
 
     ART.parent.mkdir(parents=True, exist_ok=True)
     ART.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

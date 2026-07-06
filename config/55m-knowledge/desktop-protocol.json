@@ -1,0 +1,54 @@
+{
+  "source": "https://github.com/yee338024/55chat-bot/tree/a20b4841a068bed7031c9afef01672f94cd92990",
+  "helper": "68助手（55M 桌面版）",
+  "note": "readme 默认 WS 5599；本机 68助手 v1.6.8 实测 5600，以 BOT_55WS_URL 为准",
+  "endpoints": {
+    "ws_default_doc": "ws://127.0.0.1:5599",
+    "ws_local_v168": "ws://127.0.0.1:5600",
+    "http_settings": "http://127.0.0.1:5500"
+  },
+  "handshake": {"message": "Hello"},
+  "heartbeat_sec": 3,
+  "operators": {
+    "network": ["socketLogin", "socketLoginout"],
+    "inbound": ["msgNew", "groupUpdate", "msgListPropertyUpdate"]
+  },
+  "outbound_types": {
+    "sendMsg": {
+      "desc": "群/私聊文字",
+      "data": {"id": "groupId|friendId", "type": "group|friend", "list": [{"type": "text", "values": {"chatType": 0, "content": "..."}}]}
+    },
+    "sendFile": {
+      "desc": "群/私聊文件（结算三图）",
+      "data": {"file": "Windows绝对路径", "type": "group|friend", "id": "groupId|friendId"}
+    },
+    "getGroups": {
+      "desc": "扩展：拉群列表（官方 readme 未写，本机 68助手 v1.6.8 可用）",
+      "response": {"type": "getGroups", "data": [{"id": 0, "name": "群名"}]}
+    }
+  },
+  "inbound_msgNew": {
+    "group_fields": ["sendUid", "groupId", "content", "msgType", "isSelf", "groupName"],
+    "messengerId_map": "sendUid → panel.users[].messengerId",
+    "ignore_self": true
+  },
+  "send_ack": {
+    "operator": "msgListPropertyUpdate",
+    "success": "readStatus=1",
+    "fail": "readStatus=0"
+  },
+  "not_in_protocol": ["ADD好友", "点头像读资料", "ADB UI 三图点击链"],
+  "project_paths": [
+    "protocol/55ws-client/watch.js",
+    "protocol/55ws-client/local_desktop_bot.js",
+    "scripts/desktop_local_announce.py",
+    "scripts/desktop_local_stack.py",
+    "docs/本地桌面测试.md"
+  ],
+  "executor_env": {
+    "BOT_EXECUTOR": "ws | adb（互斥，禁止双发）",
+    "BOT_55WS_URL": "WebSocket 地址",
+    "DESKTOP_GROUP_ID": "测试群 numeric id",
+    "BOT_TARGET_GROUP": "测试群名子串匹配"
+  }
+}

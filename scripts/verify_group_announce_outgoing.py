@@ -54,19 +54,23 @@ def _scan_side(serial: str, bot: dict, *, scrolls: int) -> dict[str, object]:
 
 
 def main() -> int:
+    import os
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--left", default="localhost:50185")
-    ap.add_argument("--right", default="localhost:61573")
+    ap.add_argument("--left", default=os.environ.get("BOT_CLICKER_ADB_PORT", "52840"))
+    ap.add_argument("--right", default=os.environ.get("BOT_LISTENER_ADB_PORT", "58433"))
     ap.add_argument("--group", default="苍井空测试")
     ap.add_argument("--scrolls", type=int, default=3)
     ap.add_argument("--edge-url", default="http://127.0.0.1:8790")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    left_port = args.left if ":" in str(args.left) else f"localhost:{args.left}"
+    right_port = args.right if ":" in str(args.right) else f"localhost:{args.right}"
     report = {
         "edge_brain_up": _edge_brain_ok(args.edge_url),
-        "left": _scan_side(args.left, {"id": "bot-3", "associatedGroup": args.group}, scrolls=args.scrolls),
-        "right": _scan_side(args.right, {"id": "bot-4", "associatedGroup": args.group}, scrolls=args.scrolls),
+        "left": _scan_side(left_port, {"id": "bot-3", "associatedGroup": args.group}, scrolls=args.scrolls),
+        "right": _scan_side(right_port, {"id": "bot-4", "associatedGroup": args.group}, scrolls=args.scrolls),
     }
     report["any_bot_sent_announce"] = bool(
         report["left"]["bot_sent_evidence"] or report["right"]["bot_sent_evidence"]

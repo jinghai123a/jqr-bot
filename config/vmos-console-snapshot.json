@@ -1,0 +1,43 @@
+{
+  "_updated": "2026-07-06T12:58:00+08:00",
+  "_source": "VMOS 控制台 云机信息 + 本地调试 截图",
+  "_note": "SSH_PASS 须从控制台「复制」按钮获取全文；截图可能截断。OpenAPI 续期走 vmos_adb_daemon。",
+  "left": {
+    "pad_code": "APP5AU4BB269OR35",
+    "role": "CLICKER",
+    "bot_id": "bot-3",
+    "android": 15,
+    "device_model": "V03",
+    "export_ip": "45.43.32.133",
+    "ip_region": "HK-HongKong",
+    "prod_local_port": 55612,
+    "adb_server_port": 5039,
+    "tunnel_bind": "195.114.193.136",
+    "console_ssh_host": "98.98.37.2",
+    "console_ssh_port": 1824,
+    "console_ssh_user": "s",
+    "console_local_port": 64914,
+    "console_ssh_command": "ssh -oStrictHostKeyChecking=accept-new s@98.98.37.2 -p 1824 -L 64914:localhost:1 -Nf",
+    "console_adb_command": "adb connect localhost:64914",
+    "ssh_pass": "jPe3oouKnT2VY6X5HOgAMFiiV0HGoU+mzQQxtIrm/sG2+PByQNAi7zoPR1b/6Cwo9PYxGclFr8dzvkJOPIQTP5+cGH7qHvm6h4d/QE7wwuTsRS9p3k9T9rH1L4HWML0NLx8NBs6qVSugxaLR5iCjgBVqQA7/tpMWO1hjC3Ii/Rf/eZETEAwgp+E7hksS4DGayrm0XRd8336aF/lbgoG3geuU9F0v0LzUCL3PldBRNys="
+  },
+  "right": {
+    "pad_code": "ATP6416I3I1E6KPM",
+    "role": "LISTENER",
+    "bot_id": "bot-4",
+    "android": 13,
+    "device_model": "V03",
+    "export_ip": "98.98.124.137",
+    "ip_region": "SG-Singapore",
+    "prod_local_port": 58433,
+    "adb_server_port": 5038,
+    "tunnel_bind": "195.114.193.237",
+    "console_ssh_host": "129.227.134.130",
+    "console_ssh_port": 1824,
+    "console_ssh_user": "s",
+    "console_local_port": 59065,
+    "console_ssh_command": "ssh -oStrictHostKeyChecking=accept-new s@129.227.134.130 -p 1824 -L 59065:localhost:1 -Nf",
+    "console_adb_command": "adb connect localhost:59065",
+    "ssh_pass": "VL3Y81K4QZF6pC6jO2wz650U9a2/0a9CbvA0frzD1VgY3YQ40on+wGnTF3D0lCyW/6yTHA5jG2o702Vus/UP7YstdDyIjUjldrQirL9nwGxR3Olt0ixBdeBhbTtW1smKKw6VmVWczjv+cPRn+cfKlE5Xo6jgpkpuPv7h5Y4cQ34c08K7owvmyC7fgnuYdj5CzsXm3u45UJM01bm+y8hS9WtdXhAVJkx3CDpFJke31g=="
+  }
+}

@@ -1,0 +1,17 @@
+﻿# 沙箱/密钥/产物 — 不进 Cursor Review
+.venv/
+__pycache__/
+.pytest_cache/
+artifacts/
+logs/
+data/edge_brain/state.json
+*.png
+scripts/_*.py
+scripts/_*.txt
+config/bot-start.env
+config/tunnel-left.env
+config/tunnel-right.env
+config/vmos-api.env
+config/vps-ssh.env
+edge_android/listener-right/edge_config.json
+edge_android/settle-left/edge_config.json

@@ -7,13 +7,16 @@ cd "$ROOT"
 source "${ROOT}/config/bot-start.env" 2>/dev/null || true
 RPORT="${BOT_LISTENER_ADB_PORT:-60478}"
 LPORT="${BOT_CLICKER_ADB_PORT:-56121}"
+RADB="${BOT_LISTENER_ADB_SERVER_PORT:-5038}"
+LADB="${BOT_CLICKER_ADB_SERVER_PORT:-5039}"
 LOG="${ROOT}/logs/tunnel-watch.log"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
 probe_adb() {
   local p="$1"
-  adb -s "127.0.0.1:${p}" shell echo OK >/dev/null 2>&1 \
-    || adb -s "localhost:${p}" shell echo OK >/dev/null 2>&1
+  local adb_p="$2"
+  adb -P "${adb_p}" -s "127.0.0.1:${p}" shell echo OK >/dev/null 2>&1 \
+    || adb -P "${adb_p}" -s "localhost:${p}" shell echo OK >/dev/null 2>&1
 }
 
 cleanup_stale_adb() {
@@ -24,13 +27,13 @@ cleanup_stale_adb() {
 }
 
 heal_side() {
-  local name="$1" port="$2" script="$3"
-  if probe_adb "${port}"; then
+  local name="$1" port="$2" script="$3" adb_p="$4"
+  if probe_adb "${port}" "${adb_p}"; then
     echo "[$(ts)] OK ${name} :${port} (skip rebuild)" | tee -a "${LOG}"
     return 0
   fi
   echo "[$(ts)] HEAL ${name} :${port} via ${script}" | tee -a "${LOG}"
-  if bash "${ROOT}/scripts/${script}.sh" >>"${LOG}" 2>&1 && probe_adb "${port}"; then
+  if bash "${ROOT}/scripts/${script}.sh" >>"${LOG}" 2>&1 && probe_adb "${port}" "${adb_p}"; then
     echo "[$(ts)] OK ${name} after ${script}" | tee -a "${LOG}"
     return 0
   fi
@@ -41,8 +44,8 @@ echo "[$(ts)] === reconnect-dual-adb (per-side) ===" | tee -a "${LOG}"
 cleanup_stale_adb
 
 RF=0 LF=0
-heal_side right "${RPORT}" tunnel-right || RF=1
-heal_side left "${LPORT}" tunnel-left || LF=1
+heal_side right "${RPORT}" tunnel-right "${RADB}" || RF=1
+heal_side left "${LPORT}" tunnel-left "${LADB}" || LF=1
 
     if [[ "${RF}" -eq 1 || "${LF}" -eq 1 ]]; then
   if [[ -f "${ROOT}/config/vmos-api.env" && -f "${ROOT}/scripts/vmos-refresh-tunnels.py" ]]; then
@@ -53,13 +56,14 @@ heal_side left "${LPORT}" tunnel-left || LF=1
     if [[ "${LF}" -eq 1 ]]; then
       python3 "${ROOT}/scripts/vmos-refresh-tunnels.py" --reconnect --side left >>"${LOG}" 2>&1 || true
     fi
-    probe_adb "${RPORT}" && RF=0 || RF=1
-    probe_adb "${LPORT}" && LF=0 || LF=1
+    probe_adb "${RPORT}" "${RADB}" && RF=0 || RF=1
+    probe_adb "${LPORT}" "${LADB}" && LF=0 || LF=1
   fi
 fi
 
 echo "[$(ts)] === adb devices ===" | tee -a "${LOG}"
-adb devices -l | tee -a "${LOG}"
+adb -P "${RADB}" devices -l | tee -a "${LOG}"
+adb -P "${LADB}" devices -l | tee -a "${LOG}"
 
 if [[ "${RF}" -eq 0 && "${LF}" -eq 0 ]]; then
   exit 0

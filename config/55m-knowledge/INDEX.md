@@ -16,6 +16,8 @@
 | [control-plane.json](./control-plane.json) | 端口、进程、VM 专区、APS 路径 |
 | [ui-pages.json](./ui-pages.json) | 55Messenger 页面地图 |
 | [edge-events.json](./edge-events.json) | 事件门控与 API 调用序 |
+| [desktop-protocol.json](./desktop-protocol.json) | 68助手 WS 协议（55chat-bot 文档 + 本机扩展） |
+| [executor-matrix.json](./executor-matrix.json) | 执行器模式 desktop_ws / edge_124 / dual_supervisor |
 
 ## 宿主机 → VM
 

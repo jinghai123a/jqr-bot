@@ -8,17 +8,20 @@ mkdir -p "${ROOT}/logs"
 source "${ROOT}/config/bot-start.env" 2>/dev/null || true
 RPORT="${BOT_LISTENER_ADB_PORT:-60478}"
 LPORT="${BOT_CLICKER_ADB_PORT:-56121}"
+RADB="${BOT_LISTENER_ADB_SERVER_PORT:-5038}"
+LADB="${BOT_CLICKER_ADB_SERVER_PORT:-5039}"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
 probe() {
   local p="$1"
-  adb -s "127.0.0.1:${p}" shell echo OK >/dev/null 2>&1 \
-    || adb -s "localhost:${p}" shell echo OK >/dev/null 2>&1
+  local adb_p="$2"
+  adb -P "${adb_p}" -s "127.0.0.1:${p}" shell echo OK >/dev/null 2>&1 \
+    || adb -P "${adb_p}" -s "localhost:${p}" shell echo OK >/dev/null 2>&1
 }
 
 ok_r=0 ok_l=0
-probe "$RPORT" && ok_r=1 || true
-probe "$LPORT" && ok_l=1 || true
+probe "$RPORT" "$RADB" && ok_r=1 || true
+probe "$LPORT" "$LADB" && ok_l=1 || true
 
 if [[ "$ok_r" -eq 1 && "$ok_l" -eq 1 ]]; then
   echo "[$(ts)] OK right=${RPORT} left=${LPORT}" >>"$LOG"
@@ -29,18 +32,23 @@ echo "[$(ts)] FAIL right=${ok_r} left=${ok_l} — reconnect" >>"$LOG"
 cd "$ROOT"
 bash scripts/reconnect-dual-adb.sh >>"$LOG" 2>&1 || true
 sleep 3
-probe "$RPORT" && ok_r=1 || ok_r=0
-probe "$LPORT" && ok_l=1 || ok_l=0
+probe "$RPORT" "$RADB" && ok_r=1 || ok_r=0
+probe "$LPORT" "$LADB" && ok_l=1 || ok_l=0
 echo "[$(ts)] after reconnect right=${ok_r} left=${ok_l}" >>"$LOG"
 
 if [[ "$ok_r" -eq 0 || "$ok_l" -eq 0 ]]; then
-  if [[ -f "${ROOT}/config/vmos-api.env" && -f "${ROOT}/scripts/vmos-refresh-tunnels.py" ]]; then
-    echo "[$(ts)] try VMOS API refresh" >>"$LOG"
-    python3 "${ROOT}/scripts/vmos-refresh-tunnels.py" --reconnect >>"$LOG" 2>&1 || true
-    sleep 3
-    probe "$RPORT" && ok_r=1 || ok_r=0
-    probe "$LPORT" && ok_l=1 || ok_l=0
-    echo "[$(ts)] after vmos refresh right=${ok_r} left=${ok_l}" >>"$LOG"
+  if [[ -f "${ROOT}/config/vmos-api.env" && -f "${ROOT}/scripts/vmos_adb_daemon.py" ]]; then
+    echo "[$(ts)] signal vmos_adb_daemon urgent (no inline API storm)" >>"$LOG"
+    touch "${ROOT}/data/vmos_adb_daemon.urgent" 2>/dev/null || true
+    if [[ -x "${ROOT}/scripts/vmos_adb_daemon_start.sh" ]]; then
+      bash "${ROOT}/scripts/vmos_adb_daemon_start.sh" once >>"$LOG" 2>&1 || true
+    else
+      python3 "${ROOT}/scripts/vmos_adb_daemon.py" --once >>"$LOG" 2>&1 || true
+    fi
+    sleep 5
+    probe "$RPORT" "$RADB" && ok_r=1 || ok_r=0
+    probe "$LPORT" "$LADB" && ok_l=1 || ok_l=0
+    echo "[$(ts)] after daemon refresh right=${ok_r} left=${ok_l}" >>"$LOG"
   fi
 fi
 

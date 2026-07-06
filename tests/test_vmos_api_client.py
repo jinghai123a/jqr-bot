@@ -214,6 +214,17 @@ class CompatibilityTests(unittest.TestCase):
         self.assertTrue(hasattr(VmosApiClient, "get_adb"))
         self.assertEqual(VmosApiClient.HOST, "api.vmoscloud.com")
 
+    def test_proxy_mask_hides_credentials(self) -> None:
+        from vmos_api.transport import mask_proxy_url, normalize_proxy_url, proxy_from_env
+
+        self.assertEqual(
+            mask_proxy_url("http://user:secret@1.2.3.4:8080"),
+            "http://***@1.2.3.4:8080",
+        )
+        self.assertEqual(normalize_proxy_url("1.2.3.4:8080"), "http://1.2.3.4:8080")
+        with mock.patch.dict("os.environ", {"VMOS_API_PROXY": "http://p:1"}, clear=False):
+            self.assertEqual(proxy_from_env(), "http://p:1")
+
 
 if __name__ == "__main__":
     unittest.main()

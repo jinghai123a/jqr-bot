@@ -21,7 +21,7 @@ alwaysApply: true
 | Ordering | Updated |
 | Source | **Reset**（全来源；避免漏本机 gate / VPS handoff） |
 | Status | 默认全开；排障时只看 Failed / Running |
-| Environment | **不收窄**（本机 Windows + APS `46.183.27.174` 都要见） |
+| Environment | **不收窄**（本机 Windows + APS `195.114.193.136` 都要见） |
 | PR | **关闭**（本仓库以本地/VPS 部署为主） |
 | Archived | 隐藏已归档 |
 

@@ -28,7 +28,8 @@ patch = {
     "BOT_LISTENER_TICK_HIDE_KB": "0",
     "BOT_ADB_HEAL_DURING_SEND": "0",
     "BOT_LISTENER_HIDE_KEYBOARD": "0",
-    "BOT_LISTENER_CMDS_PER_TICK": "5",
+    "BOT_LISTENER_CMDS_PER_TICK": "8",
+    "BOT_CMD_CLAIM_RACE_SEC": "0.5",
     "BOT_LISTENER_SEND_FIRE": "1",
     "BOT_UI_COLLECTOR": "1",
     "BOT_LISTENER_BLUE_SEND_POLLS": "1",
@@ -56,6 +57,13 @@ patch = {
     "BOT_CLICKER_SETTLE": "1",
     "BOT_CLICKER_OPTIONAL": "0",
     "BOT_LOG_WORKERS": "2",
+    "BOT_CONTEXT_REFRESH_SEC": "1",
+    "BOT_DRAW_FETCH_SEC": "0.35",
+    "BOT_SETTLE_LOOP_SEC": "0.15",
+    "BOT_ANNOUNCE_LOOP_SEC": "0.15",
+    "BOT_SETTLE_SEND_RETRY_SEC": "2",
+    "BOT_SETTLE_OPEN_DEFER_MAX_SEC": "180",
+    "BOT_LISTENER_FORCE_SCAN_SEC": "0.25",
 }
 remove_keys = ("BOT_SKIP_BOT_IDS",)
 for k in remove_keys:
@@ -105,6 +113,11 @@ def patch_finance_hosts(text: str) -> list[tuple[str, str]]:
     walk(data)
     if changed:
         db.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    stale = f"localhost:52840"
+    fresh = f"localhost:{clicker_port}"
+    if stale in db.read_text(encoding="utf-8"):
+        db.write_text(db.read_text(encoding="utf-8").replace(stale, fresh), encoding="utf-8")
+        changed.append(("legacy_port", fresh))
     return changed
 
 

@@ -1,4 +1,4 @@
-"""LISTENER 结算 → CLICKER 发图 → LISTENER 新一局：跨进程文件队列（双进程栈）。"""
+"""CLICKER 结算 → 发图 → 同机 open 公告：跨进程文件队列（双进程栈）。"""
 from __future__ import annotations
 
 import json
@@ -96,7 +96,7 @@ def capture_in_progress_for_rid(rid: int) -> bool:
 def clicker_capture_queue_busy() -> bool:
     """左机发图队列是否已有待处理/进行中任务（禁止并发入队）。"""
     try:
-        purge_stale_inflight(120.0)
+        purge_stale_inflight(60.0)
         return bool(any(_pending_dir().glob("*.json"))) or bool(
             any(_inflight_dir().glob("*.json"))
         )
@@ -175,6 +175,8 @@ def enqueue_capture_ipc(payload: dict[str, Any]) -> bool:
     if path.is_file() or has_inflight_for_rid(rid):
         log.info("[capture-ipc] 跳过重复入队 rid=%s", rid)
         return False
+    if clicker_capture_queue_busy():
+        purge_stale_inflight(60.0)
     if clicker_capture_queue_busy():
         log.info("[capture-ipc] 左机队列忙，推迟入队 rid=%s", rid)
         return False
