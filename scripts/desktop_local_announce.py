@@ -40,30 +40,30 @@ def _acquire_singleton() -> None:
     global _SINGLETON_FP
     path = ROOT / "data" / ".desktop_announce.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_file():
+    # 文件缺失则原子创建空文件，绝不截断既有 PID。
+    if not path.exists():
         try:
-            old = int(path.read_text(encoding="utf-8").strip() or "0")
-            if old > 0:
-                import ctypes
-                k = ctypes.windll.kernel32
-                h = k.OpenProcess(0x1000, False, old)
-                if h:
-                    k.CloseHandle(h)
-                    log.error("已有 desktop_local_announce pid=%s 在跑，本次退出", old)
-                    sys.exit(0)
-        except (OSError, ValueError):
+            open(path, "x", encoding="utf-8").close()
+        except FileExistsError:
             pass
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-    fp = open(path, "w", encoding="utf-8")
+    # 用 r+ 打开（不截断，支持 seek 覆盖）。抢到 OS 字节锁之前绝不动文件内容，
+    # 避免中途失败 / 竞态留下空 lock（self-heal 判定为「announce 未写入 lock」而反复重启）。
+    fp = open(path, "r+", encoding="utf-8")
     try:
+        fp.seek(0)
         msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
-        log.error("已有 desktop_local_announce 在跑，本次退出（请只保留一个实例）")
+        try:
+            old = int((fp.read() or "").strip() or "0")
+        except (OSError, ValueError):
+            old = 0
+        fp.close()
+        log.error("已有 desktop_local_announce pid=%s 在跑，本次退出（请只保留一个实例）", old or "?")
         sys.exit(0)
+    # 独占锁到手后再写 PID：先覆盖再截断，任何时刻文件都至少含新 PID，杜绝空 lock 窗口。
+    fp.seek(0)
     fp.write(str(os.getpid()))
+    fp.truncate()
     fp.flush()
     _SINGLETON_FP = fp
 
