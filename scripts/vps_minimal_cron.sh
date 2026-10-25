@@ -7,13 +7,18 @@ PY="${R}/.venv/bin/python3"
 # shellcheck disable=SC1091
 source "${R}/config/bot-start.env" 2>/dev/null || true
 MEM_CRON="${BOT_DAILY_MEM_CYCLE_CRON:-35 19}"
+if [[ "${MEM_CRON}" =~ ^([0-9]{1,2})[[:space:]:]+([0-9]{1,2})$ ]]; then
+  MEM_CRON="${BASH_REMATCH[1]} ${BASH_REMATCH[2]} * * *"
+else
+  MEM_CRON="35 19 * * *"
+fi
 
 (
   echo "CRON_TZ=Asia/Shanghai"
   echo "@reboot sleep 90 && flock -n /tmp/lean-boot.lock bash ${R}/scripts/lean-boot.sh >> ${R}/logs/lean-boot.log 2>&1"
   echo "0 19 * * * flock -n /tmp/vmos-refresh.lock bash ${R}/scripts/vmos-maintenance-tunnel-cycle.sh"
   echo "20 19 * * * flock -n /tmp/vmos-refresh-retry.lock bash ${R}/scripts/vmos-maintenance-tunnel-retry.sh"
-  echo "${MEM_CRON} * * * flock -n /tmp/daily-mem-cycle.lock cd ${R} && ${PY} scripts/daily_memory_cycle.py >> ${R}/logs/daily-mem-cycle.log 2>&1"
+  echo "${MEM_CRON} flock -n /tmp/daily-mem-cycle.lock cd ${R} && ${PY} scripts/daily_memory_cycle.py >> ${R}/logs/daily-mem-cycle.log 2>&1"
   echo "* * * * * flock -n /tmp/kill-legacy.lock bash ${R}/scripts/kill-legacy-if-dual.sh"
 ) > /tmp/bot-production.cron
 crontab /tmp/bot-production.cron
